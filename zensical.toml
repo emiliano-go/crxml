@@ -1,0 +1,134 @@
+[project]
+site_name = "crxml"
+site_description = "Fast streaming parser for Crystal Reports XML exports"
+site_url = "https://emiliano-gandini-outeda.me/crxml/"
+docs_dir = "docs"
+site_dir = "site"
+
+copyright = "&copy; 2026 Emiliano Gandini Outeda"
+
+extra_css = ["stylesheets/extra.css"]
+
+[project.theme]
+variant = "modern"
+font.text = "Ubuntu"
+font.code = "JetBrains Mono"
+features = [
+    "navigation.instant",
+    "navigation.instant.prefetch",
+    "navigation.tabs",
+    "navigation.indexes",
+    "navigation.top",
+    "navigation.footer",
+    "search.suggest",
+    "search.highlight",
+    "content.code.copy",
+    "content.code.annotate",
+    "toc.follow",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/emiliano-gandini-outeda/crxml"
+name = "crxml on GitHub"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/python"
+link = "https://pypi.org/project/crxml/"
+name = "crxml on PyPI"
+
+[[project.nav]]
+"Home" = "index.md"
+
+[[project.nav]]
+"Installation" = "installation.md"
+
+[[project.nav]]
+"Getting Started" = "getting-started.md"
+
+[[project.nav]]
+"Usage" = "usage/index.md"
+
+[[project.nav."Usage"]]
+"Basic Parsing" = "usage/basic.md"
+
+[[project.nav."Usage"]]
+"Pipeline API" = "usage/pipeline.md"
+
+[[project.nav."Usage"]]
+"Built-in Stages" = "usage/stages.md"
+
+[[project.nav."Usage"]]
+"Custom Stages" = "usage/custom-stages.md"
+
+[[project.nav."Usage"]]
+"Parallel Execution" = "usage/parallel.md"
+
+[[project.nav."Usage"]]
+"Sinks" = "usage/sinks.md"
+
+[[project.nav."Usage"]]
+"Branching" = "usage/branching.md"
+
+[[project.nav]]
+"Architecture" = "architecture.md"
+
+[[project.nav]]
+"Performance" = "performance.md"
+
+[[project.nav]]
+"Rust Core" = "rust-core.md"
+
+[[project.nav]]
+"FastAPI Integration" = "fastapi.md"
+
+[[project.nav]]
+"Django Integration" = "django.md"
+
+[[project.nav]]
+"Flask Integration" = "flask.md"
+
+[[project.nav]]
+"Changelog" = "changelog.md"
+
+[project.markdown_extensions.tables]
+
+[project.markdown_extensions.admonition]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+
+[project.markdown_extensions.pymdownx.snippets]
+
+[project.markdown_extensions.pymdownx.superfences]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true
+
+[project.markdown_extensions.attr_list]
+
+[project.markdown_extensions.md_in_html]
