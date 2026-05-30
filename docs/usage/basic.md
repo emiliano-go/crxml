@@ -2,8 +2,7 @@
 
 ## Opening a file
 
-`CrystalXMLSource` accepts a path string, a `pathlib.Path` object, or any
-file-like object with a `.name` attribute:
+`CrystalXMLSource` accepts a file path (string or `pathlib.Path`):
 
 ```python
 from crxml import CrystalXMLSource
@@ -14,18 +13,14 @@ src = CrystalXMLSource("report.xml")
 # pathlib.Path
 from pathlib import Path
 src = CrystalXMLSource(Path("report.xml"))
-
-# file-like object
-with open("report.xml") as f:
-    src = CrystalXMLSource(f)
 ```
 
 ### Parameters
 
-| Param    | Type                          | Default         | Description                       |
-|----------|-------------------------------|-----------------|-----------------------------------|
-| `source` | `str \| Path \| TextIOBase`   | —               | Path or file-like object          |
-| `row_tag`| `str`                         | `"Details"`     | XML tag for each record row       |
+| Param    | Type               | Default   | Description                   |
+|----------|--------------------|-----------|-------------------------------|
+| `source` | `str \| Path`      | —         | Path to CR XML file           |
+| `row_tag`| `str`              | `"Row"`   | XML tag for each record row   |
 
 The `row_tag` parameter lets you target a different repeating element if your
 CR XML uses a non-standard tag name.
@@ -70,4 +65,4 @@ Crystal Reports XML stores field values in two patterns:
 - **Element style:** `<Field><FieldName>{Report.Amount}</FieldName><Value>123.45</Value></Field>`
 - **Mixed:** some fields use attributes, others use child elements
 
-The parser detects both styles automatically — no configuration needed.
+The parser detects both styles automatically, no configuration needed.

@@ -30,7 +30,7 @@ modifying the previous one:
 ```python
 base = CrystalXMLSource("report.xml") | RenameFields(mapping)
 
-# These are independent — each re-reads the source
+# These are independent, each re-reads the source
 pipe_a = base | CastTypes({"amount": float})
 pipe_b = base | DropFields("tax_rate")
 ```
@@ -49,11 +49,11 @@ pipe = Pipeline(CrystalXMLSource("report.xml"), RenameFields(mapping))
 
 Pipelines are fully lazy until one of:
 
-- `for row in pipeline:` — per-row iteration
-- `list(pipeline)` — collect all rows
-- `to_dataframe(pipeline)` — DataFrame sink
-- `to_csv(pipeline, path)` — CSV sink
-- `collect(pipeline)` — list sink
+- `for row in pipeline:`, per-row iteration
+- `list(pipeline)`, collect all rows
+- `to_dataframe(pipeline)`, DataFrame sink
+- `to_csv(pipeline, path)`, CSV sink
+- `collect(pipeline)`, list sink
 
 ## Example: 3-stage pipeline
 

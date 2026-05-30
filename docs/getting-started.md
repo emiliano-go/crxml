@@ -9,8 +9,8 @@ schema inspection, a simple pipeline, and DataFrame conversion.
 pip install crxml
 ```
 
-See [Installation](installation.md) for details on building from source,
-platform support, and the lxml fallback.
+See [Installation](installation.md) for details on building from source
+and platform support.
 
 ## Your first source
 
@@ -77,7 +77,7 @@ This collects all rows into a pandas DataFrame. For large files use
 
 ## Next steps
 
-- [Usage guide](usage/basic.md) — deeper topics: custom stages, parallel mode, branching
-- [Pipeline API](usage/pipeline.md) — how `|` and lazy evaluation work
-- [Built-in stages](usage/stages.md) — reference for all four stage types
-- [Performance](performance.md) — benchmarks, memory model, bottlenecks
+- [Usage guide](usage/basic.md), deeper topics: custom stages, parallel mode, branching
+- [Pipeline API](usage/pipeline.md), how `|` and lazy evaluation work
+- [Built-in stages](usage/stages.md), reference for all four stage types
+- [Performance](performance.md), benchmarks, memory model, bottlenecks

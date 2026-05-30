@@ -4,15 +4,14 @@
 
 Tests on a synthetic 100 MB Crystal Reports XML file (~90K rows).
 
-| Metric | Rust backend | lxml fallback |
-|--------|-------------|---------------|
-| Throughput | 155 K rows/s | 42 K rows/s |
-| Parse time (100 MB) | 0.58 s | 3.8 s |
-| Peak RSS | 94 MB | 182 MB |
-| Memory per row (streaming) | ~34 bytes | ~1.1 KB |
+| Metric | Value |
+|--------|-------|
+| Throughput | 155 K rows/s |
+| Parse time (100 MB) | 0.58 s |
+| Peak RSS | 94 MB |
+| Memory per row (streaming) | ~34 bytes |
 
-Rust backend RSS stays flat from 10 MB to 100 MB inputs (~94 MB). The lxml
-fallback builds a DOM tree and has higher baseline memory.
+RSS stays flat from 10 MB to 100 MB inputs (~94 MB).
 
 ## Where time goes
 
@@ -51,8 +50,8 @@ Diminishing returns past 4 workers due to IPC overhead.
 
 - **Disk I/O:** Not the bottleneck for files <1 GB on modern NVMe SSDs
 - **Single-threaded Python:** Dict allocation is the bottleneck
-- **lxml DOM:** Memory is the bottleneck for files >50 MB
-- **Rust allocator jemalloc:** Gives better RSS stability than system malloc
+- **XML parsing:** quick-xml is fast; the bottleneck is Python dict construction
+- **Rust allocator:** Uses system allocator with stable RSS
 
 ## Recommendations
 

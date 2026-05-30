@@ -125,4 +125,4 @@ def to_xlsx():
 
 Flask's development server is single-threaded by default. In production with
 a WSGI server (gunicorn, waitress), each worker has its own
-`CrystalXMLSource` instance — no shared state.
+`CrystalXMLSource` instance, no shared state.

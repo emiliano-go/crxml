@@ -25,8 +25,8 @@ struct CrxmlReader {
 }
 ```
 
-- `__iter__` — returns `self`
-- `__next__` — reads the next row as a `PyDict`
+- `__iter__`, returns `self`
+- `__next__`, reads the next row as a `PyDict`
 
 The reader walks the XML stream, finds `<row_tag>` elements, and extracts
 field key/value pairs from nested `<Field>` and `<Text>` elements.
@@ -61,7 +61,7 @@ manifest-path = "src/crxml_core/Cargo.toml"
 
 - Rust 2021 edition
 - `cargo fmt` for formatting
-- `cargo clippy` — no warnings allowed
+- `cargo clippy`, no warnings allowed
 - Unsafe code is prohibited (`#![deny(unsafe_code)]`)
 
 ## Testing
@@ -76,8 +76,8 @@ python -c "from crxml._crxml_core import CrxmlReader; r = CrxmlReader('test.xml'
 
 ## Security
 
-- **No unsafe code** — the entire crate is safe Rust
-- **Input validation** — XML is assumed trusted (users control their source
+- **No unsafe code**, the entire crate is safe Rust
+- **Input validation**, XML is assumed trusted (users control their source
   files). Buffer sizes are managed by quick-xml.
-- **Buffer limits** — individual field values are bounded by the XML entity
+- **Buffer limits**, individual field values are bounded by the XML entity
   size. No unbounded allocations.

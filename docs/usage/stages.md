@@ -27,9 +27,9 @@ Casts specified fields to the given types.
 
 **`errors` modes:**
 
-- `"raise"` (default) — raises `TypeError` on conversion failure
-- `"coerce"` — replaces uncastable values with `None`
-- `"skip"` — leaves uncastable values as-is
+- `"raise"` (default), raises `TypeError` on conversion failure
+- `"coerce"`, replaces uncastable values with `None`
+- `"skip"`, leaves uncastable values as-is
 
 **Example:**
 
@@ -43,7 +43,7 @@ CastTypes({"qty": int, "price": float})
 ## DropFields
 
 ```python
-DropFields(*fields: str)
+DropFields(fields: list[str])
 ```
 
 Removes specified keys from each row.
@@ -54,7 +54,7 @@ Removes specified keys from each row.
 # Input:  {"a": "1", "b": "2", "c": "3"}
 # Output: {"a": "1", "c": "3"}
 
-DropFields("b")
+DropFields(["b"])
 ```
 
 ## FilterRows
@@ -77,7 +77,7 @@ FilterRows(lambda r: float(r.get("amt", 0)) > 100)
 ## Edge cases
 
 - **RenameFields:** If a mapping key does not exist in the row, it is silently
-  ignored. Duplicate target names are not checked — the last mapping wins.
+  ignored. Duplicate target names are not checked, the last mapping wins.
 - **CastTypes:** When `errors="coerce"`, the coerced value is `None`. The
   original key is always preserved in the output dict.
 - **DropFields:** Dropping a non-existent key is a no-op.
