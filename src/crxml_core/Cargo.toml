@@ -1,0 +1,44 @@
+# src/crxml_core/Cargo.toml
+
+[package]
+name = "crxml-core"
+version = "0.1.0"
+edition = "2021"
+description = "Fast streaming Crystal Reports XML parser for Python"
+license = "MIT"
+repository = "https://github.com/emiliano-gandini-outeda/crxml"
+authors = ["Emiliano Gandini <emiliano.gandini@protonmail.com>"]
+
+[lib]
+# The compiled library name. maturin will place this as crxml._crxml_core
+name = "_crxml_core"
+# cdylib produces a shared library (.so / .dylib / .dll) that Python can load
+crate-type = ["cdylib"]
+
+[dependencies]
+# Python bindings
+pyo3 = { version = "0.24", features = ["extension-module"] }
+
+# Streaming XML parser
+quick-xml = "0.36"
+
+# SIMD-accelerated byte search used internally by quick-xml.
+# Listed explicitly so we can control the version and audit it.
+memchr = "2"
+
+[profile.release]
+# Optimize for speed
+opt-level = 3
+# Enable link-time optimization for smaller, faster binaries
+lto = true
+# Reduce binary size
+codegen-units = 1
+# Strip debug symbols (maturin also strips, but this ensures it at compile time)
+strip = true
+# Abort on panic instead of unwinding – smaller binary, and Python will see a
+# RuntimeError instead of an abort anyway because PyO3 catches panics at the boundary
+panic = "abort"
+
+[profile.dev]
+# Faster debug builds for development
+opt-level = 1
