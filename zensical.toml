@@ -61,28 +61,16 @@ name = "crxml on PyPI"
 "Getting Started" = "getting-started.md"
 
 [[project.nav]]
-"Usage" = "usage/index.md"
-
-[[project.nav."Usage"]]
-"Basic Parsing" = "usage/basic.md"
-
-[[project.nav."Usage"]]
-"Pipeline API" = "usage/pipeline.md"
-
-[[project.nav."Usage"]]
-"Built-in Stages" = "usage/stages.md"
-
-[[project.nav."Usage"]]
-"Custom Stages" = "usage/custom-stages.md"
-
-[[project.nav."Usage"]]
-"Parallel Execution" = "usage/parallel.md"
-
-[[project.nav."Usage"]]
-"Sinks" = "usage/sinks.md"
-
-[[project.nav."Usage"]]
-"Branching" = "usage/branching.md"
+"Usage" = [
+    "usage/index.md",
+    { "Basic Parsing" = "usage/basic.md" },
+    { "Pipeline API" = "usage/pipeline.md" },
+    { "Built-in Stages" = "usage/stages.md" },
+    { "Custom Stages" = "usage/custom-stages.md" },
+    { "Parallel Execution" = "usage/parallel.md" },
+    { "Sinks" = "usage/sinks.md" },
+    { "Branching" = "usage/branching.md" },
+]
 
 [[project.nav]]
 "Architecture" = "architecture.md"
