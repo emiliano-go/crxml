@@ -54,10 +54,10 @@ pipeline = (
 )
 ```
 
-- **RenameFields**(mapping) — renames dict keys
-- **CastTypes**(types, errors="raise") — casts fields to target types
-- **DropFields**(*fields) — removes fields from rows
-- **FilterRows**(predicate) — keeps rows matching predicate
+- **RenameFields**(mapping), renames dict keys
+- **CastTypes**(types, errors="raise"), casts fields to target types
+- **DropFields**(*fields), removes fields from rows
+- **FilterRows**(predicate), keeps rows matching predicate
 
 ### Sinks
 
