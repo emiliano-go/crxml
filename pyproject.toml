@@ -1,0 +1,61 @@
+[build-system]
+# Requires Rust toolchain (rustc + cargo) installed on the build machine.
+# Install from https://rustup.rs if not present.
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "crxml"
+version = "0.1.0"
+description = "Fast streaming parser for Crystal Reports XML, with Rust acceleration"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Emiliano Gandini", email = "emiliano.gandini@protonmail.com"}
+]
+keywords = ["crystal-reports", "xml", "parser", "pandas", "etl"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Text Processing :: Markup :: XML",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=1.5",
+    "lxml>=4.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-benchmark>=4",
+    "openpyxl>=3.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/emiliano-gandini.outeda/crxml"
+Repository = "https://github.com/emiliano-gandini.outeda/crxml"
+Issues = "https://github.com/emiliano-gandini.outeda/crxml/issues"
+
+[tool.maturin]
+# The Rust crate is in src/crxml_core/
+manifest-path = "src/crxml_core/Cargo.toml"
+# The compiled extension will be accessible as crxml._crxml_core
+module-name = "crxml._crxml_core"
+# Include the Python package from src/crxml/ alongside the compiled extension
+python-source = "src"
+# Build in release mode for maximum performance, strip debug symbols
+features = ["pyo3/extension-module"]
+strip = true
+profile = "release"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
