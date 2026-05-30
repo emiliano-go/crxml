@@ -1,13 +1,13 @@
 ## CrystalXMLSource
 
 ```python
-CrystalXMLSource(source: str | Path | TextIOBase, row_tag: str = "Details")
+CrystalXMLSource(source: str | Path, *, row_tag: str = "Row")
 ```
 
-| Param     | Type                          | Default      | Description                      |
-|-----------|-------------------------------|--------------|----------------------------------|
-| `source`  | `str \| Path \| TextIOBase`   | —            | Path or file-like object         |
-| `row_tag` | `str`                         | `"Details"`  | XML tag for each record row      |
+| Param     | Type               | Default   | Description                   |
+|-----------|--------------------|-----------|-------------------------------|
+| `source`  | `str \| Path`      | —         | Path to CR XML file           |
+| `row_tag` | `str`              | `"Row"`   | XML tag for each record row   |
 
 **Returns:** iterable of `dict[str, str]`
 
@@ -33,7 +33,7 @@ CastTypes(types: dict[str, type], errors: str = "raise")
 
 | Param   | Type             | Default   | Description                         |
 |---------|------------------|-----------|-------------------------------------|
-| `types` | `dict[str, type]`| —         | Field name → target type            |
+| `types` | `dict[str, type]`|,         | Field name → target type            |
 | `errors`| `str`            | `"raise"` | One of `"raise"`, `"coerce"`, `"skip"` |
 
 **Fusable:** yes | **Picklable:** yes
@@ -41,12 +41,12 @@ CastTypes(types: dict[str, type], errors: str = "raise")
 ## DropFields
 
 ```python
-DropFields(*fields: str)
+DropFields(fields: list[str])
 ```
 
-| Param    | Type    | Description            |
-|----------|---------|------------------------|
-| `*fields`| `str`   | Keys to remove from rows |
+| Param    | Type          | Description               |
+|----------|---------------|---------------------------|
+| `fields` | `list[str]`   | Keys to remove from rows  |
 
 **Fusable:** yes | **Picklable:** yes
 
@@ -86,7 +86,7 @@ to_dataframe(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
 
 | Param      | Type               | Default | Description                    |
 |------------|--------------------|---------|--------------------------------|
-| `pipeline` | `Pipeline`         | —       | Pipeline to consume            |
+| `pipeline` | `Pipeline`         |,       | Pipeline to consume            |
 | `chunksize`| `int \| None`      | `None`  | Incremental chunk size         |
 
 ## to_csv
@@ -97,9 +97,9 @@ to_csv(pipeline: Pipeline, path: str | Path, **csv_writer_kwargs) -> None
 
 | Param               | Type               | Default | Description                  |
 |---------------------|--------------------|---------|------------------------------|
-| `pipeline`          | `Pipeline`         | —       | Pipeline to consume          |
-| `path`              | `str \| Path`      | —       | Output CSV path              |
-| `**csv_writer_kwargs`| `Any`             | —       | Forwarded to `csv.writer`    |
+| `pipeline`          | `Pipeline`         |,       | Pipeline to consume          |
+| `path`              | `str \| Path`      |,       | Output CSV path              |
+| `**csv_writer_kwargs`| `Any`             |,       | Forwarded to `csv.writer`    |
 
 ## collect
 

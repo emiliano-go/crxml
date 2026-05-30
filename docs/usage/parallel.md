@@ -43,7 +43,7 @@ Parallel mode adds overhead for batch serialization and IPC. The heuristic:
 | File size  | Recommended |
 |------------|-------------|
 | < 50 MB    | Sequential  |
-| 50–200 MB  | Optional    |
+| 50–200 MB  | Recommended |
 | > 200 MB   | Parallel    |
 
 ## Validation
@@ -54,10 +54,10 @@ crxml validates all stages at pipeline construction:
 from crxml import CrystalXMLSource, RenameFields, FilterRows
 
 pipe = CrystalXMLSource("report.xml") | RenameFields({"a": "b"})
-# This works — both stages are Fusable and picklable
+# This works, both stages are Fusable and picklable
 
 pipe2 = CrystalXMLSource("report.xml") | FilterRows(lambda r: r["x"] > 1)
-pipe2.parallel()  # raises UnpicklableStageError — lambda not picklable
+pipe2.parallel()  # raises UnpicklableStageError, lambda not picklable
 ```
 
 ## Named function example
@@ -67,5 +67,5 @@ def above_threshold(row):
     return row if float(row.get("amount", 0)) > 100 else None
 
 pipe = CrystalXMLSource("report.xml") | above_threshold
-pipe.parallel(workers=2)  # works — module-level function
+pipe.parallel(workers=2)  # works, module-level function
 ```

@@ -40,26 +40,11 @@ Or use `maturin develop` during development:
 maturin develop --release
 ```
 
-## lxml fallback
-
-If the Rust extension cannot be imported (e.g. on unsupported platforms or
-when Rust is not available), crxml automatically falls back to an lxml-based
-parser. No action is required — the library selects the best available backend
-at import time.
-
-Check which backend is active:
-
-```python
-from crxml import _RUST
-print("Rust backend" if _RUST else "lxml fallback")
-```
-
 ## Supported platforms
 
-| Platform    | Rust wheel | lxml fallback |
-|-------------|------------|---------------|
-| Linux x86_64 | ✅         | ✅            |
-| macOS arm64 | ✅         | ✅            |
-| macOS x86_64 | ✅        | ✅            |
-| Windows x86_64 | ✅      | ✅            |
-| Other       | ❌         | ✅            |
+| Platform    | Wheel |
+|-------------|-------|
+| Linux x86_64 | ✅   |
+| macOS arm64 | ✅    |
+| macOS x86_64 | ✅   |
+| Windows x86_64 | ✅ |

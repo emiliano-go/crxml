@@ -1,12 +1,12 @@
 # crxml
 
 Fast streaming parser for SAP Crystal Reports XML exports.
-Parse 100 MB in 0.6 seconds. Constant memory. Optional Rust backend.
+Parse 100 MB in 0.6 seconds. Constant memory.
 
 ## Features
 
 - Streaming: never loads the full file into memory
-- Fast: Rust parser (optional) or lxml fallback
+- Fast: Rust parser via PyO3 + quick-xml
 - Pipeline API: compose transformations with `|`
 - Parallel mode: multi-core batch processing
 - Pandas-native: direct to DataFrame or CSV

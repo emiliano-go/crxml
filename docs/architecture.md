@@ -13,9 +13,9 @@ rows via the `|` operator. Sinks consume the pipeline and materialize results.
 
 The Rust crate at `src/crxml_core/` uses:
 
-- **quick-xml** — fast, streaming XML reader
-- **PyO3** — Python bindings
-- **Buffer reuse** — `Vec<u8>` is reused across rows to minimize allocations
+- **quick-xml**, fast, streaming XML reader
+- **PyO3**, Python bindings
+- **Buffer reuse**, `Vec<u8>` is reused across rows to minimize allocations
 
 The reader:
 
@@ -32,21 +32,8 @@ strips namespace prefixes via local-name matching on the XML reader.
 
 ## Python source layer
 
-`CrystalXMLSource` is a thin Python wrapper:
-
-```python
-class CrystalXMLSource:
-    def __init__(self, source, row_tag="Details"):
-        ...
-
-    def __iter__(self):
-        if _RUST:
-            return _rust_iter(self.source, self.row_tag)
-        return _lxml_iter(self.source, self.row_tag)
-```
-
-The `_RUST` flag is set at import time. The lxml fallback uses the same
-nested `<Field>` / `<Text>` extraction logic but via lxml's iterparse.
+`CrystalXMLSource` is a thin Python wrapper that delegates to the Rust
+`CrxmlReader` via PyO3 bindings.
 
 ## Pipeline
 
