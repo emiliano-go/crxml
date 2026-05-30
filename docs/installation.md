@@ -1,6 +1,6 @@
 # Installation
 
-## From PyPI (recommended)
+## From PyPI
 
 ```bash
 pip install crxml
