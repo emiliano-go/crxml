@@ -58,3 +58,6 @@ profile = "release"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "bench: tests that use large benchmark files (50/100 MB)",
+]
