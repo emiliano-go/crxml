@@ -25,6 +25,8 @@ elements and yields flat dictionaries. A built-in pipeline lets you rename,
 cast, filter, and drop fields with `|` operators. The Rust backend
 processes 100 MB in ~0.5 seconds using <100 MB RSS.
 
+This library is conceptually based on [carlosplanchon/xmlstreamer](https://github.com/carlosplanchon/xmlstreamer).
+
 ## API
 
 ### CrystalXMLSource
