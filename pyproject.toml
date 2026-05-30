@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "crxml"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast streaming parser for Crystal Reports XML, with Rust acceleration"
 readme = "README.md"
 license = {text = "MIT"}
