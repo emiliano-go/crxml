@@ -98,6 +98,14 @@ Distributes batches across worker processes. See the docs for requirements.
 
 pandas is imported lazily — memory climbs only when `to_dataframe` is called.
 
+## Publishing
+
+```bash
+./upload.sh
+```
+
+Builds a manylinux2014 wheel + sdist and uploads to PyPI. Requires `maturin` and `twine`. The `--manylinux 2014 --zig` flag ensures PyPI-compatible platform tags — `python -m build` does not support manylinux flags via PEP 517.
+
 ## Documentation
 
 Full documentation is available at the [project site](https://emiliano-gandini-outeda.me/crxml/),
