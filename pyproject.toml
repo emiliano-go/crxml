@@ -54,6 +54,8 @@ python-source = "src"
 features = ["pyo3/extension-module"]
 strip = true
 profile = "release"
+# Produce a manylinux-compatible wheel accepted by PyPI
+manylinux = "manylinux2014"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
