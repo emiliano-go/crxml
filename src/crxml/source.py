@@ -5,6 +5,8 @@ from crxml._crxml_core import CrxmlReader
 
 
 class CrystalXMLSource:
+    __slots__ = ("_row_tag", "_filepath")
+
     def __init__(self, source: Union[str, Path], *, row_tag: str = "Row"):
         self._row_tag = row_tag
         self._filepath = Path(source)
@@ -13,11 +15,10 @@ class CrystalXMLSource:
             raise FileNotFoundError(f"File not found: {self._filepath}")
 
     def schema(self) -> list[str]:
-        """Return the field names of the first row without consuming the main stream."""
         first_row = next(iter(self), None)
         if first_row is None:
             return []
-        return list(first_row.keys())
+        return [*first_row]
 
     def __iter__(self) -> Iterator[dict]:
         return CrxmlReader(str(self._filepath), self._row_tag)

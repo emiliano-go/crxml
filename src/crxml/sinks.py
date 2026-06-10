@@ -1,9 +1,9 @@
 import csv
 from pathlib import Path
 from typing import Iterable
-import pandas as pd
 
-def to_dataframe(pipeline: Iterable[dict], chunksize: int | None = None) -> pd.DataFrame:
+def to_dataframe(pipeline: Iterable[dict], chunksize: int | None = None) -> "pd.DataFrame":
+    import pandas as pd
     if chunksize is None:
         return pd.DataFrame.from_records(iter(pipeline))
     chunks = []
@@ -33,7 +33,7 @@ def to_csv(
         return
     with open(path, "w", encoding=encoding, newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=list(first.keys()), delimiter=delimiter,
+            f, fieldnames=[*first], delimiter=delimiter,
             extrasaction='ignore'
         )
         writer.writeheader()
