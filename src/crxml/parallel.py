@@ -1,13 +1,9 @@
-import pickle
-import threading
-import queue
-from concurrent.futures import ProcessPoolExecutor
-from itertools import islice
 from typing import Iterable, Iterator, Callable
 
 _SENTINEL = object()
 
 def validate_stages_picklable(stages):
+    import pickle
     for stage in stages:
         try:
             pickle.dumps(stage)
@@ -26,6 +22,8 @@ def _reader_thread(source, q, batch_size):
     q.put(_SENTINEL)
 
 def _prefetch_iter(source, batch_size, maxsize=8):
+    import queue
+    import threading
     q = queue.Queue(maxsize=maxsize)
     t = threading.Thread(target=_reader_thread, args=(source, q, batch_size), daemon=True)
     t.start()
@@ -41,28 +39,31 @@ def _worker_apply(batch, stages):
     from .fusion import fused_iter  # re‑import inside worker
     return list(fused_iter(batch, stages))
 
+def _submit_next(raw_stream, batch_size, futures, executor, stages):
+    from itertools import islice
+    batch = list(islice(raw_stream, batch_size))
+    if batch:
+        futures.append(executor.submit(_worker_apply, batch, stages))
+        return True
+    return False
+
 def parallel_iter(
     source: Iterable[dict],
     stages: list[Callable],
     workers: int,
     batch_size: int,
 ) -> Iterator[dict]:
+    from concurrent.futures import ProcessPoolExecutor
     raw_stream = _prefetch_iter(source, batch_size)
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = []
-        def submit_next():
-            batch = list(islice(raw_stream, batch_size))
-            if batch:
-                futures.append(executor.submit(_worker_apply, batch, stages))
-                return True
-            return False
 
-        # Pre‑fill window
         for _ in range(workers * 2):
-            if not submit_next():
+            if not _submit_next(raw_stream, batch_size, futures, executor, stages):
                 break
 
-        while futures:
-            fut = futures.pop(0)  # preserve order
-            yield from fut.result()
-            submit_next()
+        idx = 0
+        while idx < len(futures):
+            yield from futures[idx].result()
+            idx += 1
+            _submit_next(raw_stream, batch_size, futures, executor, stages)
