@@ -2,16 +2,22 @@
 
 ## Benchmarks
 
-Tests on a synthetic 100 MB Crystal Reports XML file (~90K rows).
+| Test | Size | Rows | Time | Rows/s | MB/s | RSS |
+|------|------|------|------|--------|------|-----|
+| Stream | 10 MB | 9,010 | 0.043s | 211 K | 234 | 22 MB |
+| Stream | 50 MB | 45,328 | 0.223s | 203 K | 224 | 45 MB |
+| Stream | 100 MB | 90,384 | 0.418s | 216 K | 239 | 75 MB |
+| To list | 10 MB | 9,010 | 0.052s | 174 K | 192 | 32 MB |
+| To list | 50 MB | 45,328 | 0.249s | 182 K | 201 | 98 MB |
+| To list | 100 MB | 90,384 | 0.478s | 189 K | 209 | 181 MB |
+| Pipeline | 10 MB | 9,010 | 0.060s | 150 K | 166 | 32 MB |
+| Pipeline | 50 MB | 45,328 | 0.295s | 154 K | 169 | 96 MB |
+| Pipeline | 100 MB | 90,384 | 0.579s | 156 K | 173 | 176 MB |
+| DataFrame | 10 MB | 9,010 | 0.320s | 28 K | 31 | 86 MB |
+| DataFrame | 50 MB | 45,328 | 0.538s | 84 K | 93 | 152 MB |
+| DataFrame | 100 MB | 90,384 | 0.829s | 109 K | 121 | 234 MB |
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 155 K rows/s |
-| Parse time (100 MB) | 0.58 s |
-| Peak RSS | 94 MB |
-| Memory per row (streaming) | ~34 bytes |
-
-RSS stays flat from 10 MB to 100 MB inputs (~94 MB).
+pandas is imported lazily — RSS and time for DataFrame mode includes pandas overhead.
 
 ## Where time goes
 
@@ -26,12 +32,15 @@ constructing dicts. This overhead is inherent to the Python/Rust boundary.
 ## Memory breakdown
 
 ```
-┌──────────────┐
-│  I/O buffer  │  2 MB  (reused Vec<u8>)
-│  Row dict    │  ~2 KB per row (temporary)
-│  RSS floor   │  94 MB (Python interpreter + Rust allocator)
-└──────────────┘
+┌──────────────────┐
+│  I/O buffer      │  2 MB  (reused Vec<u8>)
+│  Row dict        │  ~2 KB per row (temporary)
+│  RSS floor       │  15 MB (Python interpreter, no pandas)
+│  Pipeline stages │  ~20 MB (stage objects, fusion)
+└──────────────────┘
 ```
+
+RSS scales with file content (22 MB for 10 MB, 75 MB for 100 MB).
 
 ## Parallel mode
 

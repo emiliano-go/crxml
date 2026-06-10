@@ -1,7 +1,7 @@
 # crxml
 
 Fast streaming parser for SAP Crystal Reports XML exports.
-Parse 100 MB in 0.6 seconds. Constant memory.
+Parse 100 MB in 0.42 seconds. RSS stays well below file size.
 
 ## Features
 
