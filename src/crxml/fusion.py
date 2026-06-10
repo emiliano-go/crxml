@@ -1,10 +1,10 @@
-from typing import Iterable, Iterator, Callable, Protocol
-
-class Fusable(Protocol):
-    def apply(self, record: dict) -> dict | None: ...
+from typing import Iterable, Iterator, Callable
 
 def is_fusable(stage) -> bool:
-    return hasattr(stage, "apply") and callable(stage.apply)
+    try:
+        return callable(stage.apply)
+    except AttributeError:
+        return False
 
 def fused_iter(source: Iterable[dict], stages: list[Callable]) -> Iterator[dict]:
     # Split into leading fusables and the rest
@@ -14,11 +14,13 @@ def fused_iter(source: Iterable[dict], stages: list[Callable]) -> Iterator[dict]
         fusables.append(rem.pop(0))
 
     # Fused part
+    bound = [s.apply for s in fusables]
+
     def fused():
         for record in source:
             r = record
-            for stage in fusables:
-                r = stage.apply(r)
+            for fn in bound:
+                r = fn(r)
                 if r is None:
                     break
             else:
