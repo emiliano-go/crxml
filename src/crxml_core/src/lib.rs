@@ -11,6 +11,8 @@ use std::path::Path;
 pub struct CrxmlReader {
     reader: Reader<BufReader<File>>,
     buf: Vec<u8>,
+    inner_buf: Vec<u8>,
+    row: Vec<(String, String)>,
     row_tag: Vec<u8>,
 }
 
@@ -29,6 +31,8 @@ impl CrxmlReader {
         Ok(CrxmlReader {
             reader,
             buf: Vec::with_capacity(4096),
+            inner_buf: Vec::with_capacity(4096),
+            row: Vec::with_capacity(16),
             row_tag,
         })
     }
@@ -39,7 +43,7 @@ impl CrxmlReader {
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
         let py = slf.py();
-        let CrxmlReader { reader, buf, row_tag } = &mut *slf;
+        let CrxmlReader { reader, buf, inner_buf, row, row_tag } = &mut *slf;
 
         loop {
             let event = reader.read_event_into(buf).map_err(|e| {
@@ -48,37 +52,28 @@ impl CrxmlReader {
 
             match event {
                 Event::Empty(ref e) if e.name().as_ref() == row_tag.as_slice() => {
-                    let mut row: Vec<(String, String)> = Vec::with_capacity(16);
-
+                    let dict = PyDict::new(py);
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| PyException::new_err(format!("Attribute error: {}", e)))?;
-                        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+                        let key = unsafe { std::str::from_utf8_unchecked(attr.key.as_ref()) };
                         let value = attr.unescape_value()
-                            .map_err(|e| PyException::new_err(format!("Value unescape error: {}", e)))?
-                            .into_owned();
-                        row.push((key, value));
+                            .map_err(|e| PyException::new_err(format!("Value unescape error: {}", e)))?;
+                        dict.set_item(key, value.as_ref())?;
                     }
                     buf.clear();
-
-                    let dict = PyDict::new(py);
-                    for (k, v) in row {
-                        dict.set_item(k, v)?;
-                    }
                     return Ok(Some(dict.into()));
                 }
 
                 Event::Start(ref e) if e.name().as_ref() == row_tag.as_slice() => {
-                    let mut row: Vec<(String, String)> = Vec::with_capacity(16);
+                    row.clear();
 
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| PyException::new_err(format!("Attribute error: {}", e)))?;
-                        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+                        let key = unsafe { std::str::from_utf8_unchecked(attr.key.as_ref()) };
                         let value = attr.unescape_value()
-                            .map_err(|e| PyException::new_err(format!("Value unescape error: {}", e)))?
-                            .into_owned();
-                        row.push((key, value));
+                            .map_err(|e| PyException::new_err(format!("Value unescape error: {}", e)))?;
+                        row.push((key.to_owned(), value.into_owned()));
                     }
-                    buf.clear();
 
                     loop {
                         let child_event = reader.read_event_into(buf).map_err(|e| {
@@ -87,16 +82,18 @@ impl CrxmlReader {
 
                         match child_event {
                             Event::Start(ref child) | Event::Empty(ref child) => {
-                                let child_name = String::from_utf8_lossy(child.name().as_ref()).into_owned();
+                                let child_name = child.name();
+                                let child_tag = child_name.as_ref();
 
-                                if child_name == "Field" {
+                                if child_tag == b"Field" {
                                     let mut field_name: Option<String> = None;
                                     for attr in child.attributes() {
                                         if let Ok(attr) = attr {
-                                            let attr_key = String::from_utf8_lossy(attr.key.as_ref());
-                                            if attr_key == "FieldName" || attr_key == "Name" {
+                                            let attr_key = attr.key.as_ref();
+                                            if attr_key == b"FieldName" || attr_key == b"Name" {
                                                 if let Ok(value) = attr.unescape_value() {
                                                     field_name = Some(value.into_owned());
+                                                    break;
                                                 }
                                             }
                                         }
@@ -105,17 +102,18 @@ impl CrxmlReader {
 
                                     let mut text = String::new();
                                     if matches!(child_event, Event::Start(_)) {
-                                        let mut inner_buf = Vec::new();
+                                        let field_end_bytes = child_name.as_ref();
                                         loop {
-                                            let inner = reader.read_event_into(&mut inner_buf).map_err(|e| {
+                                            let inner = reader.read_event_into(inner_buf).map_err(|e| {
                                                 PyException::new_err(format!("XML parse error: {}", e))
                                             })?;
                                             match inner {
                                                 Event::Start(ref inner_child) | Event::Empty(ref inner_child) => {
-                                                    let inner_name = String::from_utf8_lossy(inner_child.name().as_ref()).into_owned();
-                                                    if inner_name == "FormattedValue" || inner_name == "Value" {
+                                                    let inner_child_name = inner_child.name();
+                                                    let inner_tag = inner_child_name.as_ref();
+                                                    if inner_tag == b"FormattedValue" || inner_tag == b"Value" {
                                                         if matches!(inner, Event::Start(_)) {
-                                                            let text_event = reader.read_event_into(&mut inner_buf).map_err(|e| {
+                                                            let text_event = reader.read_event_into(inner_buf).map_err(|e| {
                                                                 PyException::new_err(format!("Text read error: {}", e))
                                                             })?;
                                                             if let Event::Text(txt) = text_event {
@@ -124,32 +122,28 @@ impl CrxmlReader {
                                                                     .into_owned();
                                                             }
                                                         }
+                                                        inner_buf.clear();
                                                     }
-                                                    inner_buf.clear();
                                                 }
-                                                Event::End(ref e) if e.name().as_ref() == child.name().as_ref() => {
-                                                    inner_buf.clear();
+                                                Event::End(ref e) if e.name().as_ref() == field_end_bytes => {
                                                     break;
                                                 }
                                                 Event::Eof => return Ok(None),
-                                                _ => {
-                                                    inner_buf.clear();
-                                                }
+                                                _ => {}
                                             }
                                         }
                                     }
                                     row.push((key, text));
-                                    buf.clear();
                                 }
 
-                                else if child_name == "Text" {
+                                else if child_tag == b"Text" {
                                     let mut text_name: Option<String> = None;
                                     for attr in child.attributes() {
                                         if let Ok(attr) = attr {
-                                            let attr_key = String::from_utf8_lossy(attr.key.as_ref());
-                                            if attr_key == "Name" {
+                                            if attr.key.as_ref() == b"Name" {
                                                 if let Ok(value) = attr.unescape_value() {
                                                     text_name = Some(value.into_owned());
+                                                    break;
                                                 }
                                             }
                                         }
@@ -158,17 +152,16 @@ impl CrxmlReader {
 
                                     let mut text = String::new();
                                     if matches!(child_event, Event::Start(_)) {
-                                        let mut inner_buf = Vec::new();
+                                        let text_end_bytes = child_name.as_ref();
                                         loop {
-                                            let inner = reader.read_event_into(&mut inner_buf).map_err(|e| {
+                                            let inner = reader.read_event_into(inner_buf).map_err(|e| {
                                                 PyException::new_err(format!("XML parse error: {}", e))
                                             })?;
                                             match inner {
                                                 Event::Start(ref inner_child) | Event::Empty(ref inner_child) => {
-                                                    let inner_name = String::from_utf8_lossy(inner_child.name().as_ref()).into_owned();
-                                                    if inner_name == "TextValue" {
+                                                    if inner_child.name().as_ref() == b"TextValue" {
                                                         if matches!(inner, Event::Start(_)) {
-                                                            let text_event = reader.read_event_into(&mut inner_buf).map_err(|e| {
+                                                            let text_event = reader.read_event_into(inner_buf).map_err(|e| {
                                                                 PyException::new_err(format!("Text read error: {}", e))
                                                             })?;
                                                             if let Event::Text(txt) = text_event {
@@ -177,26 +170,22 @@ impl CrxmlReader {
                                                                     .into_owned();
                                                             }
                                                         }
+                                                        inner_buf.clear();
                                                     }
-                                                    inner_buf.clear();
                                                 }
-                                                Event::End(ref e) if e.name().as_ref() == child.name().as_ref() => {
-                                                    inner_buf.clear();
+                                                Event::End(ref e) if e.name().as_ref() == text_end_bytes => {
                                                     break;
                                                 }
                                                 Event::Eof => return Ok(None),
-                                                _ => {
-                                                    inner_buf.clear();
-                                                }
+                                                _ => {}
                                             }
                                         }
                                     }
                                     row.push((key, text));
-                                    buf.clear();
                                 }
 
                                 else {
-                                    let key = child_name;
+                                    let key = unsafe { std::str::from_utf8_unchecked(child_tag) }.to_owned();
                                     let text = if matches!(child_event, Event::Start(_)) {
                                         let text_event = reader.read_event_into(buf).map_err(|e| {
                                             PyException::new_err(format!("Text read error: {}", e))
@@ -211,32 +200,26 @@ impl CrxmlReader {
                                         String::new()
                                     };
                                     row.push((key, text));
-                                    buf.clear();
                                 }
                             }
 
                             Event::End(ref e) if e.name().as_ref() == row_tag.as_slice() => {
-                                buf.clear();
                                 break;
                             }
                             Event::Eof => return Ok(None),
-                            _ => {
-                                buf.clear();
-                            }
+                            _ => {}
                         }
                     }
 
                     let dict = PyDict::new(py);
-                    for (k, v) in row {
+                    for (k, v) in std::mem::take(row) {
                         dict.set_item(k, v)?;
                     }
                     return Ok(Some(dict.into()));
                 }
 
                 Event::Eof => return Ok(None),
-                _ => {
-                    buf.clear();
-                }
+                _ => {}
             }
         }
     }
