@@ -1,4 +1,6 @@
 class FilterRows:
+    __slots__ = ("_predicate",)
+
     def __init__(self, predicate):
         self._predicate = predicate
 
@@ -6,4 +8,4 @@ class FilterRows:
         return record if self._predicate(record) else None
 
     def __call__(self, stream):
-        return (r for r in map(self.apply, stream) if r is not None)
+        return filter(None, map(self.apply, stream))
