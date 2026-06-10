@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "crxml"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fast streaming parser for Crystal Reports XML, with Rust acceleration"
 readme = "README.md"
 license = {text = "MIT"}
@@ -27,15 +27,15 @@ classifiers = [
     "Topic :: Text Processing :: Markup :: XML",
 ]
 requires-python = ">=3.10"
-dependencies = [
-    "pandas>=1.5",
-]
+dependencies = []
 
 [project.optional-dependencies]
+pandas = ["pandas>=1.5"]
 dev = [
     "pytest>=7",
     "pytest-benchmark>=4",
     "openpyxl>=3.1",
+    "crxml[pandas]",
 ]
 
 [project.urls]
