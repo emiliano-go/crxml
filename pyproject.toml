@@ -54,8 +54,8 @@ python-source = "src"
 features = ["pyo3/extension-module"]
 strip = true
 profile = "release"
-# Produce a manylinux-compatible wheel accepted by PyPI
-manylinux = "manylinux2014"
+# Build with: maturin build --release --manylinux 2014 --zig -o dist
+# (PEP 517 `python -m build` does not support manylinux flags)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
