@@ -23,7 +23,7 @@ crxml streams through Crystal Reports XML files row by row, never loading
 the full document into memory. It extracts field data from nested CR field
 elements and yields flat dictionaries. A built-in pipeline lets you rename,
 cast, filter, and drop fields with `|` operators. The Rust backend
-processes 100 MB in ~0.5 seconds using <100 MB RSS.
+processes 100 MB in ~0.42 seconds using ~75 MB RSS for streaming.
 
 This library is conceptually based on [carlosplanchon/xmlstreamer](https://github.com/carlosplanchon/xmlstreamer).
 
@@ -81,16 +81,22 @@ Distributes batches across worker processes. See the docs for requirements.
 
 ## Benchmarks
 
-| Test | Size | Rows | Time | Throughput | RSS |
-|------|------|------|------|------------|-----|
-| Stream | 10 MB | 9,010 | 0.058s | 155 K rows/s | 94 MB |
-| Stream | 50 MB | 45,328 | 0.261s | 174 K rows/s | 94 MB |
-| Stream | 100 MB | 90,384 | 0.508s | 178 K rows/s | 94 MB |
-| To list | 100 MB | 90,384 | 0.574s | 157 K rows/s | 339 MB |
-| Pipeline | 100 MB | 90,384 | 0.781s | 116 K rows/s | 327 MB |
-| DataFrame | 100 MB | 90,384 | 0.675s | 134 K rows/s | 351 MB |
+| Test | Size | Rows | Time | Rows/s | MB/s | RSS |
+|------|------|------|------|--------|------|-----|
+| Stream | 10 MB | 9,010 | 0.043s | 211 K | 234 | 22 MB |
+| Stream | 50 MB | 45,328 | 0.223s | 203 K | 224 | 45 MB |
+| Stream | 100 MB | 90,384 | 0.418s | 216 K | 239 | 75 MB |
+| To list | 10 MB | 9,010 | 0.052s | 174 K | 192 | 32 MB |
+| To list | 50 MB | 45,328 | 0.249s | 182 K | 201 | 98 MB |
+| To list | 100 MB | 90,384 | 0.478s | 189 K | 209 | 181 MB |
+| Pipeline | 10 MB | 9,010 | 0.060s | 150 K | 166 | 32 MB |
+| Pipeline | 50 MB | 45,328 | 0.295s | 154 K | 169 | 96 MB |
+| Pipeline | 100 MB | 90,384 | 0.579s | 156 K | 173 | 176 MB |
+| DataFrame | 10 MB | 9,010 | 0.320s | 28 K | 31 | 86 MB |
+| DataFrame | 50 MB | 45,328 | 0.538s | 84 K | 93 | 152 MB |
+| DataFrame | 100 MB | 90,384 | 0.829s | 109 K | 121 | 234 MB |
 
-RSS stays flat at ~94 MB regardless of file size.
+pandas is imported lazily — memory climbs only when `to_dataframe` is called.
 
 ## Documentation
 

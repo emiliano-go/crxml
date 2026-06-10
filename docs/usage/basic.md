@@ -54,8 +54,9 @@ lost. `.schema()` is safe to call before building a pipeline.
 
 The parser streams the file in constant memory. The Rust backend reuses
 internal buffers across rows and never materializes the full document.
-RSS stays flat regardless of file size (e.g. ~94 MB for both 10 MB and
-100 MB inputs).
+RSS scales with file content (22 MB for 10 MB, 75 MB for 100 MB),
+staying well below file size. pandas is imported lazily — memory climbs
+only when `to_dataframe` is called.
 
 ## CR XML layout detection
 
