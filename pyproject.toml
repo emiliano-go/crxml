@@ -39,9 +39,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/emiliano-gandini-outeda/crxml"
-Repository = "https://github.com/emiliano-gandini-outeda/crxml"
-Issues = "https://github.com/emiliano-gandini-outeda/crxml/issues"
+Homepage = "https://github.com/emiliano-go/crxml"
+Repository = "https://github.com/emiliano-go/crxml"
+Issues = "https://github.com/emiliano-go/crxml/issues"
 
 [tool.maturin]
 # The Rust crate is in src/crxml_core/
