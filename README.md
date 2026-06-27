@@ -108,7 +108,7 @@ Builds a manylinux2014 wheel + sdist and uploads to PyPI. Requires `maturin` and
 
 ## Documentation
 
-Full documentation is available at the [project site](https://emiliano-gandini-outeda.me/crxml/),
+Full documentation is available at the [project site](https://crxml.emiliano-go.com/),
 covering installation, usage, stages, custom stages, architecture, performance,
 FastAPI integration, and the Rust core.
 

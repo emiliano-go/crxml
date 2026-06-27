@@ -1,7 +1,7 @@
 [project]
 site_name = "crxml"
 site_description = "Fast streaming parser for Crystal Reports XML exports"
-site_url = "https://emiliano-gandini-outeda.me/crxml/"
+site_url = "https://crxml.emiliano-go.com/"
 docs_dir = "docs"
 site_dir = "site"
 
