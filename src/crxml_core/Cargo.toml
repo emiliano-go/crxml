@@ -6,7 +6,7 @@ version = "0.2.0"
 edition = "2021"
 description = "Fast streaming Crystal Reports XML parser for Python"
 license = "MIT"
-repository = "https://github.com/emiliano-gandini-outeda/crxml"
+repository = "https://github.com/emiliano-go/crxml"
 authors = ["Emiliano Gandini <emiliano.gandini@protonmail.com>"]
 
 [lib]
