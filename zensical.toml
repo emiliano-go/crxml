@@ -11,6 +11,7 @@ extra_css = ["stylesheets/extra.css"]
 
 [project.theme]
 variant = "modern"
+custom_dir = "docs/overrides"
 font.text = "Ubuntu"
 font.code = "JetBrains Mono"
 features = [
@@ -92,6 +93,17 @@ name = "crxml on PyPI"
 
 [[project.nav]]
 "Changelog" = "changelog.md"
+
+[project.markdown_extensions]
+"seoslug.contrib.zensical" = {
+  canonical_host = "crxml.emiliano-go.com",
+  public_base_url = "https://crxml.emiliano-go.com/",
+  site_name = "crxml",
+  title_template = "{title} - crxml",
+  publisher_name = "Emiliano Gandini Outeda",
+  locale = "en_US",
+  auto_generate_schema = true,
+}
 
 [project.markdown_extensions.tables]
 
