@@ -1,3 +1,15 @@
+<p align="center">
+  <a href="https://www.python.org/downloads/">
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white&style=for-the-badge" alt="Python">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-10AC84?style=for-the-badge" alt="License">
+  </a>
+  <a href="https://pypi.org/project/crxml/">
+    <img src="https://img.shields.io/pypi/v/crxml?logo=pypi&logoColor=white&style=for-the-badge" alt="PyPI">
+  </a>
+</p>
+
 # crxml
 
 Fast streaming parser for Crystal Reports XML exports.
