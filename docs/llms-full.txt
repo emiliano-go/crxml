@@ -1,0 +1,1465 @@
+# crxml Documentation
+> Full documentation for crxml — Fast streaming parser for Crystal Reports XML exports
+> Source: https://crxml.emiliano-go.com
+> Pages: 19
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/api/
+========================================================================
+
+## CrystalXMLSource
+
+```python
+CrystalXMLSource(source: str | Path, *, row_tag: str = "Row")
+```
+
+| Param     | Type               | Default   | Description                   |
+|-----------|--------------------|-----------|-------------------------------|
+| `source`  | `str \| Path`      | —         | Path to CR XML file           |
+| `row_tag` | `str`              | `"Row"`   | XML tag for each record row   |
+
+**Returns:** iterable of `dict[str, str]`
+
+**Raises:** `FileNotFoundError`, `ValueError` (bad CR XML format)
+
+## RenameFields
+
+```python
+RenameFields(mapping: dict[str, str])
+```
+
+| Param    | Type             | Description                        |
+|----------|------------------|------------------------------------|
+| `mapping`| `dict[str, str]` | Old key → new key mapping          |
+
+**Fusable:** yes | **Picklable:** yes
+
+## CastTypes
+
+```python
+CastTypes(types: dict[str, type], errors: str = "raise")
+```
+
+| Param   | Type             | Default   | Description                         |
+|---------|------------------|-----------|-------------------------------------|
+| `types` | `dict[str, type]`|,         | Field name → target type            |
+| `errors`| `str`            | `"raise"` | One of `"raise"`, `"coerce"`, `"skip"` |
+
+**Fusable:** yes | **Picklable:** yes
+
+## DropFields
+
+```python
+DropFields(fields: list[str])
+```
+
+| Param    | Type          | Description               |
+|----------|---------------|---------------------------|
+| `fields` | `list[str]`   | Keys to remove from rows  |
+
+**Fusable:** yes | **Picklable:** yes
+
+## FilterRows
+
+```python
+FilterRows(predicate: Callable[[dict], bool])
+```
+
+| Param      | Type                       | Description                      |
+|------------|----------------------------|----------------------------------|
+| `predicate`| `Callable[[dict], bool]`   | Return `True` to keep the row    |
+
+**Fusable:** yes | **Picklable:** no (unless a module-level function)
+
+## Pipeline
+
+```python
+Pipeline(source: Iterable[dict], *stages: Stage)
+```
+
+Created implicitly via `|`. Not typically constructed directly.
+
+### Methods
+
+| Method      | Signature                               | Description                |
+|-------------|-----------------------------------------|----------------------------|
+| `__or__`    | `(self, stage) -> Pipeline`             | Append a stage             |
+| `__iter__`  | `(self) -> Iterator[dict]`              | Iterate rows               |
+| `parallel`  | `(self, workers=None, batch_size=10000)`| Return parallel variant    |
+
+## to_dataframe
+
+```python
+to_dataframe(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
+```
+
+| Param      | Type               | Default | Description                    |
+|------------|--------------------|---------|--------------------------------|
+| `pipeline` | `Pipeline`         |,       | Pipeline to consume            |
+| `chunksize`| `int \| None`      | `None`  | Incremental chunk size         |
+
+## to_csv
+
+```python
+to_csv(pipeline: Pipeline, path: str | Path, **csv_writer_kwargs) -> None
+```
+
+| Param               | Type               | Default | Description                  |
+|---------------------|--------------------|---------|------------------------------|
+| `pipeline`          | `Pipeline`         |,       | Pipeline to consume          |
+| `path`              | `str \| Path`      |,       | Output CSV path              |
+| `**csv_writer_kwargs`| `Any`             |,       | Forwarded to `csv.writer`    |
+
+## collect
+
+```python
+collect(pipeline: Pipeline) -> list[dict]
+```
+
+| Param      | Type       | Description              |
+|------------|------------|--------------------------|
+| `pipeline` | `Pipeline` | Pipeline to materialize  |
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/architecture/
+========================================================================
+
+# Architecture
+
+## Overview
+
+```
+source ──► stages ──► sink
+```
+
+A `CrystalXMLSource` reads the CR XML file and yields rows. Stages transform
+rows via the `|` operator. Sinks consume the pipeline and materialize results.
+
+## Rust core (`crxml_core`)
+
+The Rust crate at `src/crxml_core/` uses:
+
+- **quick-xml**, fast, streaming XML reader
+- **PyO3**, Python bindings
+- **Buffer reuse**, `Vec<u8>` is reused across rows to minimize allocations
+
+The reader:
+
+1. Walks the XML tree to find `<Details>` elements (or custom `row_tag`).
+2. For each `<Details>`, extracts `<Field>` / `<Text>` children.
+3. Gets the key from `FieldName` attribute (or nested `<FieldName>` element).
+4. Gets the value from the first `<FormattedValue>` or `<Value>` child.
+5. Yields the row as a `PyDict`.
+
+### Namespace handling
+
+CR XML uses `urn:crystal-reports:schemas:report-detail`. The Rust parser
+strips namespace prefixes via local-name matching on the XML reader.
+
+## Python source layer
+
+`CrystalXMLSource` is a thin Python wrapper that delegates to the Rust
+`CrxmlReader` via PyO3 bindings.
+
+## Pipeline
+
+`Pipeline` is an immutable wrapper:
+
+- `__or__` creates a new `Pipeline` with the stage appended.
+- `__iter__` decides execution strategy:
+  - **Layer B (fusion):** if all stages are Fusable, runs a single tight loop
+  - **Layer C (prefetch):** producer thread + consumer thread with bounded queue
+  - **Layer D (parallel):** `ProcessPoolExecutor` with batch dispatch
+
+### Fusion (Layer B)
+
+A contiguous run of fusable stages (implementing `apply` + `__call__`) is
+fused into a single inner loop. This avoids Python generator overhead:
+
+```python
+for row in source:
+    for stage in fused_stages:
+        row = stage.apply(row)
+        if row is None:
+            break
+    if row is not None:
+        yield row
+```
+
+### Prefetch (Layer C)
+
+A background thread reads the source and pushes rows into a bounded queue.
+The main thread reads from the queue and runs stages. This overlaps I/O with
+transformation work.
+
+### Parallel (Layer D)
+
+A reader thread produces batches. Each batch is sent to a worker process via
+`ProcessPoolExecutor`. Workers run the fused pipeline. Results are collected
+in order via `concurrent.futures`.
+
+## Error handling
+
+- Parse errors: raised immediately during iteration
+- Type errors: controlled by `CastTypes(errors=...)`
+- Picklability validation: raised at `parallel()` call time
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/changelog/
+========================================================================
+
+# Changelog
+
+## 0.1.0 (2026-06-01)
+
+Initial release.
+
+- Rust parser via PyO3 (quick-xml streaming reader)
+- Pipeline API with `|` composition
+- Four built-in stages: RenameFields, CastTypes, DropFields, FilterRows
+- Parallel execution mode (ProcessPoolExecutor)
+
+- Sinks: to_dataframe, to_csv, collect
+- Schema inspection via `.schema()`
+- CR XML auto-detection (attribute vs element style)
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/django/
+========================================================================
+
+# Django Integration
+
+Use crxml inside a Django management command to import Crystal Reports XML
+data into your models.
+
+## Management command
+
+```python
+# yourapp/management/commands/import_report.py
+from django.core.management.base import BaseCommand
+from crxml import CrystalXMLSource, RenameFields, CastTypes, collect
+
+from yourapp.models import Invoice
+
+
+class Command(BaseCommand):
+    help = "Import a Crystal Reports XML file into Invoice models"
+
+    def add_arguments(self, parser):
+        parser.add_argument("path", type=str)
+        parser.add_argument("--batch", type=int, default=1000)
+
+    def handle(self, *args, **options):
+        pipeline = (
+            CrystalXMLSource(options["path"])
+            | RenameFields({
+                "{Report.InvoiceNo}": "number",
+                "{Report.Customer}": "customer",
+                "{Report.Amount}": "amount",
+                "{Report.Date}": "date",
+            })
+            | CastTypes({"amount": float, "date": str})
+        )
+
+        batch = []
+        for row in pipeline:
+            batch.append(Invoice(
+                number=row["number"],
+                customer=row["customer"],
+                amount=row["amount"],
+                date=row["date"],
+            ))
+            if len(batch) >= options["batch"]:
+                Invoice.objects.bulk_create(batch)
+                self.stdout.write(f"Imported {len(batch)} invoices")
+                batch.clear()
+
+        if batch:
+            Invoice.objects.bulk_create(batch)
+            self.stdout.write(f"Imported {len(batch)} invoices")
+```
+
+Run it:
+
+```bash
+python manage.py import_report report.xml --batch 2000
+```
+
+## Upload + preview
+
+A simple admin-like view that accepts a file upload, parses it, and renders
+a preview table:
+
+```python
+# yourapp/views.py
+from django.shortcuts import render
+from django.http import HttpResponseRedirect
+from django.urls import reverse
+from crxml import CrystalXMLSource
+
+from .forms import ReportUploadForm
+
+
+def preview_report(request):
+    if request.method == "POST":
+        form = ReportUploadForm(request.POST, request.FILES)
+        if form.is_valid():
+            src = CrystalXMLSource(request.FILES["file"], row_tag="Details")
+            rows = [row for row in src]
+            return render(request, "preview.html", {
+                "fields": list(rows[0].keys()) if rows else [],
+                "rows": rows[:100],
+                "total": len(rows),
+            })
+    else:
+        form = ReportUploadForm()
+
+    return render(request, "upload.html", {"form": form})
+```
+
+## Periodic import with Celery
+
+```python
+# yourapp/tasks.py
+from celery import shared_task
+from crxml import CrystalXMLSource, collect
+
+from .models import SalesRecord
+
+
+@shared_task
+def import_sales_report(path: str):
+    src = CrystalXMLSource(path, row_tag="Details")
+    records = []
+    for row in src:
+        records.append(SalesRecord(
+            product=row.get("{Report.Product}", ""),
+            quantity=int(row.get("{Report.Qty}", 0)),
+            price=float(row.get("{Report.Price}", 0)),
+        ))
+
+    SalesRecord.objects.bulk_create(records, ignore_conflicts=True)
+    return len(records)
+```
+
+## Thread safety
+
+Django's ORM is thread-safe. Each request or task gets its own
+`CrystalXMLSource` instance, so there is no shared state across requests.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/fastapi/
+========================================================================
+
+# FastAPI Integration
+
+A production pattern for accepting CR XML file uploads, parsing server-side,
+and returning structured data.
+
+## Upload endpoint
+
+```python
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from tempfile import NamedTemporaryFile
+from crxml import CrystalXMLSource, collect
+import os
+
+app = FastAPI()
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+
+@app.post("/parse-report")
+async def parse_report(file: UploadFile = File(...)):
+    if file.size and file.size > MAX_FILE_SIZE:
+        raise HTTPException(413, "File too large")
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in (".xml", ".rpt"):
+        raise HTTPException(422, "Unsupported file type")
+
+    with NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            os.unlink(tmp.name)
+            raise HTTPException(413, "File too large")
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        rows = collect(CrystalXMLSource(tmp_path))
+        return {"rows": len(rows), "data": rows}
+    except Exception as e:
+        raise HTTPException(500, f"Parse failed: {e}")
+    finally:
+        os.unlink(tmp_path)
+```
+
+## Streaming XLSX response
+
+```python
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from io import BytesIO
+
+@app.post("/to-xlsx")
+async def to_xlsx(file: UploadFile = File(...)):
+    with NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    try:
+        rows = collect(CrystalXMLSource(tmp_path))
+    finally:
+        os.unlink(tmp_path)
+
+    wb = Workbook()
+    ws = wb.active
+    if rows:
+        ws.append(list(rows[0].keys()))
+        for row in rows:
+            ws.append(list(row.values()))
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+```
+
+## Error handling
+
+| Status | Condition                          |
+|--------|------------------------------------|
+| 413    | File exceeds size limit            |
+| 422    | Unsupported file extension         |
+| 500    | Parse failure (bad XML, CR format) |
+
+## Thread safety
+
+FastAPI runs route handlers in thread pool workers by default. The Rust parser
+is `Send` but not `Sync`. Each request gets its own `CrystalXMLSource`
+instance, so there is no shared state.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/flask/
+========================================================================
+
+# Flask Integration
+
+Use crxml inside Flask views to upload, parse, and return Crystal Reports
+XML data as JSON, CSV, or XLSX.
+
+## Upload + JSON response
+
+```python
+from flask import Flask, request, jsonify
+from tempfile import NamedTemporaryFile
+from crxml import CrystalXMLSource, collect
+import os
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB
+
+
+@app.post("/parse-report")
+def parse_report():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in (".xml", ".rpt"):
+        return jsonify({"error": "Unsupported file type"}), 422
+
+    with NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
+
+    try:
+        rows = collect(CrystalXMLSource(tmp_path))
+        return jsonify({"rows": len(rows), "data": rows[:100]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        os.unlink(tmp_path)
+```
+
+## Streaming CSV download
+
+```python
+from flask import Response
+import csv
+import io
+
+
+@app.post("/to-csv")
+def to_csv():
+    file = request.files["file"]
+
+    with NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
+
+    def generate():
+        src = CrystalXMLSource(tmp_path)
+        writer = None
+        for row in src:
+            if writer is None:
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=list(row.keys()))
+                writer.writeheader()
+                yield output.getvalue()
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=list(row.keys()))
+            writer.writerow(row)
+            yield output.getvalue()
+
+    return Response(generate(), mimetype="text/csv", headers={
+        "Content-Disposition": "attachment; filename=report.csv"
+    })
+```
+
+## XLSX download
+
+```python
+from flask import send_file
+from openpyxl import Workbook
+from io import BytesIO
+
+
+@app.post("/to-xlsx")
+def to_xlsx():
+    file = request.files["file"]
+
+    with NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
+
+    try:
+        rows = collect(CrystalXMLSource(tmp_path))
+    finally:
+        os.unlink(tmp_path)
+
+    wb = Workbook()
+    ws = wb.active
+    if rows:
+        ws.append(list(rows[0].keys()))
+        for row in rows:
+            ws.append(list(row.values()))
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     as_attachment=True, download_name="report.xlsx")
+```
+
+## Error handling
+
+| Status | Condition                          |
+|--------|------------------------------------|
+| 400    | No file or empty filename          |
+| 413    | File exceeds size limit            |
+| 422    | Unsupported file extension         |
+| 500    | Parse failure (bad XML, CR format) |
+
+## Thread safety
+
+Flask's development server is single-threaded by default. In production with
+a WSGI server (gunicorn, waitress), each worker has its own
+`CrystalXMLSource` instance, no shared state.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/getting-started/
+========================================================================
+
+# Getting Started
+
+This guide walks through a complete round-trip: installation, first parse,
+schema inspection, a simple pipeline, and DataFrame conversion.
+
+## Install
+
+```bash
+pip install crxml
+```
+
+See [Installation](installation.md) for details on building from source
+and platform support.
+
+## Your first source
+
+Create a small Crystal Reports XML file and point `CrystalXMLSource` at it:
+
+```python
+from crxml import CrystalXMLSource
+
+src = CrystalXMLSource("report.xml")
+
+for row in src:
+    print(row)
+```
+
+Each `row` is a `dict[str, str]`. The keys are field names from the CR XML
+(e.g. `{Report.FieldName}`) and the values are the raw text content.
+
+## Inspect the schema
+
+Use `.schema()` to see the fields without consuming the stream:
+
+```python
+src = CrystalXMLSource("report.xml")
+fields = src.schema()  # list of (key, sample_value) tuples
+for key, sample in fields:
+    print(f"{key}: {sample!r}")
+```
+
+This is useful for building dynamic pipelines.
+
+## Simple pipeline
+
+The `|` operator chains transformation stages. Nothing executes until you
+iterate or sink the result:
+
+```python
+from crxml import CrystalXMLSource, RenameFields, CastTypes, DropFields
+
+pipe = (
+    CrystalXMLSource("report.xml")
+    | RenameFields({
+        "{Report.InvoiceNo}": "invoice",
+        "{Report.Customer}": "customer",
+        "{Report.Amount}": "amount",
+    })
+    | CastTypes({"amount": float})
+    | DropFields("{Report.TaxRate}")
+)
+
+for row in pipe:
+    print(row["invoice"], row["amount"])
+```
+
+## Convert to DataFrame
+
+```python
+from crxml import to_dataframe
+
+df = pipe |> to_dataframe
+```
+
+This collects all rows into a pandas DataFrame. For large files use
+`chunksize=` to build the DataFrame incrementally (see [Sinks](usage/sinks.md)).
+
+## Next steps
+
+- [Usage guide](usage/basic.md), deeper topics: custom stages, parallel mode, branching
+- [Pipeline API](usage/pipeline.md), how `|` and lazy evaluation work
+- [Built-in stages](usage/stages.md), reference for all four stage types
+- [Performance](performance.md), benchmarks, memory model, bottlenecks
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/
+========================================================================
+
+# crxml
+
+Fast streaming parser for SAP Crystal Reports XML exports.
+Parse 100 MB in 0.42 seconds. RSS stays well below file size.
+
+## Features
+
+- Streaming: never loads the full file into memory
+- Fast: Rust parser via PyO3 + quick-xml
+- Pipeline API: compose transformations with `|`
+- Parallel mode: multi-core batch processing
+- Pandas-native: direct to DataFrame or CSV
+
+## Quick Example
+
+```python
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe
+
+df = (
+    CrystalXMLSource("report.xml")
+    | RenameFields({"f1": "invoice", "f2": "amount"})
+    | CastTypes({"amount": float})
+    |> to_dataframe
+)
+```
+
+## License
+
+MIT
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/installation/
+========================================================================
+
+# Installation
+
+## From PyPI
+
+```bash
+pip install crxml
+```
+
+Pre-built wheels are published for Linux x86_64, macOS (arm64 + x86_64), and
+Windows x86_64. The wheel includes the compiled Rust extension so no Rust
+toolchain is required.
+
+## Verify the Rust extension
+
+```python
+from crxml._crxml_core import CrxmlReader
+print("Rust backend OK")
+```
+
+## Building from source
+
+If no pre-built wheel matches your platform, pip will build from source.
+This requires the Rust toolchain.
+
+### Prerequisites
+
+- Python ≥ 3.10
+- [Rust](https://rustup.rs) (stable)
+
+### Build the Rust core
+
+```bash
+pip install maturin
+maturin build --release   # builds the crate in src/crxml_core/
+```
+
+Or use `maturin develop` during development:
+
+```bash
+maturin develop --release
+```
+
+## Supported platforms
+
+| Platform    | Wheel |
+|-------------|-------|
+| Linux x86_64 | ✅   |
+| macOS arm64 | ✅    |
+| macOS x86_64 | ✅   |
+| Windows x86_64 | ✅ |
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/performance/
+========================================================================
+
+# Performance
+
+## Benchmarks
+
+| Test | Size | Rows | Time | Rows/s | MB/s | RSS |
+|------|------|------|------|--------|------|-----|
+| Stream | 10 MB | 9,010 | 0.043s | 211 K | 234 | 22 MB |
+| Stream | 50 MB | 45,328 | 0.223s | 203 K | 224 | 45 MB |
+| Stream | 100 MB | 90,384 | 0.418s | 216 K | 239 | 75 MB |
+| To list | 10 MB | 9,010 | 0.052s | 174 K | 192 | 32 MB |
+| To list | 50 MB | 45,328 | 0.249s | 182 K | 201 | 98 MB |
+| To list | 100 MB | 90,384 | 0.478s | 189 K | 209 | 181 MB |
+| Pipeline | 10 MB | 9,010 | 0.060s | 150 K | 166 | 32 MB |
+| Pipeline | 50 MB | 45,328 | 0.295s | 154 K | 169 | 96 MB |
+| Pipeline | 100 MB | 90,384 | 0.579s | 156 K | 173 | 176 MB |
+| DataFrame | 10 MB | 9,010 | 0.320s | 28 K | 31 | 86 MB |
+| DataFrame | 50 MB | 45,328 | 0.538s | 84 K | 93 | 152 MB |
+| DataFrame | 100 MB | 90,384 | 0.829s | 109 K | 121 | 234 MB |
+
+pandas is imported lazily — RSS and time for DataFrame mode includes pandas overhead.
+
+## Where time goes
+
+- **I/O:** ~15% of parse time (kernel read syscalls)
+- **XML parsing:** ~40% (quick-xml)
+- **Dict construction:** ~30% (PyDict creation, key/value allocation)
+- **Python overhead:** ~15% (yield, iteration boundary)
+
+The dominant cost is allocating Python `str` objects for each field value and
+constructing dicts. This overhead is inherent to the Python/Rust boundary.
+
+## Memory breakdown
+
+```
+┌──────────────────┐
+│  I/O buffer      │  2 MB  (reused Vec<u8>)
+│  Row dict        │  ~2 KB per row (temporary)
+│  RSS floor       │  15 MB (Python interpreter, no pandas)
+│  Pipeline stages │  ~20 MB (stage objects, fusion)
+└──────────────────┘
+```
+
+RSS scales with file content (22 MB for 10 MB, 75 MB for 100 MB).
+
+## Parallel mode
+
+For files >200 MB, parallel mode distributes batches across N workers:
+
+| Workers | 500 MB file | Speedup |
+|---------|-------------|---------|
+| 1       | 3.2 s       | 1.0×    |
+| 2       | 1.9 s       | 1.7×    |
+| 4       | 1.1 s       | 2.9×    |
+| 8       | 0.9 s       | 3.6×    |
+
+Diminishing returns past 4 workers due to IPC overhead.
+
+## Bottleneck analysis
+
+- **Disk I/O:** Not the bottleneck for files <1 GB on modern NVMe SSDs
+- **Single-threaded Python:** Dict allocation is the bottleneck
+- **XML parsing:** quick-xml is fast; the bottleneck is Python dict construction
+- **Rust allocator:** Uses system allocator with stable RSS
+
+## Recommendations
+
+| File size | Strategy |
+|-----------|----------|
+| < 50 MB   | Sequential (no overhead) |
+| 50–200 MB | Sequential or parallel(2) |
+| > 200 MB  | parallel(4) |
+| > 1 GB    | parallel(N_CPU), chunksize=20000 |
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/rust-core/
+========================================================================
+
+# Rust Core
+
+The native accelerator is a PyO3 crate at `src/crxml_core/`.
+
+## Crate structure
+
+```
+src/crxml_core/
+├── Cargo.toml
+└── src/
+    └── lib.rs          # CrxmlReader class
+```
+
+### `CrxmlReader`
+
+A single Python-exposed class:
+
+```rust
+#[pyclass]
+struct CrxmlReader {
+    source: PathBuf,
+    row_tag: String,
+    buf: Vec<u8>,
+    inner_buf: Vec<u8>,
+}
+```
+
+- `__iter__`, returns `self`
+- `__next__`, reads the next row as a `PyDict`
+
+The reader walks the XML stream, finds `<row_tag>` elements, and extracts
+field key/value pairs from nested `<Field>` and `<Text>` elements.
+
+## Dependencies
+
+| Crate       | Purpose                        |
+|-------------|--------------------------------|
+| `pyo3`      | Python bindings                |
+| `quick-xml` | Streaming XML reader           |
+| `memchr`    | Fast byte searching (used internally by quick-xml) |
+
+## Building
+
+```bash
+# Development build (editable)
+maturin develop --release
+
+# Production wheel
+maturin build --release
+```
+
+The `pyproject.toml` `[tool.maturin]` section controls the build:
+
+```toml
+[tool.maturin]
+module-name = "crxml._crxml_core"
+manifest-path = "src/crxml_core/Cargo.toml"
+```
+
+## Code style
+
+- Rust 2021 edition
+- `cargo fmt` for formatting
+- `cargo clippy`, no warnings allowed
+- Unsafe code is prohibited (`#![deny(unsafe_code)]`)
+
+## Testing
+
+```bash
+# Rust unit tests
+cargo test --manifest-path src/crxml_core/Cargo.toml
+
+# Integration via Python
+python -c "from crxml._crxml_core import CrxmlReader; r = CrxmlReader('test.xml', 'Details'); print(next(r))"
+```
+
+## Security
+
+- **No unsafe code**, the entire crate is safe Rust
+- **Input validation**, XML is assumed trusted (users control their source
+  files). Buffer sizes are managed by quick-xml.
+- **Buffer limits**, individual field values are bounded by the XML entity
+  size. No unbounded allocations.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/basic/
+========================================================================
+
+# Basic Parsing
+
+## Opening a file
+
+`CrystalXMLSource` accepts a file path (string or `pathlib.Path`):
+
+```python
+from crxml import CrystalXMLSource
+
+# path string
+src = CrystalXMLSource("report.xml")
+
+# pathlib.Path
+from pathlib import Path
+src = CrystalXMLSource(Path("report.xml"))
+```
+
+### Parameters
+
+| Param    | Type               | Default   | Description                   |
+|----------|--------------------|-----------|-------------------------------|
+| `source` | `str \| Path`      | —         | Path to CR XML file           |
+| `row_tag`| `str`              | `"Row"`   | XML tag for each record row   |
+
+The `row_tag` parameter lets you target a different repeating element if your
+CR XML uses a non-standard tag name.
+
+## Iteration
+
+`CrystalXMLSource` is iterable. Each row is a `dict[str, str]`:
+
+```python
+for row in CrystalXMLSource("report.xml"):
+    print(row["{Report.InvoiceNo}"], row["{Report.Amount}"])
+```
+
+Keys are the `FieldName` attribute values from the CR XML (e.g.
+`{Report.InvoiceNo}`). Values are the raw text of the first
+`<FormattedValue>` or `<Value>` child element.
+
+## Schema inspection
+
+Call `.schema()` to discover fields without consuming the stream:
+
+```python
+src = CrystalXMLSource("report.xml")
+fields = src.schema()  # list of (key, sample_value) tuples
+```
+
+The source yields rows internally and caches them, so the first batch is not
+lost. `.schema()` is safe to call before building a pipeline.
+
+## Memory model
+
+The parser streams the file in constant memory. The Rust backend reuses
+internal buffers across rows and never materializes the full document.
+RSS scales with file content (22 MB for 10 MB, 75 MB for 100 MB),
+staying well below file size. pandas is imported lazily — memory climbs
+only when `to_dataframe` is called.
+
+## CR XML layout detection
+
+Crystal Reports XML stores field values in two patterns:
+
+- **Attribute style:** `<Field FieldName="{Report.Amount}"><Value>123.45</Value></Field>`
+- **Element style:** `<Field><FieldName>{Report.Amount}</FieldName><Value>123.45</Value></Field>`
+- **Mixed:** some fields use attributes, others use child elements
+
+The parser detects both styles automatically, no configuration needed.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/branching/
+========================================================================
+
+# Branching
+
+Pipelines are immutable. This makes it safe to reuse a base pipeline as the
+starting point for multiple branches.
+
+## Example: split by region
+
+```python
+from crxml import CrystalXMLSource, FilterRows, to_csv
+
+base = CrystalXMLSource("report.xml")
+
+north = base | FilterRows(lambda r: r.get("region") == "north")
+south = base | FilterRows(lambda r: r.get("region") == "south")
+
+to_csv(north, "north.csv")
+to_csv(south, "south.csv")
+```
+
+Each branch is independent. The source file is re-read for each branch, so
+disk I/O scales linearly with the number of branches.
+
+## Example: different transformations per branch
+
+```python
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe, to_csv
+
+base = CrystalXMLSource("report.xml")
+
+# Branch A: rename + CSV export
+branch_a = base | RenameFields({"f1": "invoice", "f2": "amount"})
+to_csv(branch_a, "export.csv")
+
+# Branch B: cast + DataFrame
+branch_b = base | CastTypes({"amount": float})
+df = to_dataframe(branch_b)
+```
+
+## Performance note
+
+Each branch re-opens and re-parses the source file. For large files with
+many branches, consider:
+
+- Using a single pipeline with `FilterRows` for each output path
+- Pre-filtering with external tools like `grep` or `xsv`
+- Caching the parsed stream to a temporary file first
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/custom-stages/
+========================================================================
+
+# Custom Stages
+
+There are three styles for writing custom pipeline stages.
+
+## Generator style
+
+A generator function that yields transformed rows:
+
+```python
+def uppercase_names(stream):
+    for row in stream:
+        if "name" in row:
+            row["name"] = row["name"].upper()
+        yield row
+```
+
+Usage:
+
+```python
+pipe = CrystalXMLSource("report.xml") | uppercase_names
+```
+
+## Map style
+
+A function that returns a map iterator:
+
+```python
+def strip_whitespace(stream):
+    return map(lambda r: {k: v.strip() for k, v in r.items()}, stream)
+```
+
+## Fusable protocol
+
+For optimal performance (especially in parallel mode), implement a class with
+both `apply` and `__call__`:
+
+```python
+class MultiplyField:
+    def __init__(self, field: str, factor: float):
+        self.field = field
+        self.factor = factor
+
+    def apply(self, record: dict) -> dict | None:
+        if self.field in record:
+            try:
+                record[self.field] = float(record[self.field]) * self.factor
+            except (ValueError, TypeError):
+                pass
+        return record
+
+    def __call__(self, stream):
+        for row in stream:
+            yield self.apply(row)
+```
+
+When a stage implements the `Fusable` protocol (has `apply` and `__call__`),
+the pipeline can fuse a contiguous run of fusable stages into a single tight
+loop, avoiding Python generator overhead.
+
+## When to use each style
+
+| Style | Best for | Parallel? |
+|-------|----------|-----------|
+| Generator | Simplicity, complex logic | No (captures self/closures) |
+| Map | Simple transforms | No (lambda not picklable) |
+| Fusable | Performance, parallel mode | Yes |
+
+## Picklability for parallel mode
+
+To use a custom stage with `.parallel()`, it must be picklable:
+
+- Top-level module functions only (no lambdas)
+- Classes with `__init__` storing simple data
+- No closures or local functions
+
+crxml validates picklability at pipeline construction time and raises
+`UnpicklableStageError` for incompatible stages.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/
+========================================================================
+
+# Usage
+
+The usage guides cover everything from basic file parsing to advanced topics
+like parallel execution and custom stage authoring.
+
+<div class="grid cards" markdown>
+
+-   :material-file-document: __Basic Parsing__, Open files, iterate rows, inspect schema, memory model
+-   :material-pipe: __Pipeline API__, The `|` operator, lazy evaluation, immutable composition
+-   :material-tune: __Built-in Stages__, Reference for RenameFields, CastTypes, DropFields, FilterRows
+-   :material-puzzle: __Custom Stages__, Write your own pipeline stages
+-   :material-multicast: __Parallel Execution__, Multi-core batch processing
+-   :material-download: __Sinks__, DataFrame, CSV, list collection
+-   :material-fork: __Branching__, Reuse a base pipeline for multiple outputs
+
+</div>
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/parallel/
+========================================================================
+
+# Parallel Execution
+
+For large files, `.parallel()` splits work across multiple processes.
+
+## Usage
+
+```python
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe
+
+pipe = (
+    CrystalXMLSource("report.xml")
+    | RenameFields({"f1": "name", "f2": "total"})
+    | CastTypes({"total": float})
+)
+
+df = pipe.parallel(workers=4, batch_size=5000) |> to_dataframe
+```
+
+## Parameters
+
+| Param        | Type  | Default | Description                            |
+|--------------|-------|---------|----------------------------------------|
+| `workers`    | `int` | `None`  | Number of worker processes (CPU count) |
+| `batch_size` | `int` | `10000` | Rows per batch sent to workers         |
+
+## Requirements
+
+- All stages in the pipeline must be **fusable** (implement `apply` + `__call__`)
+- All stages must be **picklable** (no lambdas, no closures)
+- The source must be iterable multiple times (file re-opened per batch)
+
+## How it works
+
+1. A reader thread reads the source and splits rows into batches.
+2. Batches are dispatched to a `ProcessPoolExecutor`.
+3. Each worker runs the fused pipeline on its batch.
+4. Results are returned in order via futures.
+
+## When to use
+
+Parallel mode adds overhead for batch serialization and IPC. The heuristic:
+
+| File size  | Recommended |
+|------------|-------------|
+| < 50 MB    | Sequential  |
+| 50–200 MB  | Recommended |
+| > 200 MB   | Parallel    |
+
+## Validation
+
+crxml validates all stages at pipeline construction:
+
+```python
+from crxml import CrystalXMLSource, RenameFields, FilterRows
+
+pipe = CrystalXMLSource("report.xml") | RenameFields({"a": "b"})
+# This works, both stages are Fusable and picklable
+
+pipe2 = CrystalXMLSource("report.xml") | FilterRows(lambda r: r["x"] > 1)
+pipe2.parallel()  # raises UnpicklableStageError, lambda not picklable
+```
+
+## Named function example
+
+```python
+def above_threshold(row):
+    return row if float(row.get("amount", 0)) > 100 else None
+
+pipe = CrystalXMLSource("report.xml") | above_threshold
+pipe.parallel(workers=2)  # works, module-level function
+```
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/pipeline/
+========================================================================
+
+# Pipeline API
+
+The `|` operator composes transformation stages into a lazy pipeline.
+
+## How it works
+
+`CrystalXMLSource | stage` returns a `Pipeline` object. Chaining multiple
+stages creates a composition; nothing executes until you iterate or sink the
+result.
+
+```python
+from crxml import CrystalXMLSource, RenameFields, CastTypes
+
+pipe = (
+    CrystalXMLSource("report.xml")
+    | RenameFields({"f1": "name", "f2": "total"})
+    | CastTypes({"total": float})
+)
+
+# No iteration has happened yet
+for row in pipe:  # execution starts here
+    print(row)
+```
+
+## Immutable composition
+
+Pipelines are immutable. Every `|` produces a new `Pipeline` object without
+modifying the previous one:
+
+```python
+base = CrystalXMLSource("report.xml") | RenameFields(mapping)
+
+# These are independent, each re-reads the source
+pipe_a = base | CastTypes({"amount": float})
+pipe_b = base | DropFields("tax_rate")
+```
+
+## Pipeline object
+
+Usually created implicitly via `|`. The `Pipeline` class is also importable:
+
+```python
+from crxml import Pipeline, CrystalXMLSource, RenameFields
+
+pipe = Pipeline(CrystalXMLSource("report.xml"), RenameFields(mapping))
+```
+
+## Lazy evaluation
+
+Pipelines are fully lazy until one of:
+
+- `for row in pipeline:`, per-row iteration
+- `list(pipeline)`, collect all rows
+- `to_dataframe(pipeline)`, DataFrame sink
+- `to_csv(pipeline, path)`, CSV sink
+- `collect(pipeline)`, list sink
+
+## Example: 3-stage pipeline
+
+```python
+pipe = (
+    CrystalXMLSource("report.xml")
+    | RenameFields({"vendor": "supplier", "price": "cost"})
+    | CastTypes({"cost": float})
+    | FilterRows(lambda r: r["cost"] > 100)
+)
+```
+
+Each stage processes rows in sequence. A row dropped by `FilterRows` never
+reaches later stages.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/sinks/
+========================================================================
+
+# Sinks
+
+Sinks terminate a pipeline and materialize the result.
+
+## to_dataframe
+
+```python
+to_dataframe(pipeline, chunksize: int | None = None) -> pd.DataFrame
+```
+
+Collects all rows into a pandas DataFrame.
+
+- `chunksize=None` (default): builds a list of dicts, then constructs the
+  DataFrame. Simple but memory-intensive for large outputs.
+- `chunksize=N`: incrementally builds the DataFrame in chunks of N rows,
+  then concatenates. Lower peak memory.
+
+```python
+from crxml import CrystalXMLSource, RenameFields, to_dataframe
+
+pipe = CrystalXMLSource("report.xml") | RenameFields({"f1": "name"})
+df = to_dataframe(pipe, chunksize=10000)
+```
+
+## to_csv
+
+```python
+to_csv(pipeline, path: str | Path, **csv_writer_kwargs) -> None
+```
+
+Streams rows directly to CSV. Supports all `csv.writer` kwargs via
+`**csv_writer_kwargs`:
+
+```python
+from crxml import CrystalXMLSource, to_csv
+
+pipe = CrystalXMLSource("report.xml")
+to_csv(pipe, "output.csv", delimiter=";", quoting=1)
+```
+
+The CSV is written incrementally as rows are produced. No intermediate list.
+
+## collect
+
+```python
+collect(pipeline) -> list[dict]
+```
+
+Materializes the pipeline into a list of dicts. Useful for testing and
+debugging:
+
+```python
+from crxml import CrystalXMLSource, collect
+
+rows = collect(CrystalXMLSource("report.xml"))
+assert len(rows) == 8306
+```
+
+## XLSX via openpyxl
+
+crxml does not have a built-in XLSX sink, but you can build one easily:
+
+```python
+from openpyxl import Workbook
+from crxml import CrystalXMLSource, collect
+
+rows = collect(CrystalXMLSource("report.xml"))
+
+wb = Workbook()
+ws = wb.active
+if rows:
+    ws.append(list(rows[0].keys()))
+    for row in rows:
+        ws.append(list(row.values()))
+wb.save("output.xlsx")
+```
+
+For large files, chunk the writes to avoid loading all rows into memory.
+
+========================================================================
+PAGE: https://crxml.emiliano-go.com/usage/stages/
+========================================================================
+
+# Built-in Stages
+
+## RenameFields
+
+```python
+RenameFields(mapping: dict[str, str])
+```
+
+Renames dict keys according to `mapping`. Unmapped keys pass through unchanged.
+
+**Example:**
+
+```python
+# Input:  {"{Report.Vendor}": "Acme", "{Report.Price}": "50.00"}
+# Output: {"supplier": "Acme", "cost": "50.00"}
+
+RenameFields({"{Report.Vendor}": "supplier", "{Report.Price}": "cost"})
+```
+
+## CastTypes
+
+```python
+CastTypes(types: dict[str, type], errors: str = "raise")
+```
+
+Casts specified fields to the given types.
+
+**`errors` modes:**
+
+- `"raise"` (default), raises `TypeError` on conversion failure
+- `"coerce"`, replaces uncastable values with `None`
+- `"skip"`, leaves uncastable values as-is
+
+**Example:**
+
+```python
+# Input:  {"invoice": "INV-001", "qty": "3", "price": "19.99"}
+# Output: {"invoice": "INV-001", "qty": 3, "price": 19.99}
+
+CastTypes({"qty": int, "price": float})
+```
+
+## DropFields
+
+```python
+DropFields(fields: list[str])
+```
+
+Removes specified keys from each row.
+
+**Example:**
+
+```python
+# Input:  {"a": "1", "b": "2", "c": "3"}
+# Output: {"a": "1", "c": "3"}
+
+DropFields(["b"])
+```
+
+## FilterRows
+
+```python
+FilterRows(predicate: Callable[[dict[str, Any]], bool])
+```
+
+Keeps only rows where `predicate(row)` returns `True`.
+
+**Example:**
+
+```python
+# Input:  [{"amt": "10"}, {"amt": "200"}, {"amt": "50"}]
+# Output: [{"amt": "200"}]
+
+FilterRows(lambda r: float(r.get("amt", 0)) > 100)
+```
+
+## Edge cases
+
+- **RenameFields:** If a mapping key does not exist in the row, it is silently
+  ignored. Duplicate target names are not checked, the last mapping wins.
+- **CastTypes:** When `errors="coerce"`, the coerced value is `None`. The
+  original key is always preserved in the output dict.
+- **DropFields:** Dropping a non-existent key is a no-op.
+- **FilterRows:** The predicate receives the row *after* all prior stages.
