@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block site_meta %}
+{% if page.meta and page.meta._seo_head %}
+{{ page.meta._seo_head | safe }}
+{% else %}
+{{ super() }}
+{% endif %}
+{% endblock %}
