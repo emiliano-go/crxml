@@ -103,7 +103,7 @@ name = "crxml on PyPI"
   title_template = "{title} - crxml",
   publisher_name = "Emiliano Gandini Outeda",
   locale = "en_US",
-  twitter_site = "@emiliano_gando",
+  twitter_site = "@emiliano_go_",
   auto_generate_schema = true,
 }
 
