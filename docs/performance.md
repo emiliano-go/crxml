@@ -17,7 +17,7 @@
 | DataFrame | 50 MB | 45,328 | 0.538s | 84 K | 93 | 152 MB |
 | DataFrame | 100 MB | 90,384 | 0.829s | 109 K | 121 | 234 MB |
 
-pandas is imported lazily — RSS and time for DataFrame mode includes pandas overhead.
+pandas is imported lazily: RSS and time for DataFrame mode includes pandas overhead.
 
 ## Where time goes
 
