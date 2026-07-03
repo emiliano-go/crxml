@@ -17,7 +17,7 @@
 - [Branching](https://crxml.emiliano-go.com/usage/branching/): Route records through different pipelines by content
 
 ## Architecture
-- [Architecture](https://crxml.emiliano-go.com/architecture/): How crxml is structured — Python API, Rust core, streaming engine
+- [Architecture](https://crxml.emiliano-go.com/architecture/): How crxml is structured: Python API, Rust core, streaming engine
 - [Performance](https://crxml.emiliano-go.com/performance/): Benchmarks and optimization strategies
 - [Rust Core](https://crxml.emiliano-go.com/rust-core/): The PyO3 Rust extension that accelerates XML parsing
 
