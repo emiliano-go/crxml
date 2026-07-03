@@ -1,0 +1,33 @@
+# crxml Documentation
+
+> Fast streaming parser for Crystal Reports XML exports, with Rust acceleration. Parse large XML exports into structured data with pipeline API, parallel execution, and multiple output sinks.
+
+## Overview
+- [crxml](https://crxml.emiliano-go.com/): Fast streaming parser for Crystal Reports XML exports
+- [Installation](https://crxml.emiliano-go.com/installation/): Install crxml via pip
+- [Getting Started](https://crxml.emiliano-go.com/getting-started/): Parse your first Crystal Reports XML file
+
+## Usage
+- [Basic Parsing](https://crxml.emiliano-go.com/usage/basic/): Parse XML into flat records with field mapping
+- [Pipeline API](https://crxml.emiliano-go.com/usage/pipeline/): Compose parsing stages into reusable pipelines
+- [Built-in Stages](https://crxml.emiliano-go.com/usage/stages/): Filter, transform, validate, aggregate stages
+- [Custom Stages](https://crxml.emiliano-go.com/usage/custom-stages/): Write your own parsing stages
+- [Parallel Execution](https://crxml.emiliano-go.com/usage/parallel/): Parse multiple files concurrently
+- [Sinks](https://crxml.emiliano-go.com/usage/sinks/): Output to pandas, JSON, CSV, Excel, parquet
+- [Branching](https://crxml.emiliano-go.com/usage/branching/): Route records through different pipelines by content
+
+## Architecture
+- [Architecture](https://crxml.emiliano-go.com/architecture/): How crxml is structured — Python API, Rust core, streaming engine
+- [Performance](https://crxml.emiliano-go.com/performance/): Benchmarks and optimization strategies
+- [Rust Core](https://crxml.emiliano-go.com/rust-core/): The PyO3 Rust extension that accelerates XML parsing
+
+## Integrations
+- [FastAPI](https://crxml.emiliano-go.com/fastapi/): Serve parsed Crystal Reports data via FastAPI endpoints
+- [Django](https://crxml.emiliano-go.com/django/): Integrate crxml with Django management commands
+- [Flask](https://crxml.emiliano-go.com/flask/): Use crxml in Flask routes and background tasks
+
+## Reference
+- [API Reference](https://crxml.emiliano-go.com/api/): Complete API reference
+- [Changelog](https://crxml.emiliano-go.com/changelog/): Release history and version notes
+
+For the full documentation in a single file, see [llms-full.txt](https://crxml.emiliano-go.com/llms-full.txt).

@@ -28,7 +28,11 @@ jobs:
         with:
           python-version: '3.x'
       - run: pip install "seoslug>=2.0.1" zensical
+      - run: python scripts/generate_llms_full.py
       - run: zensical build --clean
+      - run: cp docs/robots.txt site/robots.txt
+      - run: cp docs/llms.txt site/llms.txt
+      - run: cp docs/llms-full.txt site/llms-full.txt
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site
