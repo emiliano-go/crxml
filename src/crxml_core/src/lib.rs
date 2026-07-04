@@ -10,11 +10,55 @@ use std::io::BufReader;
 #[cfg(feature = "columnar")]
 use std::io::Read;
 use std::path::Path;
+#[cfg(feature = "columnar")]
+use std::collections::HashMap;
 
 #[cfg(feature = "columnar")]
 pub mod columnar;
 #[cfg(feature = "columnar")]
 pub mod splitter;
+
+#[cfg(feature = "columnar")]
+fn build_plan_from_kwargs(
+    field_mapping: Option<HashMap<String, String>>,
+    drop_fields: Option<Vec<String>>,
+    filter: Option<HashMap<String, String>>,
+) -> PyResult<columnar::BuildPlan> {
+    let mut plan = columnar::BuildPlan::new();
+
+    if let Some(map) = field_mapping {
+        plan.field_map = map;
+    }
+
+    if let Some(drop) = drop_fields {
+        plan.drop_fields = drop.into_iter().collect();
+    }
+
+    if let Some(f) = filter {
+        let field = f
+            .get("field")
+            .ok_or_else(|| PyException::new_err("filter must include 'field' key"))?
+            .to_owned();
+        let op = f
+            .get("op")
+            .ok_or_else(|| PyException::new_err("filter must include 'op' key"))?
+            .to_owned();
+        let value = f
+            .get("value")
+            .ok_or_else(|| PyException::new_err("filter must include 'value' key"))?
+            .to_owned();
+        plan.filter = Some(match op.as_str() {
+            "!=" | "ne" => columnar::FilterPredicate::NotEqual { field, value },
+            "==" | "eq" => columnar::FilterPredicate::Equal { field, value },
+            other => {
+                    let msg = format!("unsupported filter op {other:?}; use '!=' or '=='");
+                    return Err(PyException::new_err(msg));
+            }
+        });
+    }
+
+    Ok(plan)
+}
 
 #[pyclass]
 pub struct CrxmlReader {
@@ -235,7 +279,16 @@ impl CrxmlReader {
 
     #[cfg(feature = "columnar")]
     #[staticmethod]
-    fn read_to_columnar(path: String, row_tag: Option<String>) -> PyResult<PyObject> {
+    #[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None))]
+    fn read_to_columnar(
+        path: String,
+        row_tag: Option<String>,
+        field_mapping: Option<HashMap<String, String>>,
+        drop_fields: Option<Vec<String>>,
+        filter: Option<HashMap<String, String>>,
+    ) -> PyResult<PyObject> {
+        let plan = build_plan_from_kwargs(field_mapping, drop_fields, filter)?;
+
         let p = Path::new(&path);
         if !p.is_file() {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
@@ -249,7 +302,7 @@ impl CrxmlReader {
 
         let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
 
-        let mut engine = columnar::ColumnarEngine::with_capacity(bytes.len() / 512);
+        let mut engine = columnar::ColumnarEngine::with_plan(bytes.len() / 512, plan);
         engine
             .parse_bytes(&bytes, &row_tag)
             .map_err(|e| PyException::new_err(format!("Columnar parse error: {}", e)))?;
@@ -259,11 +312,17 @@ impl CrxmlReader {
 
     #[cfg(feature = "columnar")]
     #[staticmethod]
+    #[pyo3(signature = (path, row_tag=None, num_chunks=2, field_mapping=None, drop_fields=None, filter=None))]
     fn read_to_columnar_multi(
         path: String,
         row_tag: Option<String>,
         num_chunks: usize,
+        field_mapping: Option<HashMap<String, String>>,
+        drop_fields: Option<Vec<String>>,
+        filter: Option<HashMap<String, String>>,
     ) -> PyResult<PyObject> {
+        let plan = build_plan_from_kwargs(field_mapping, drop_fields, filter)?;
+
         let p = Path::new(&path);
         if !p.is_file() {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
@@ -287,7 +346,7 @@ impl CrxmlReader {
                 64
             };
             let mut engine =
-                columnar::ColumnarEngine::with_capacity(estimated.max(1));
+                columnar::ColumnarEngine::with_plan(estimated.max(1), plan.clone());
             engine
                 .parse_bytes(&bytes[chunk.clone()], &row_tag)
                 .map_err(|e| PyException::new_err(format!(
@@ -302,11 +361,17 @@ impl CrxmlReader {
 
     #[cfg(feature = "columnar")]
     #[staticmethod]
+    #[pyo3(signature = (path, row_tag=None, num_chunks=4, field_mapping=None, drop_fields=None, filter=None))]
     fn read_to_columnar_par(
         path: String,
         row_tag: Option<String>,
         num_chunks: usize,
+        field_mapping: Option<HashMap<String, String>>,
+        drop_fields: Option<Vec<String>>,
+        filter: Option<HashMap<String, String>>,
     ) -> PyResult<PyObject> {
+        let plan = build_plan_from_kwargs(field_mapping, drop_fields, filter)?;
+
         let p = Path::new(&path);
         if !p.is_file() {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
@@ -325,18 +390,23 @@ impl CrxmlReader {
         use rayon::prelude::*;
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
+        let bytes_ref: &[u8] = &bytes;
+        let row_tag_ref: &[u8] = &row_tag;
+
         let results: Vec<Result<columnar::ColumnarEngine, String>> = chunks
             .par_iter()
             .map(|range| {
-                catch_unwind(AssertUnwindSafe(|| {
+                let range = range.clone();
+                let plan = plan.clone();
+                catch_unwind(AssertUnwindSafe(move || {
                     let est = if range.len() > 0 {
                         (range.len() / 512).max(64)
                     } else {
                         64
                     };
-                    let mut engine = columnar::ColumnarEngine::with_capacity(est);
+                    let mut engine = columnar::ColumnarEngine::with_plan(est, plan);
                     engine
-                        .parse_bytes(&bytes[range.clone()], &row_tag)
+                        .parse_bytes(&bytes_ref[range.clone()], row_tag_ref)
                         .map_err(|e| format!("Parse error in chunk {:?}: {}", range, e))?;
                     Ok(engine)
                 }))
