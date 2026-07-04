@@ -239,4 +239,63 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], 0..xml.len());
     }
+
+    /// Stress test: feed arbitrary byte patterns through the splitter.
+    /// Must not panic on any input.
+    #[test]
+    fn test_random_bytes_no_panic() {
+        // 100 deterministic pseudo-random inputs derived from known seeds.
+        let seeds: &[&[u8]] = &[
+            b"",
+            b"<",
+            b"<Row",
+            b"<Row>",
+            b"<Ro",
+            b"<<<<",
+            b"<Row A=\"1\"/><Row B=\"2\"/>",
+            b"<!-- <Row> -->",
+            b"<![CDATA[<Row>]]>",
+            b"\0\0\0\0",
+            b"\xff\xff\xff\xff",
+            b"<Row>\x00\x00<Row>",
+            b"<Row>\n<Row>\n<Row>",
+            b"<Row/>,<Row/>",
+            b"<RowItem/><Row/>",
+            b"<Row/><RowItem/>",
+            b"  <Row/>",
+            b"<Row/>  ",
+            b"<Row><!--<Row>--><Row/>",
+            b"<Row><![CDATA[<Row>]]><Row/>",
+            b"<!--",
+            b"<!-- <Row> ",
+            b"<![CDATA[",
+            b"<![CDATA[ <Row> ",
+            b"<Row/><Row/><Row/><Row/>",
+            b"<Row/><Row/><Row/><Row/><Row/>",
+            b"<Details Level=\"3\">text</Details>",
+            b"<Details><Section SectionNumber=\"0\"><Field Name=\"X\"><Value>1</Value></Field></Section></Details>",
+        ];
+
+        let tags: &[&[u8]] = &[b"Row", b"Details", b"Item", b"A"];
+        for seed in seeds {
+            for tag in tags {
+                let (skip, _) = find_special_regions(seed);
+                let _ = next_row_start(seed, 0, tag, &skip);
+                for n in [1, 2, 3, 4, 8, 17] {
+                    let chunks = compute_splits(seed, tag, n);
+                    // Basic structural invariants
+                    for c in &chunks {
+                        assert!(c.start <= c.end, "range {:?} inverted", c);
+                    }
+                    if chunks.len() > 1 {
+                        assert_eq!(chunks[0].start, 0);
+                        assert_eq!(chunks[chunks.len() - 1].end, seed.len());
+                        for w in chunks.windows(2) {
+                            assert_eq!(w[0].end, w[1].start, "gap in chunks");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

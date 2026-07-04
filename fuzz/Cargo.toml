@@ -1,0 +1,23 @@
+[package]
+name = "crxml-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+crxml-core = { path = "../src/crxml_core", features = ["columnar"] }
+
+[profile.release]
+opt-level = 3
+debug = 1
+strip = true
+
+[[bin]]
+name = "splitter"
+path = "fuzz_targets/splitter.rs"
+test = false
+doc = false
