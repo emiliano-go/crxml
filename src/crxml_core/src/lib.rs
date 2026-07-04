@@ -195,24 +195,20 @@ impl CrxmlReader {
                                     row.push((key, text));
                                 }
 
-                                else {
+                                else if child_tag == b"Section" {
+                                    let sn = child
+                                        .attributes()
+                                        .filter_map(|a| a.ok())
+                                        .find(|a| a.key.as_ref() == b"SectionNumber")
+                                        .and_then(|a| a.unescape_value().ok())
+                                        .unwrap_or_default()
+                                        .into_owned();
+                                    row.push(("Section".to_string(), sn));
+                                } else {
                                     let key = std::str::from_utf8(child_tag)
                                         .map_err(|e| PyException::new_err(format!("Non-UTF8 tag name: {}", e)))?
                                         .to_owned();
-                                    let text = if matches!(child_event, Event::Start(_)) {
-                                        let text_event = reader.read_event_into(buf).map_err(|e| {
-                                            PyException::new_err(format!("Text read error: {}", e))
-                                        })?;
-                                        match text_event {
-                                            Event::Text(txt) => txt.unescape()
-                                                .map_err(|e| PyException::new_err(format!("Text unescape error: {}", e)))?
-                                                .into_owned(),
-                                            _ => String::new(),
-                                        }
-                                    } else {
-                                        String::new()
-                                    };
-                                    row.push((key, text));
+                                    row.push((key, String::new()));
                                 }
                             }
 
