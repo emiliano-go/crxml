@@ -6,7 +6,7 @@ CrystalXMLSource(source: str | Path, *, row_tag: str = "Row")
 
 | Param     | Type               | Default   | Description                   |
 |-----------|--------------------|-----------|-------------------------------|
-| `source`  | `str \| Path`      | --        | Path to CR XML file           |
+| `source`  | `str \| Path`      | required | Path to CR XML file           |
 | `row_tag` | `str`              | `"Row"`   | XML tag for each record row   |
 
 **Returns:** iterable of `dict[str, str]`

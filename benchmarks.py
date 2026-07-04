@@ -15,6 +15,9 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE / "src"))
+import importlib
+_core = importlib.import_module("crxml._crxml_core")
 OUT_DIR = HERE / "bench_data"
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -181,9 +184,19 @@ def generate_file(target_mb: int, path: Path):
 
 # ── Benchmarks ─────────────────────────────────────────────────────────
 
-def bench_speed(path, label):
+def bench_native_speed(path, label, fn, **kwargs):
+    t0 = time.perf_counter()
+    tbl = fn(path, **kwargs)
+    t1 = time.perf_counter()
+    dur = t1 - t0
+    rows = tbl.num_rows
+    size = os.path.getsize(path)
+    print(f"  {label:30s}  {rows:>7,} rows  {dur:.4f}s  {rows/dur:>8,.0f} rows/s  {size/dur/1024/1024:>6.1f} MB/s")
+
+
+def bench_source_speed(path, label, engine):
     from crxml import CrystalXMLSource
-    src = CrystalXMLSource(path, row_tag="Details")
+    src = CrystalXMLSource(path, row_tag="Details", engine=engine)
     t0 = time.perf_counter()
     n = sum(1 for _ in src)
     t1 = time.perf_counter()
@@ -192,28 +205,68 @@ def bench_speed(path, label):
     print(f"  {label:30s}  {n:>7,} rows  {dur:.4f}s  {n/dur:>8,.0f} rows/s  {size/dur/1024/1024:>6.1f} MB/s")
 
 
-def bench_mem(path, label):
-    code = f"""
-import tracemalloc, resource
-tracemalloc.start()
-from crxml import CrystalXMLSource
-n = sum(1 for _ in CrystalXMLSource("{path}", row_tag="Details"))
-_, peak = tracemalloc.get_traced_memory()
-rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-print(f"ROWS={{n}} PY_PEAK={{peak}} RSS={{rss}}")
-"""
+def bench_source_arrow(path, label, engine):
+    from crxml import CrystalXMLSource
+
+    src = CrystalXMLSource(path, row_tag="Details", engine=engine)
     t0 = time.perf_counter()
-    result = subprocess.run([sys.executable, "-c", code],
-                            capture_output=True, text=True, timeout=120)
+    tbl = src.to_arrow()
     t1 = time.perf_counter()
     dur = t1 - t0
-    for line in result.stdout.splitlines():
-        vals = {kv.split("=")[0]: kv.split("=")[1] for kv in line.split()}
-        rows = int(vals["ROWS"])
-        py_peak = int(vals["PY_PEAK"]) / 1024 / 1024
-        rss = float(vals["RSS"])
-        print(f"  {label:30s}  {rows:>7,} rows  {dur:.3f}s  {py_peak:>5.1f} MB py  {rss:>5.1f} MB rss")
-        break
+    size = os.path.getsize(path)
+    print(f"  {label:30s}  {tbl.num_rows:>7,} rows  {dur:.4f}s  {tbl.num_rows/dur:>8,.0f} rows/s  {size/dur/1024/1024:>6.1f} MB/s")
+
+
+def bench_source_dataframe(path, label, engine):
+    from crxml import CrystalXMLSource
+
+    src = CrystalXMLSource(path, row_tag="Details", engine=engine)
+    t0 = time.perf_counter()
+    df = src.to_dataframe()
+    t1 = time.perf_counter()
+    dur = t1 - t0
+    size = os.path.getsize(path)
+    print(f"  {label:30s}  {len(df):>7,} rows  {dur:.4f}s  {len(df)/dur:>8,.0f} rows/s  {size/dur/1024/1024:>6.1f} MB/s")
+
+
+def bench_native_mem(path, label, fn, **kwargs):
+    import tracemalloc
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+    tbl = fn(path, **kwargs)
+    t1 = time.perf_counter()
+    _, peak = tracemalloc.get_traced_memory()
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"  {label:30s}  {tbl.num_rows:>7,} rows  {t1 - t0:.3f}s  {peak / 1024 / 1024:>5.1f} MB py  {rss:>5.1f} MB rss")
+
+
+def bench_source_mem(path, label, engine):
+    import tracemalloc
+
+    from crxml import CrystalXMLSource
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+    n = sum(1 for _ in CrystalXMLSource(path, row_tag="Details", engine=engine))
+    t1 = time.perf_counter()
+    _, peak = tracemalloc.get_traced_memory()
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"  {label:30s}  {n:>7,} rows  {t1 - t0:.3f}s  {peak / 1024 / 1024:>5.1f} MB py  {rss:>5.1f} MB rss")
+
+
+def bench_source_dataframe_mem(path, label, engine):
+    import tracemalloc
+
+    from crxml import CrystalXMLSource
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+    df = CrystalXMLSource(path, row_tag="Details", engine=engine).to_dataframe()
+    t1 = time.perf_counter()
+    _, peak = tracemalloc.get_traced_memory()
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"  {label:30s}  {len(df):>7,} rows  {t1 - t0:.3f}s  {peak / 1024 / 1024:>5.1f} MB py  {rss:>5.1f} MB rss")
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -242,19 +295,62 @@ def run():
     if args.gen_only:
         return
 
-    print("\n" + "=" * 60)
-    print("Speed Benchmarks")
-    print("=" * 60)
-    for mb, p in targets:
-        print(f"\n--- {mb} MB ---")
-        bench_speed(str(p), f"Parse {mb} MB")
+    bench_path = targets[-1][1]
+    engines = ["stream", "columnar", "parallel"]
 
     print("\n" + "=" * 60)
-    print("Memory Benchmarks")
+    print("Native Export Benchmarks (100 MB)")
     print("=" * 60)
-    for mb, p in targets:
-        print(f"\n--- {mb} MB ---")
-        bench_mem(str(p), f"Stream {mb} MB")
+    native = [
+        ("read_to_columnar", lambda path: _core.read_to_columnar(path, row_tag="Details")),
+        ("read_to_columnar_multi", lambda path: _core.read_to_columnar_multi(path, row_tag="Details", num_chunks=2)),
+        ("read_to_columnar_par", lambda path: _core.read_to_columnar_par(path, row_tag="Details", num_chunks=4)),
+    ]
+    for name, fn in native:
+        print(f"\n--- {name} ---")
+        bench_native_speed(str(bench_path), name, fn)
+
+    print("\n" + "=" * 60)
+    print("Source Row-Iteration Benchmarks (100 MB)")
+    print("=" * 60)
+    for engine in engines:
+        print(f"\n--- {engine} ---")
+        bench_source_speed(str(bench_path), f"Iter 100 MB [{engine}]", engine)
+
+    print("\n" + "=" * 60)
+    print("Source Arrow Benchmarks (100 MB)")
+    print("=" * 60)
+    for engine in engines:
+        print(f"\n--- {engine} ---")
+        bench_source_arrow(str(bench_path), f"Arrow 100 MB [{engine}]", engine)
+
+    print("\n" + "=" * 60)
+    print("Source DataFrame Benchmarks (100 MB)")
+    print("=" * 60)
+    for engine in engines:
+        print(f"\n--- {engine} ---")
+        bench_source_dataframe(str(bench_path), f"DataFrame 100 MB [{engine}]", engine)
+
+    print("\n" + "=" * 60)
+    print("Native Export Memory (100 MB)")
+    print("=" * 60)
+    for name, fn in native:
+        print(f"\n--- {name} ---")
+        bench_native_mem(str(bench_path), name, fn)
+
+    print("\n" + "=" * 60)
+    print("Source Row-Iteration Memory (100 MB)")
+    print("=" * 60)
+    for engine in engines:
+        print(f"\n--- {engine} ---")
+        bench_source_mem(str(bench_path), f"Iter 100 MB [{engine}]", engine)
+
+    print("\n" + "=" * 60)
+    print("Source DataFrame Memory (100 MB)")
+    print("=" * 60)
+    for engine in engines:
+        print(f"\n--- {engine} ---")
+        bench_source_dataframe_mem(str(bench_path), f"DataFrame 100 MB [{engine}]", engine)
 
 
 if __name__ == "__main__":

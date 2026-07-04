@@ -5,6 +5,9 @@ from typing import Iterable
 def to_dataframe(pipeline: Iterable[dict], chunksize: int | None = None) -> "pd.DataFrame":
     import pandas as pd
     if chunksize is None:
+        if hasattr(pipeline, "_iter_batches"):
+            chunks = [pd.DataFrame.from_records(batch) for batch in pipeline._iter_batches()]
+            return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         return pd.DataFrame.from_records(iter(pipeline))
     chunks = []
     batch = []
@@ -42,4 +45,9 @@ def to_csv(
             writer.writerow(rec)
 
 def collect(pipeline: Iterable[dict]) -> list[dict]:
+    if hasattr(pipeline, "_iter_batches"):
+        rows = []
+        for batch in pipeline._iter_batches():
+            rows.extend(batch)
+        return rows
     return list(pipeline)

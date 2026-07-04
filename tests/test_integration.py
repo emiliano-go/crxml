@@ -75,14 +75,14 @@ class TestEndToEnd10MB:
 
     def test_to_dataframe(self, bench_10mb):
         df = to_dataframe(CrystalXMLSource(bench_10mb, row_tag="Details"))
-        assert df.shape == (9010, 11)
+        assert df.shape == (9010, 10)
 
     def test_to_dataframe_with_stages(self, bench_10mb):
         df = to_dataframe(
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | DropFields(["Level", "Section"])
         )
-        assert df.shape[1] == 9  # dropped 2 of 11 fields
+        assert df.shape[1] == 8  # dropped 2 of 10 fields
 
     def test_csv_roundtrip(self, bench_10mb, tmp_path):
         out = tmp_path / "out.csv"

@@ -16,14 +16,17 @@ crate-type = ["cdylib"]
 [features]
 default = []
 # Columnar engine: build typed arrays in Rust, export via PyArrow
-columnar = ["dep:rayon", "dep:indexmap", "dep:bumpalo"]
+columnar = ["dep:rayon", "dep:indexmap", "dep:bumpalo", "dep:arrow"]
 # Memory-map input files (carries the only unsafe in the crate)
 mmap = ["dep:memmap2"]
+# Profiling counters (Instant timestamps around hot paths)
+profile = []
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 quick-xml = "0.36"
 memchr = "2"
+lexical = "7"
 
 # Parallel chunked parsing with work-stealing thread pool
 rayon = { version = "1", optional = true }
@@ -32,6 +35,9 @@ bumpalo = { version = "3", optional = true }
 
 # Memory-mapped file I/O (carries the one unsafe)
 memmap2 = { version = "0.9", optional = true }
+
+# Arrow zero-copy export via C Data Interface (behind columnar)
+arrow = { version = "=55.2.0", default-features = false, features = ["pyarrow"], optional = true }
 
 [profile.release]
 opt-level = 3
