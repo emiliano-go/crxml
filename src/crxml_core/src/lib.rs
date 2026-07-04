@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use pyo3::exceptions::{PyIOError, PyException};
 use pyo3::prelude::*;
@@ -17,6 +17,106 @@ use std::collections::HashMap;
 pub mod columnar;
 #[cfg(feature = "columnar")]
 pub mod splitter;
+
+#[cfg(feature = "columnar")]
+fn parse_columnar_from_slice(
+    bytes: &[u8],
+    row_tag: &[u8],
+    plan: columnar::BuildPlan,
+) -> PyResult<PyObject> {
+    let mut engine =
+        columnar::ColumnarEngine::with_plan((bytes.len() / 512).max(64), plan);
+    engine
+        .parse_bytes(bytes, row_tag)
+        .map_err(|e| PyException::new_err(format!("Columnar parse error: {}", e)))?;
+    Python::with_gil(|py| engine.to_pyarrow_table(py))
+}
+
+#[cfg(feature = "columnar")]
+fn parse_columnar_multi_from_slice(
+    bytes: &[u8],
+    row_tag: &[u8],
+    plan: columnar::BuildPlan,
+    num_chunks: usize,
+) -> PyResult<PyObject> {
+    let chunks = splitter::compute_splits(bytes, row_tag, num_chunks);
+    let mut merged = columnar::ColumnarEngine::new();
+    for chunk in &chunks {
+        let mut engine = columnar::ColumnarEngine::with_plan(
+            (chunk.len() / 512).max(64),
+            plan.clone(),
+        );
+        engine
+            .parse_bytes(&bytes[chunk.clone()], row_tag)
+            .map_err(|e| {
+                PyException::new_err(format!(
+                    "Columnar parse error in chunk {:?}: {}",
+                    chunk, e
+                ))
+            })?;
+        merged.extend(engine);
+    }
+    Python::with_gil(|py| merged.to_pyarrow_table(py))
+}
+
+#[cfg(feature = "columnar")]
+fn parse_columnar_par_from_slice(
+    bytes: &[u8],
+    row_tag: &[u8],
+    plan: columnar::BuildPlan,
+    num_chunks: usize,
+) -> PyResult<PyObject> {
+    let chunks = splitter::compute_splits(bytes, row_tag, num_chunks);
+
+    use rayon::prelude::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let results: Vec<Result<columnar::ColumnarEngine, String>> = chunks
+        .par_iter()
+        .map(|range| {
+            let range = range.clone();
+            let plan = plan.clone();
+            catch_unwind(AssertUnwindSafe(move || {
+                let est = if range.len() > 0 {
+                    (range.len() / 512).max(64)
+                } else {
+                    64
+                };
+                let mut engine = columnar::ColumnarEngine::with_plan(est, plan);
+                engine
+                    .parse_bytes(&bytes[range.clone()], row_tag)
+                    .map_err(|e| format!("Parse error in chunk {:?}: {}", range, e))?;
+                Ok(engine)
+            }))
+            .unwrap_or_else(|_| Err("Worker panicked during parallel parse".to_string()))
+        })
+        .collect();
+
+    let mut merged = columnar::ColumnarEngine::new();
+    for result in results {
+        let engine = result.map_err(|e| PyException::new_err(e))?;
+        merged.extend(engine);
+    }
+    Python::with_gil(|py| merged.to_pyarrow_table(py))
+}
+
+#[cfg(feature = "mmap")]
+fn mmap_and_parse(
+    path: &str,
+    row_tag: &[u8],
+    plan: columnar::BuildPlan,
+) -> PyResult<PyObject> {
+    let p = Path::new(path);
+    let file = File::open(p)
+        .map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
+    // SAFETY: The caller must not truncate or write to the file while the
+    // mapping exists. crxml is a read-only parser; no writes occur.
+    #[allow(unsafe_code)]
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", path, e)))?;
+    let _ = mmap.advise(memmap2::Advice::Sequential);
+    parse_columnar_from_slice(&mmap[..], row_tag, plan)
+}
 
 #[cfg(feature = "columnar")]
 fn build_plan_from_kwargs(
@@ -279,13 +379,14 @@ impl CrxmlReader {
 
     #[cfg(feature = "columnar")]
     #[staticmethod]
-    #[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None))]
+    #[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, use_mmap=false))]
     fn read_to_columnar(
         path: String,
         row_tag: Option<String>,
         field_mapping: Option<HashMap<String, String>>,
         drop_fields: Option<Vec<String>>,
         filter: Option<HashMap<String, String>>,
+        use_mmap: bool,
     ) -> PyResult<PyObject> {
         let plan = build_plan_from_kwargs(field_mapping, drop_fields, filter)?;
 
@@ -293,26 +394,33 @@ impl CrxmlReader {
         if !p.is_file() {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
         }
+        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+
+        if use_mmap {
+            #[cfg(feature = "mmap")]
+            {
+                return mmap_and_parse(&path, &row_tag, plan);
+            }
+            #[cfg(not(feature = "mmap"))]
+            {
+                return Err(PyException::new_err(
+                    "mmap requires the 'mmap' Cargo feature. Rebuild with --features=mmap",
+                ));
+            }
+        }
+
         let mut file =
             File::open(p).map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
-
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
 
-        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
-
-        let mut engine = columnar::ColumnarEngine::with_plan(bytes.len() / 512, plan);
-        engine
-            .parse_bytes(&bytes, &row_tag)
-            .map_err(|e| PyException::new_err(format!("Columnar parse error: {}", e)))?;
-
-        Python::with_gil(|py| engine.to_pyarrow_table(py))
+        parse_columnar_from_slice(&bytes, &row_tag, plan)
     }
 
     #[cfg(feature = "columnar")]
     #[staticmethod]
-    #[pyo3(signature = (path, row_tag=None, num_chunks=2, field_mapping=None, drop_fields=None, filter=None))]
+    #[pyo3(signature = (path, row_tag=None, num_chunks=2, field_mapping=None, drop_fields=None, filter=None, use_mmap=false))]
     fn read_to_columnar_multi(
         path: String,
         row_tag: Option<String>,
@@ -320,6 +428,7 @@ impl CrxmlReader {
         field_mapping: Option<HashMap<String, String>>,
         drop_fields: Option<Vec<String>>,
         filter: Option<HashMap<String, String>>,
+        use_mmap: bool,
     ) -> PyResult<PyObject> {
         let plan = build_plan_from_kwargs(field_mapping, drop_fields, filter)?;
 
@@ -327,41 +436,42 @@ impl CrxmlReader {
         if !p.is_file() {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
         }
+        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+
+        if use_mmap {
+            #[cfg(feature = "mmap")]
+            {
+                let mmap_path = path.as_str();
+                let p_file = Path::new(mmap_path);
+                let file = File::open(p_file).map_err(|e| {
+                    PyIOError::new_err(format!("Cannot open {}: {}", mmap_path, e))
+                })?;
+                #[allow(unsafe_code)]
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", mmap_path, e)))?;
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+                return parse_columnar_multi_from_slice(&mmap[..], &row_tag, plan, num_chunks);
+            }
+            #[cfg(not(feature = "mmap"))]
+            {
+                return Err(PyException::new_err(
+                    "mmap requires the 'mmap' Cargo feature. Rebuild with --features=mmap",
+                ));
+            }
+        }
+
         let mut file =
             File::open(p).map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
-
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
 
-        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
-
-        let chunks = splitter::compute_splits(&bytes, &row_tag, num_chunks);
-        let mut merged = columnar::ColumnarEngine::new();
-
-        for chunk in &chunks {
-            let estimated = if chunk.len() > 0 {
-                chunk.len() / 512
-            } else {
-                64
-            };
-            let mut engine =
-                columnar::ColumnarEngine::with_plan(estimated.max(1), plan.clone());
-            engine
-                .parse_bytes(&bytes[chunk.clone()], &row_tag)
-                .map_err(|e| PyException::new_err(format!(
-                    "Columnar parse error in chunk {:?}: {}", chunk, e
-                )))?;
-            merged.extend(engine);
-        }
-
-        let table = Python::with_gil(|py| merged.to_pyarrow_table(py))?;
-        Ok(table)
+        parse_columnar_multi_from_slice(&bytes, &row_tag, plan, num_chunks)
     }
 
     #[cfg(feature = "columnar")]
     #[staticmethod]
-    #[pyo3(signature = (path, row_tag=None, num_chunks=4, field_mapping=None, drop_fields=None, filter=None))]
+    #[pyo3(signature = (path, row_tag=None, num_chunks=4, field_mapping=None, drop_fields=None, filter=None, use_mmap=false))]
     fn read_to_columnar_par(
         path: String,
         row_tag: Option<String>,
@@ -369,6 +479,7 @@ impl CrxmlReader {
         field_mapping: Option<HashMap<String, String>>,
         drop_fields: Option<Vec<String>>,
         filter: Option<HashMap<String, String>>,
+        use_mmap: bool,
     ) -> PyResult<PyObject> {
         let plan = build_plan_from_kwargs(field_mapping, drop_fields, filter)?;
 
@@ -376,53 +487,37 @@ impl CrxmlReader {
         if !p.is_file() {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
         }
+        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+
+        if use_mmap {
+            #[cfg(feature = "mmap")]
+            {
+                let mmap_path = path.as_str();
+                let p_file = Path::new(mmap_path);
+                let file = File::open(p_file).map_err(|e| {
+                    PyIOError::new_err(format!("Cannot open {}: {}", mmap_path, e))
+                })?;
+                #[allow(unsafe_code)]
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", mmap_path, e)))?;
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+                return parse_columnar_par_from_slice(&mmap[..], &row_tag, plan, num_chunks);
+            }
+            #[cfg(not(feature = "mmap"))]
+            {
+                return Err(PyException::new_err(
+                    "mmap requires the 'mmap' Cargo feature. Rebuild with --features=mmap",
+                ));
+            }
+        }
+
         let mut file =
             File::open(p).map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
-
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
 
-        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
-
-        let chunks = splitter::compute_splits(&bytes, &row_tag, num_chunks);
-
-        use rayon::prelude::*;
-        use std::panic::{catch_unwind, AssertUnwindSafe};
-
-        let bytes_ref: &[u8] = &bytes;
-        let row_tag_ref: &[u8] = &row_tag;
-
-        let results: Vec<Result<columnar::ColumnarEngine, String>> = chunks
-            .par_iter()
-            .map(|range| {
-                let range = range.clone();
-                let plan = plan.clone();
-                catch_unwind(AssertUnwindSafe(move || {
-                    let est = if range.len() > 0 {
-                        (range.len() / 512).max(64)
-                    } else {
-                        64
-                    };
-                    let mut engine = columnar::ColumnarEngine::with_plan(est, plan);
-                    engine
-                        .parse_bytes(&bytes_ref[range.clone()], row_tag_ref)
-                        .map_err(|e| format!("Parse error in chunk {:?}: {}", range, e))?;
-                    Ok(engine)
-                }))
-                .unwrap_or_else(|_| {
-                    Err("Worker panicked during parallel parse".to_string())
-                })
-            })
-            .collect();
-
-        let mut merged = columnar::ColumnarEngine::new();
-        for result in results {
-            let engine = result.map_err(|e| PyException::new_err(e))?;
-            merged.extend(engine);
-        }
-
-        Python::with_gil(|py| merged.to_pyarrow_table(py))
+        parse_columnar_par_from_slice(&bytes, &row_tag, plan, num_chunks)
     }
 }
 
