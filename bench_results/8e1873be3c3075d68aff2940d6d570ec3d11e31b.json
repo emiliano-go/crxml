@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "git_sha": "8e1873be3c3075d68aff2940d6d570ec3d11e31b",
+    "timestamp": "2026-07-04T22:48:35Z",
+    "profile_feature": true,
+    "python": "3.14.5 (main, May 10 2026, 18:26:20) [GCC 16.1.1 20260430]"
+  },
+  "files": {
+    "10 MB": {
+      "event_loop_ns": 119192803,
+      "unescape_ns": 33066959,
+      "dict_build_ns": 20869041,
+      "row_count": 9010,
+      "wall_ns": 258718691,
+      "wall_ms": 258.7186910022865
+    },
+    "50 MB": {
+      "event_loop_ns": 604526455,
+      "unescape_ns": 162478163,
+      "dict_build_ns": 97583221,
+      "row_count": 45328,
+      "wall_ns": 1295892670,
+      "wall_ms": 1295.8926709980005
+    },
+    "100 MB": {
+      "event_loop_ns": 1149786349,
+      "unescape_ns": 320654678,
+      "dict_build_ns": 187686361,
+      "row_count": 90384,
+      "wall_ns": 2484916224,
+      "wall_ms": 2484.916224006156
+    }
+  },
+  "pyspy": {
+    "flamegraph_svg": "/home/eclipse/Documents/GitHub/crxml/bench_results/flamegraph.svg",
+    "size_kb": 85,
+    "duration_s": 5.0
+  }
+}

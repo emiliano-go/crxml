@@ -12,3 +12,6 @@ class DropFields:
 
     def __call__(self, stream):
         return map(self.apply, stream)
+
+    def _plan_kwargs(self) -> dict | None:
+        return {"drop_fields": sorted(self._fields_set)}

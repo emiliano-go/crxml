@@ -19,7 +19,7 @@ src = CrystalXMLSource(Path("report.xml"))
 
 | Param    | Type               | Default   | Description                   |
 |----------|--------------------|-----------|-------------------------------|
-| `source` | `str \| Path`      | --        | Path to CR XML file           |
+| `source` | `str \| Path`      | required | Path to CR XML file           |
 | `row_tag`| `str`              | `"Row"`   | XML tag for each record row   |
 
 The `row_tag` parameter lets you target a different repeating element if your

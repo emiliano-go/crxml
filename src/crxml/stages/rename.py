@@ -10,3 +10,6 @@ class RenameFields:
 
     def __call__(self, stream):
         return map(self.apply, stream)
+
+    def _plan_kwargs(self) -> dict | None:
+        return {"field_mapping": self._mapping}

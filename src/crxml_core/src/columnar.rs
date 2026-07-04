@@ -1,20 +1,66 @@
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::Arc;
 
-/// A compiled build plan that controls field renaming, dropping, and
-/// row filtering during parse.  Default (empty) is a no-op.
+use arrow::array::{
+    ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int32Array, Int64Array,
+    StringArray,
+};
+use arrow::datatypes::{DataType, Field as ArrowField, Int32Type, Schema};
+use arrow::pyarrow::ToPyArrow;
+use arrow::record_batch::RecordBatch;
+
+/// The storage type for a column.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldType {
+    String,
+    Int64,
+    Float64,
+    Boolean,
+    Dictionary,
+}
+
+impl FieldType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "string" => Some(FieldType::String),
+            "int64" => Some(FieldType::Int64),
+            "float64" => Some(FieldType::Float64),
+            "bool" | "boolean" => Some(FieldType::Boolean),
+            "dictionary" => Some(FieldType::Dictionary),
+            _ => None,
+        }
+    }
+}
+
+/// A compiled build plan that controls field renaming, dropping,
+/// type assignment, dictionary encoding, row filtering (per-row
+/// and post-reduce), and column ordering during parse.
+/// Default (empty) is a no-op.
 #[derive(Clone, Debug)]
 pub struct BuildPlan {
     /// Map from raw XML field name to output column name.
     pub field_map: HashMap<String, String>,
     /// Set of raw XML field names to drop entirely.
     pub drop_fields: HashSet<String>,
+    /// Explicit type overrides per output column name.
+    pub field_types: HashMap<String, FieldType>,
+    /// Set of output column names to dict-encode.
+    pub dictionary_columns: HashSet<String>,
     /// Optional row filter predicate.
     pub filter: Option<FilterPredicate>,
+    /// Desired output column order (names in order).  Columns not
+    /// listed here appear after all listed columns in first-appearance
+    /// order.  If empty, first-appearance order is used.
+    pub schema_order: Vec<String>,
+    /// When true, string columns with low cardinality are automatically
+    /// upgraded to dictionary encoding during parse.
+    pub auto_dict: bool,
 }
 
 impl BuildPlan {
@@ -22,27 +68,86 @@ impl BuildPlan {
         BuildPlan {
             field_map: HashMap::new(),
             drop_fields: HashSet::new(),
+            field_types: HashMap::new(),
+            dictionary_columns: HashSet::new(),
             filter: None,
+            schema_order: Vec::new(),
+            auto_dict: false,
         }
+    }
+
+    /// Determine the storage type for an output column name.
+    pub fn column_type(&self, name: &str) -> FieldType {
+        if let Some(ft) = self.field_types.get(name) {
+            return ft.clone();
+        }
+        if self.dictionary_columns.contains(name) {
+            return FieldType::Dictionary;
+        }
+        FieldType::String
     }
 
     /// Resolve a raw field name to its output column name.
     /// Returns `None` if the field should be dropped.
+    ///
+    /// Application order: rename first, then drop — matching left-to-right
+    /// pipeline semantics (a rename changes the field name before the drop
+    /// check, so a drop targets the renamed name, not the original).
     pub fn resolve_field<'a>(&'a self, raw: &'a str) -> Option<&'a str> {
-        if self.drop_fields.contains(raw) {
+        let resolved = self.field_map.get(raw).map_or(raw, |s| s.as_str());
+        if self.drop_fields.contains(resolved) {
             return None;
         }
-        Some(self.field_map.get(raw).map_or(raw, |s| s.as_str()))
+        Some(resolved)
+    }
+}
+
+/// Comparison operator for column-to-column filters (evaluated post-reduce).
+#[derive(Clone, Debug)]
+pub enum CompareOp {
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    Eq,
+    Ne,
+}
+
+impl CompareOp {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            ">" | "gt" => Some(CompareOp::Gt),
+            "<" | "lt" => Some(CompareOp::Lt),
+            ">=" | "ge" => Some(CompareOp::Ge),
+            "<=" | "le" => Some(CompareOp::Le),
+            "==" | "eq" => Some(CompareOp::Eq),
+            "!=" | "ne" => Some(CompareOp::Ne),
+            _ => None,
+        }
+    }
+
+    /// Map to pyarrow.compute function name.
+    pub fn compute_fn(&self) -> &'static str {
+        match self {
+            CompareOp::Gt => "greater",
+            CompareOp::Lt => "less",
+            CompareOp::Ge => "greater_equal",
+            CompareOp::Le => "less_equal",
+            CompareOp::Eq => "equal",
+            CompareOp::Ne => "not_equal",
+        }
     }
 }
 
 /// A filter predicate evaluated per-row during parsing.
 #[derive(Clone, Debug)]
 pub enum FilterPredicate {
-    /// Keep row if `field_value != value` (string comparison).
+    /// Keep row if `field_value != value` (string comparison, per-row).
     NotEqual { field: String, value: String },
-    /// Keep row if `field_value == value` (string comparison).
+    /// Keep row if `field_value == value` (string comparison, per-row).
     Equal { field: String, value: String },
+    /// Column-to-column comparison evaluated post-reduce via pyarrow.compute.
+    Compare { field_a: String, op: CompareOp, field_b: String },
 }
 
 impl FilterPredicate {
@@ -50,6 +155,7 @@ impl FilterPredicate {
     /// `columns` contains all builders; `row_index` is the current
     /// row number (before finishing).  Returns true to keep the row.
     /// The filter field is resolved through `plan.field_map` before lookup.
+    /// Compare filters always return true (evaluated post-reduce).
     pub(crate) fn check(
         &self,
         columns: &HashMap<String, ColumnBuilder>,
@@ -59,55 +165,298 @@ impl FilterPredicate {
         let (field, expected) = match self {
             FilterPredicate::NotEqual { field, value } => (field, value),
             FilterPredicate::Equal { field, value } => (field, value),
+            FilterPredicate::Compare { .. } => return true,
         };
         // Resolve the filter field name: if renamed, use the new name.
         let resolved = plan.field_map.get(field).map_or(field, |s| s);
 
         let actual = columns
             .get(resolved)
-            .and_then(|b| b.values.get(row_index))
-            .and_then(|v| v.as_deref());
+            .and_then(|b| b.get_filter_value(row_index));
+        let actual = actual.as_deref();
         match self {
             FilterPredicate::NotEqual { .. } => actual != Some(expected),
             FilterPredicate::Equal { .. } => actual == Some(expected),
+            FilterPredicate::Compare { .. } => true,
+        }
+    }
+
+    /// Apply a Compare filter over the pyarrow table, returning a filtered
+    /// table.  For per-row filters this is a no-op (returns the table as-is).
+    pub(crate) fn apply_pyarrow(
+        &self,
+        table: PyObject,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        match self {
+            FilterPredicate::Compare { field_a, op, field_b } => {
+                let pc = PyModule::import(py, "pyarrow.compute")?;
+                let fn_name = op.compute_fn();
+                let col_a = table.getattr(py, "column")?.call1(py, (field_a,))?;
+                let col_b = table.getattr(py, "column")?.call1(py, (field_b,))?;
+                let mask = pc.call_method1(fn_name, (col_a, col_b))?;
+                table.getattr(py, "filter")?.call1(py, (mask,))
+            }
+            _ => Ok(table),
         }
     }
 }
 
-/// Per-column builder: stores all values as optional owned strings.
-struct ColumnBuilder {
-    values: Vec<Option<String>>,
+/// Per-column builder: stores all values.  The variant determines
+/// the storage type (String, Int64, Float64, Boolean, or Dictionary).
+enum ColumnBuilder {
+    String(Vec<Option<String>>),
+    Int64(Vec<Option<i64>>),
+    Float64(Vec<Option<f64>>),
+    Boolean(Vec<Option<bool>>),
+    Dictionary { codes: Vec<Option<i32>>, dict: Vec<String> },
 }
 
 impl ColumnBuilder {
-    fn with_capacity(cap: usize) -> Self {
-        ColumnBuilder {
-            values: Vec::with_capacity(cap),
+    fn with_capacity(cap: usize, field_type: &FieldType) -> Self {
+        match field_type {
+            FieldType::String => ColumnBuilder::String(Vec::with_capacity(cap)),
+            FieldType::Int64 => ColumnBuilder::Int64(Vec::with_capacity(cap)),
+            FieldType::Float64 => ColumnBuilder::Float64(Vec::with_capacity(cap)),
+            FieldType::Boolean => ColumnBuilder::Boolean(Vec::with_capacity(cap)),
+            FieldType::Dictionary => ColumnBuilder::Dictionary {
+                codes: Vec::with_capacity(cap),
+                dict: Vec::new(),
+            },
         }
     }
 
+    /// Push a value.  For typed builders (Int64/Float64/Boolean),
+    /// unparseable values become `None` (null), not an error.
+    /// This applies per-chunk: cross-chunk type conflicts resolve
+    /// to null as well (widest type is the declared type).
     fn push(&mut self, value: Option<String>) {
-        self.values.push(value);
+        match self {
+            ColumnBuilder::String(v) => v.push(value),
+            ColumnBuilder::Int64(v) => {
+                v.push(value.and_then(|s| lexical::parse::<i64, _>(s.as_bytes()).ok()));
+            }
+            ColumnBuilder::Float64(v) => {
+                v.push(value.and_then(|s| lexical::parse::<f64, _>(s.as_bytes()).ok()));
+            }
+            ColumnBuilder::Boolean(v) => {
+                v.push(value.and_then(|s| s.parse::<bool>().ok()));
+            }
+            ColumnBuilder::Dictionary { codes, dict } => match value {
+                Some(v) => {
+                    let idx = if let Some(pos) = dict.iter().position(|d| d == &v) {
+                        pos as i32
+                    } else {
+                        let idx = dict.len() as i32;
+                        dict.push(v);
+                        idx
+                    };
+                    codes.push(Some(idx));
+                }
+                None => codes.push(None),
+            },
+        }
+    }
+
+    /// Push a borrowed str — avoids `into_owned()` allocation for
+    /// typed columns that parse and discard the string.
+    fn push_str(&mut self, value: Option<&str>) {
+        match self {
+            ColumnBuilder::String(v) => v.push(value.map(|s| s.to_owned())),
+            ColumnBuilder::Int64(v) => {
+                v.push(value.and_then(|s| lexical::parse::<i64, _>(s.as_bytes()).ok()));
+            }
+            ColumnBuilder::Float64(v) => {
+                v.push(value.and_then(|s| lexical::parse::<f64, _>(s.as_bytes()).ok()));
+            }
+            ColumnBuilder::Boolean(v) => {
+                v.push(value.and_then(|s| s.parse::<bool>().ok()));
+            }
+            ColumnBuilder::Dictionary { codes, dict } => match value {
+                Some(v) => {
+                    let s = v.to_owned();
+                    let idx = if let Some(pos) = dict.iter().position(|d| d == &s) {
+                        pos as i32
+                    } else {
+                        let idx = dict.len() as i32;
+                        dict.push(s);
+                        idx
+                    };
+                    codes.push(Some(idx));
+                }
+                None => codes.push(None),
+            },
+        }
+    }
+
+    fn pop(&mut self) {
+        match self {
+            ColumnBuilder::String(v) => drop(v.pop()),
+            ColumnBuilder::Int64(v) => drop(v.pop()),
+            ColumnBuilder::Float64(v) => drop(v.pop()),
+            ColumnBuilder::Boolean(v) => drop(v.pop()),
+            ColumnBuilder::Dictionary { codes, .. } => drop(codes.pop()),
+        }
     }
 
     fn len(&self) -> usize {
-        self.values.len()
+        match self {
+            ColumnBuilder::String(v) => v.len(),
+            ColumnBuilder::Int64(v) => v.len(),
+            ColumnBuilder::Float64(v) => v.len(),
+            ColumnBuilder::Boolean(v) => v.len(),
+            ColumnBuilder::Dictionary { codes, .. } => codes.len(),
+        }
     }
 
-    fn to_pylist<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyList>> {
-        let items: Vec<PyObject> = self
-            .values
-            .iter()
-            .map(|v| match v {
-                Some(s) => s.into_py(py),
-                None => py.None(),
-            })
-            .collect();
-        PyList::new(py, &items)
+    /// Value at `index` formatted as a string for filter comparison.
+    fn get_filter_value(&self, index: usize) -> Option<String> {
+        match self {
+            ColumnBuilder::String(v) => v.get(index)?.clone(),
+            ColumnBuilder::Int64(v) => v.get(index).map(|o| o.map(|n| n.to_string())).unwrap_or(None),
+            ColumnBuilder::Float64(v) => v.get(index).map(|o| o.map(|n| n.to_string())).unwrap_or(None),
+            ColumnBuilder::Boolean(v) => v.get(index).map(|o| o.map(|n| n.to_string())).unwrap_or(None),
+            ColumnBuilder::Dictionary { codes, dict } => codes
+                .get(index)
+                .and_then(|code| code.map(|idx| dict[idx as usize].clone())),
+        }
+    }
+
+    /// Merge all values from `other` into `self`.  Both must be the same variant.
+    /// Returns `Err` if the two builders are different variants (e.g. String vs Dictionary).
+    fn extend_from(&mut self, other: &ColumnBuilder) -> Result<(), String> {
+        match (self, other) {
+            (ColumnBuilder::String(a), ColumnBuilder::String(b)) => {
+                a.extend(b.iter().cloned());
+            }
+            (ColumnBuilder::Int64(a), ColumnBuilder::Int64(b)) => {
+                a.extend(b.iter().copied());
+            }
+            (ColumnBuilder::Float64(a), ColumnBuilder::Float64(b)) => {
+                a.extend(b.iter().copied());
+            }
+            (ColumnBuilder::Boolean(a), ColumnBuilder::Boolean(b)) => {
+                a.extend(b.iter().copied());
+            }
+            (ColumnBuilder::Dictionary { codes: a_codes, dict: a_dict },
+             ColumnBuilder::Dictionary { codes: b_codes, dict: b_dict }) => {
+                for code in b_codes {
+                    match code {
+                        Some(idx) => {
+                            let val = &b_dict[*idx as usize];
+                            let new_idx = if let Some(pos) = a_dict.iter().position(|d| d == val) {
+                                pos as i32
+                            } else {
+                                let idx = a_dict.len() as i32;
+                                a_dict.push(val.clone());
+                                idx
+                            };
+                            a_codes.push(Some(new_idx));
+                        }
+                        None => a_codes.push(None),
+                    }
+                }
+            }
+            _ => return Err("extend_from: column type mismatch across chunks".to_string()),
+        }
+        Ok(())
+    }
+
+    /// Upgrade a String builder to Dictionary if cardinality is low enough.
+    /// No-op if not String, or if rows < min_rows.
+    fn try_upgrade_to_dict(&mut self, min_rows: usize) {
+        let old = match self {
+            ColumnBuilder::String(v) => std::mem::take(v),
+            _ => return,
+        };
+        if old.len() < min_rows {
+            *self = ColumnBuilder::String(old);
+            return;
+        }
+        // Count distinct values
+        let mut seen = std::collections::HashSet::new();
+        for v in &old {
+            if let Some(s) = v {
+                seen.insert(s.as_str());
+            }
+        }
+        // Threshold: at most 5% distinct, clamped to [16, 256]
+        let threshold = (old.len() / 20).max(16).min(256);
+        if seen.len() > threshold {
+            *self = ColumnBuilder::String(old);
+            return;
+        }
+        // Upgrade: build dictionary + codes
+        let mut dict: Vec<String> = Vec::new();
+        let mut codes: Vec<Option<i32>> = Vec::with_capacity(old.len());
+        for v in &old {
+            match v {
+                Some(s) => {
+                    let idx = match dict.iter().position(|d| d == s) {
+                        Some(i) => i as i32,
+                        None => {
+                            let i = dict.len() as i32;
+                            dict.push(s.clone());
+                            i
+                        }
+                    };
+                    codes.push(Some(idx));
+                }
+                None => codes.push(None),
+            }
+        }
+        *self = ColumnBuilder::Dictionary { codes, dict };
+    }
+
+    /// Arrow logical type for this column (used to build the schema Field).
+    fn arrow_datatype(&self) -> DataType {
+        match self {
+            ColumnBuilder::String(_) => DataType::Utf8,
+            ColumnBuilder::Int64(_) => DataType::Int64,
+            ColumnBuilder::Float64(_) => DataType::Float64,
+            ColumnBuilder::Boolean(_) => DataType::Boolean,
+            ColumnBuilder::Dictionary { .. } => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
+        }
+    }
+
+    /// Build a native Arrow array from the column builder.
+    /// No per-cell Python objects are created.
+    fn to_arrow_array(&self) -> Result<ArrayRef, String> {
+        Ok(match self {
+            ColumnBuilder::String(v) => {
+                Arc::new(v.iter().map(|o| o.as_deref()).collect::<StringArray>())
+            }
+            ColumnBuilder::Int64(v) => {
+                Arc::new(v.iter().copied().collect::<Int64Array>())
+            }
+            ColumnBuilder::Float64(v) => {
+                Arc::new(v.iter().copied().collect::<Float64Array>())
+            }
+            ColumnBuilder::Boolean(v) => {
+                Arc::new(v.iter().copied().collect::<BooleanArray>())
+            }
+            ColumnBuilder::Dictionary { codes, dict } => {
+                let keys: Int32Array = codes.iter().copied().collect();
+                let values: ArrayRef = Arc::new(
+                    dict.iter().map(|s| Some(s.as_str())).collect::<StringArray>(),
+                );
+                let arr = DictionaryArray::<Int32Type>::try_new(keys, values)
+                    .map_err(|e| e.to_string())?;
+                Arc::new(arr)
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn as_str_vec(&self) -> &[Option<String>] {
+        match self {
+            ColumnBuilder::String(v) => v,
+            _ => panic!("as_str_vec called on non-String ColumnBuilder"),
+        }
     }
 }
-
-use pyo3::types::PyList;
 
 /// Columnar engine: parses XML rows into column-oriented storage,
 /// then exports to a PyArrow table in one shot.
@@ -120,6 +469,37 @@ pub struct ColumnarEngine {
 }
 
 impl ColumnarEngine {
+    fn trailing_close_tags_only(bytes: &[u8], mut pos: usize) -> bool {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+
+        if pos >= bytes.len() {
+            return true;
+        }
+
+        while pos < bytes.len() {
+            if bytes[pos] != b'<' || pos + 1 >= bytes.len() || bytes[pos + 1] != b'/' {
+                return false;
+            }
+            pos += 2;
+
+            while pos < bytes.len() && bytes[pos] != b'>' {
+                pos += 1;
+            }
+            if pos >= bytes.len() {
+                return false;
+            }
+            pos += 1;
+
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+        }
+
+        true
+    }
+
     pub fn new() -> Self {
         ColumnarEngine {
             columns: HashMap::new(),
@@ -150,15 +530,35 @@ impl ColumnarEngine {
         }
     }
 
+    fn schema_insert_index(&self, name: &str) -> usize {
+        let order = &self.plan.schema_order;
+        if order.is_empty() {
+            return self.column_order.len();
+        }
+        let pos = order.iter().position(|n| n == name);
+        match pos {
+            Some(p) => self
+                .column_order
+                .iter()
+                .position(|existing| {
+                    order.iter().position(|n| n == existing).map_or(false, |ep| ep > p)
+                })
+                .unwrap_or(self.column_order.len()),
+            None => self.column_order.len(),
+        }
+    }
+
     fn ensure_column(&mut self, name: &str) {
         if !self.columns.contains_key(name) {
             let est = self.estimated_rows.max(64);
-            let mut b = ColumnBuilder::with_capacity(est);
+            let col_type = self.plan.column_type(name);
+            let mut b = ColumnBuilder::with_capacity(est, &col_type);
             for _ in 0..self.row_count {
                 b.push(None);
             }
             self.columns.insert(name.to_owned(), b);
-            self.column_order.push(name.to_owned());
+            let idx = self.schema_insert_index(name);
+            self.column_order.insert(idx, name.to_owned());
         }
     }
 
@@ -174,9 +574,31 @@ impl ColumnarEngine {
             // Last-write-wins: if this column was already pushed for the
             // current (incomplete) row, overwrite instead of append.
             if b.len() > self.row_count {
-                b.values.pop();
+                b.pop();
             }
             b.push(value);
+        }
+    }
+
+    /// Push a borrowed str — avoids `into_owned()` for typed columns.
+    /// Falls back to `push_field` with owned String for String/Dictionary.
+    fn push_field_str(&mut self, name: &str, value: Option<&str>) {
+        let resolved = match self.plan.resolve_field(name) {
+            Some(n) => n.to_owned(),
+            None => return,
+        };
+        self.ensure_column(&resolved);
+        if let Some(b) = self.columns.get_mut(&resolved) {
+            if b.len() > self.row_count {
+                b.pop();
+            }
+            // Use push_str for non-string types to avoid allocation
+            match self.plan.column_type(&resolved) {
+                FieldType::Int64 | FieldType::Float64 | FieldType::Boolean => {
+                    b.push_str(value);
+                }
+                _ => b.push(value.map(|s| s.to_owned())),
+            }
         }
     }
 
@@ -194,7 +616,7 @@ impl ColumnarEngine {
         if let Some(ref filter) = self.plan.filter {
             if !filter.check(&self.columns, self.row_count, &self.plan) {
                 for b in self.columns.values_mut() {
-                    b.values.pop();
+                    b.pop();
                 }
                 return;
             }
@@ -221,10 +643,22 @@ impl ColumnarEngine {
         loop {
             let event = match reader.read_event_into(&mut buf) {
                 Ok(e) => e,
-                Err(_) => {
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("close tag") {
+                        let err_pos = reader.buffer_position() as usize;
+                        self.parse_tail(bytes, row_tag, err_pos)?;
+                        return Ok(());
+                    }
                     let err_pos = reader.buffer_position() as usize;
-                    self.parse_tail(bytes, row_tag, err_pos)?;
-                    return Ok(());
+                    if Self::trailing_close_tags_only(bytes, err_pos) {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "malformed XML at byte {}: {}",
+                        reader.buffer_position(),
+                        e
+                    ));
                 }
             };
 
@@ -435,9 +869,9 @@ impl ColumnarEngine {
         }
     }
 
-    /// Fallback: scan bytes for remaining row tags and parse each row with
-    /// an independent quick-xml reader.  Tag names are copied to owned storage
-    /// before nested reads into the same buffer to avoid borrow conflicts.
+    /// Fallback recovery for chunked parsing: resume by scanning for the next
+    /// row start and parsing rows individually. This handles orphan parent
+    /// close-tags that are valid in the full document but not within a chunk.
     fn parse_tail(&mut self, bytes: &[u8], row_tag: &[u8], start_pos: usize) -> Result<(), String> {
         let (skip_regions, _) = crate::splitter::find_special_regions(bytes);
         let mut pos: usize = start_pos;
@@ -506,8 +940,7 @@ impl ColumnarEngine {
                                             let inner = rr.read_event_into(&mut buf);
                                             match inner {
                                                 Ok(Event::Start(ic)) => {
-                                                    let ic_name =
-                                                        ic.name().as_ref().to_vec();
+                                                    let ic_name = ic.name().as_ref().to_vec();
                                                     if ic_name == b"FormattedValue"
                                                         || ic_name == b"Value"
                                                     {
@@ -521,8 +954,7 @@ impl ColumnarEngine {
                                                     }
                                                 }
                                                 Ok(Event::Empty(ic)) => {
-                                                    let ic_name =
-                                                        ic.name().as_ref().to_vec();
+                                                    let ic_name = ic.name().as_ref().to_vec();
                                                     if ic_name == b"FormattedValue"
                                                         || ic_name == b"Value"
                                                     {
@@ -535,9 +967,7 @@ impl ColumnarEngine {
                                                         }
                                                     }
                                                 }
-                                                Ok(Event::End(ref ne))
-                                                    if ne.name().as_ref() == end =>
-                                                {
+                                                Ok(Event::End(ref ne)) if ne.name().as_ref() == end => {
                                                     break;
                                                 }
                                                 Ok(Event::Eof) => return Ok(()),
@@ -562,17 +992,12 @@ impl ColumnarEngine {
                                         let end = tag;
                                         loop {
                                             match rr.read_event_into(&mut buf) {
-                                                Ok(Event::End(ref ne))
-                                                    if ne.name().as_ref() == end =>
-                                                {
+                                                Ok(Event::End(ref ne)) if ne.name().as_ref() == end => {
                                                     break;
                                                 }
                                                 Ok(Event::Text(txt)) => {
                                                     if let Ok(v) = txt.unescape() {
-                                                        self.push_field(
-                                                            &name,
-                                                            Some(v.into_owned()),
-                                                        );
+                                                        self.push_field(&name, Some(v.into_owned()));
                                                     }
                                                 }
                                                 Ok(Event::Eof) => return Ok(()),
@@ -590,10 +1015,7 @@ impl ColumnarEngine {
                                         .into_owned();
                                     self.push_field("Section", Some(sn));
                                 } else {
-                                    let key =
-                                        std::str::from_utf8(&tag)
-                                            .unwrap_or("")
-                                            .to_owned();
+                                    let key = std::str::from_utf8(&tag).unwrap_or("").to_owned();
                                     self.push_field(&key, Some(String::new()));
                                 }
                             }
@@ -617,21 +1039,27 @@ impl ColumnarEngine {
     /// in `self`.  Columns present in `self` but absent from `other` are
     /// null-padded for `other`'s rows.  Column order follows first-appearance
     /// order across both engines.
-    pub fn extend(&mut self, other: ColumnarEngine) {
+    ///
+    /// Returns `Err` if any column has a type mismatch between chunks.
+    pub fn extend(&mut self, other: ColumnarEngine) -> Result<(), String> {
         let self_rows = self.row_count;
         let other_rows = other.row_count;
 
         // 1. Create columns from other that self doesn't have yet
         //    (null-padded for self's existing rows, no values copied yet)
+        //    Use other's plan for type information (self may have BuildPlan::new()).
+        //    Respect schema_order for insertion position.
         for name in &other.column_order {
             if !self.column_order.contains(name) {
                 let est = self_rows + other.estimated_rows.max(64);
-                let mut builder = ColumnBuilder::with_capacity(est);
+                let col_type = other.plan.column_type(name);
+                let mut builder = ColumnBuilder::with_capacity(est, &col_type);
                 for _ in 0..self_rows {
                     builder.push(None);
                 }
                 self.columns.insert(name.clone(), builder);
-                self.column_order.push(name.clone());
+                let idx = self.schema_insert_index(name);
+                self.column_order.insert(idx, name.clone());
             }
         }
 
@@ -639,9 +1067,7 @@ impl ColumnarEngine {
         for name in &self.column_order.clone() {
             if let Some(self_b) = self.columns.get_mut(name) {
                 if let Some(other_b) = other.columns.get(name) {
-                    for val in &other_b.values {
-                        self_b.push(val.clone());
-                    }
+                    self_b.extend_from(other_b)?;
                 } else {
                     for _ in 0..other_rows {
                         self_b.push(None);
@@ -651,23 +1077,57 @@ impl ColumnarEngine {
         }
 
         self.row_count = self_rows + other_rows;
+        Ok(())
     }
 
-    /// Build a PyArrow table from the columnar data by calling
-    /// `pyarrow.table({"col": pa.array([...]), ...})` from Python.
-    pub fn to_pyarrow_table(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let pyarrow = PyModule::import(py, "pyarrow")?;
-
-        let dict = PyDict::new(py);
-        for name in &self.column_order {
-            if let Some(b) = self.columns.get(name) {
-                let py_list = b.to_pylist(py)?;
-                let array = pyarrow.call_method1("array", (py_list,))?;
-                dict.set_item(name.as_str(), array)?;
+    /// If `auto_dict` is set, upgrade low-cardinality string columns
+    /// to dictionary encoding before export.
+    pub fn auto_dict_upgrade(&mut self) {
+        if self.plan.auto_dict {
+            for (_name, b) in self.columns.iter_mut() {
+                b.try_upgrade_to_dict(512);
             }
         }
-        let table = pyarrow.call_method1("table", (dict,))?;
-        Ok(table.into())
+    }
+
+    /// Build a PyArrow table from the columnar data via the Arrow C Data
+    /// Interface.  Numeric and dictionary arrays cross the boundary as
+    /// contiguous buffers with zero per-cell Python object materialization.
+    /// Applies post-reduce filters (column-to-column compare) if any.
+    pub fn to_pyarrow_table(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        self.normalize();
+
+        if self.column_order.is_empty() {
+            let pa = PyModule::import(py, "pyarrow")?;
+            let table: PyObject = pa
+                .call_method1("table", (PyDict::new(py),))?
+                .into();
+            return Ok(table);
+        }
+
+        let mut fields = Vec::with_capacity(self.column_order.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.column_order.len());
+        for name in &self.column_order {
+            if let Some(b) = self.columns.get(name) {
+                fields.push(ArrowField::new(name.as_str(), b.arrow_datatype(), true));
+                arrays.push(b.to_arrow_array().map_err(PyValueError::new_err)?);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch =
+            RecordBatch::try_new(schema, arrays).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        // Export the single batch as a pyarrow.RecordBatch via C Data Interface.
+        let rb = batch.to_pyarrow(py)?;
+        let pa = PyModule::import(py, "pyarrow")?;
+        let table: PyObject = pa.call_method1("table", (rb,))?.into();
+
+        // Apply post-reduce filter (column-to-column compare)
+        if let Some(ref filter) = self.plan.filter {
+            return filter.apply_pyarrow(table, py);
+        }
+        Ok(table)
     }
 
     pub fn num_rows(&self) -> usize {
@@ -680,6 +1140,23 @@ impl ColumnarEngine {
 
     pub fn column_names(&self) -> &[String] {
         &self.column_order
+    }
+
+    /// Reset all data while preserving the plan and estimated rows.
+    pub fn reset(&mut self) {
+        self.columns.clear();
+        self.column_order.clear();
+        self.row_count = 0;
+    }
+
+    /// Truncate every column back to `row_count`, dropping any partial-row
+    /// values from a mid-field EOF. Idempotent; safe to call before export.
+    pub fn normalize(&mut self) {
+        for b in self.columns.values_mut() {
+            while b.len() > self.row_count {
+                b.pop();
+            }
+        }
     }
 }
 
@@ -710,7 +1187,7 @@ mod tests {
         e1.parse_bytes(xml, b"Details").unwrap();
 
         let mut merged = ColumnarEngine::new();
-        merged.extend(e1);
+        merged.extend(e1).unwrap();
         assert_eq!(merged.num_rows(), 1);
         // Verify column data lengths match row_count
         for (name, col) in &merged.columns {
@@ -732,7 +1209,7 @@ mod tests {
         for chunk in &chunks {
             let mut engine = ColumnarEngine::new();
             engine.parse_bytes(&xml[chunk.clone()], row_tag).unwrap();
-            merged.extend(engine);
+            merged.extend(engine).unwrap();
         }
         assert_eq!(merged.num_rows(), single.num_rows(),
             "multi-chunk produced {} rows, expected {} from single",
@@ -754,7 +1231,7 @@ mod tests {
         for chunk in &chunks {
             let mut engine = ColumnarEngine::new();
             engine.parse_bytes(&xml[chunk.clone()], row_tag).unwrap();
-            merged.extend(engine);
+            merged.extend(engine).unwrap();
         }
         assert_eq!(merged.num_rows(), single.num_rows(),
             "parent-elements test: multi={}, single={}",
@@ -788,7 +1265,7 @@ mod tests {
         let mut merged = ColumnarEngine::new();
         for result in results {
             let engine = result.unwrap();
-            merged.extend(engine);
+            merged.extend(engine).unwrap();
         }
         assert_eq!(
             merged.num_rows(),
@@ -808,7 +1285,7 @@ mod tests {
         for chunk in &chunks {
             let mut engine = ColumnarEngine::new();
             engine.parse_bytes(&xml[chunk.clone()], row_tag).unwrap();
-            merged.extend(engine);
+            merged.extend(engine).unwrap();
         }
         assert_eq!(merged.num_rows(), 1,
             "N=1 should produce 1 row, got {}", merged.num_rows());
@@ -825,10 +1302,10 @@ mod tests {
         let score_col = engine.columns.get("Score").unwrap();
         assert_eq!(score_col.len(), 1);
         assert_eq!(
-            score_col.values[0],
+            score_col.as_str_vec()[0],
             Some("20".to_string()),
             "last-write-wins: expected '20' got {:?}",
-            score_col.values[0]
+            score_col.as_str_vec()[0]
         );
     }
 
@@ -843,7 +1320,7 @@ mod tests {
         assert_eq!(engine.num_columns(), 3); // Level, Section, Renamed
         assert!(engine.columns.contains_key("Renamed"));
         assert!(!engine.columns.contains_key("Score"));
-        assert_eq!(engine.columns.get("Renamed").unwrap().values[0], Some("100".into()));
+        assert_eq!(engine.columns.get("Renamed").unwrap().as_str_vec()[0], Some("100".into()));
     }
 
     #[test]
@@ -873,7 +1350,7 @@ mod tests {
         engine.parse_bytes(xml, b"Details").unwrap();
         assert_eq!(engine.num_rows(), 2, "filter should keep rows 1 and 3");
         let col = engine.columns.get("Score").unwrap();
-        assert_eq!(col.values, vec![Some("10".into()), Some("30".into())]);
+        assert_eq!(col.as_str_vec(), &[Some("10".into()), Some("30".into())]);
     }
 
     #[test]
@@ -890,7 +1367,7 @@ mod tests {
         engine.parse_bytes(xml, b"Details").unwrap();
         assert_eq!(engine.num_rows(), 2, "filter should keep only rows with Score=10");
         let col = engine.columns.get("Score").unwrap();
-        assert_eq!(col.values, vec![Some("10".into()), Some("10".into())]);
+        assert_eq!(col.as_str_vec(), &[Some("10".into()), Some("10".into())]);
     }
 
     #[test]
@@ -908,6 +1385,374 @@ mod tests {
         // Row 1 has Score=10 → filtered out. Row 2 has no Score → None != "10" → kept.
         assert_eq!(engine.num_rows(), 1);
         let col = engine.columns.get("Level").unwrap();
-        assert_eq!(col.values, vec![Some("2".into())]);
+        assert_eq!(col.as_str_vec(), &[Some("2".into())]);
+    }
+
+    #[test]
+    fn test_typed_int64_column() {
+        let xml = b"<R><Row><Field Name=\"Score\"><Value>42</Value></Field></Row></R>";
+        let mut plan = BuildPlan::new();
+        plan.field_types
+            .insert("Score".to_string(), FieldType::Int64);
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Row").unwrap();
+        assert_eq!(engine.num_rows(), 1);
+        if let ColumnBuilder::Int64(v) = &engine.columns["Score"] {
+            assert_eq!(v[0], Some(42));
+        } else {
+            panic!("expected Int64 builder");
+        }
+    }
+
+    #[test]
+    fn test_typed_float64_column() {
+        let xml = b"<R><Row><Field Name=\"Amount\"><Value>99.5</Value></Field></Row></R>";
+        let mut plan = BuildPlan::new();
+        plan.field_types
+            .insert("Amount".to_string(), FieldType::Float64);
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Row").unwrap();
+        if let ColumnBuilder::Float64(v) = &engine.columns["Amount"] {
+            assert!((v[0].unwrap() - 99.5).abs() < 1e-9);
+        } else {
+            panic!("expected Float64 builder");
+        }
+    }
+
+    #[test]
+    fn test_typed_parse_failure_nulls() {
+        let xml = b"<R><Row><Field Name=\"Score\"><Value>42</Value></Field></Row>\
+                        <Row><Field Name=\"Score\"><Value>N/A</Value></Field></Row>\
+                        <Row><Field Name=\"Score\"><Value>100</Value></Field></Row></R>";
+        let mut plan = BuildPlan::new();
+        plan.field_types
+            .insert("Score".to_string(), FieldType::Int64);
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Row").unwrap();
+        assert_eq!(engine.num_rows(), 3);
+        if let ColumnBuilder::Int64(v) = &engine.columns["Score"] {
+            assert_eq!(v[0], Some(42));
+            assert_eq!(v[1], None);
+            assert_eq!(v[2], Some(100));
+        } else {
+            panic!("expected Int64 builder");
+        }
+    }
+
+    #[test]
+    fn test_dictionary_column() {
+        let xml = b"<R><Row><Field Name=\"Product\"><Value>Widget</Value></Field></Row>\
+                        <Row><Field Name=\"Product\"><Value>Gadget</Value></Field></Row>\
+                        <Row><Field Name=\"Product\"><Value>Widget</Value></Field></Row></R>";
+        let mut plan = BuildPlan::new();
+        plan.dictionary_columns.insert("Product".to_string());
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Row").unwrap();
+        assert_eq!(engine.num_rows(), 3);
+        if let ColumnBuilder::Dictionary { codes, dict } = &engine.columns["Product"] {
+            assert_eq!(dict.len(), 2); // Widget, Gadget
+            assert_eq!(codes[0], Some(0)); // Widget
+            assert_eq!(codes[1], Some(1)); // Gadget
+            assert_eq!(codes[2], Some(0)); // Widget again
+        } else {
+            panic!("expected Dictionary builder");
+        }
+    }
+
+    // ── Ground-truth oracle (independent of columnar storage) ──────────────
+
+    /// Walk raw XML bytes and extract row-major key-value pairs.
+    /// Shares no code with `ColumnarEngine` — used as an independent reference
+    /// for multi-chunk / parallel test assertions.
+    fn row_values_reference(bytes: &[u8], row_tag: &[u8]) -> Vec<std::collections::HashMap<String, String>> {
+        use quick_xml::events::{BytesStart, Event};
+        use quick_xml::Reader;
+        use std::collections::HashMap;
+        use std::io::Cursor;
+
+        let mut reader = Reader::from_reader(Cursor::new(bytes));
+        reader.config_mut().check_end_names = false;
+        let mut buf = Vec::new();
+        let mut rows = Vec::new();
+
+        fn read_child_text(
+            reader: &mut Reader<Cursor<&[u8]>>,
+            end: &[u8],
+            wanted: &[&[u8]],
+        ) -> String {
+            let mut text = String::new();
+            let mut ibuf = Vec::new();
+            loop {
+                match reader.read_event_into(&mut ibuf) {
+                    Ok(Event::Start(ref ic)) => {
+                        if wanted.contains(&ic.name().as_ref()) {
+                            if let Ok(Event::Text(t)) = reader.read_event_into(&mut ibuf) {
+                                if let Ok(v) = t.unescape() {
+                                    text = v.into_owned();
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::Empty(_)) => {}
+                    Ok(Event::End(ref e)) if e.name().as_ref() == end => break,
+                    Ok(Event::Eof) | Err(_) => break,
+                    _ => {}
+                }
+                ibuf.clear();
+            }
+            text
+        }
+
+        fn attr(e: &BytesStart, keys: &[&[u8]]) -> Option<String> {
+            e.attributes()
+                .flatten()
+                .find(|a| keys.contains(&a.key.as_ref()))
+                .and_then(|a| a.unescape_value().ok())
+                .map(|v| v.into_owned())
+        }
+
+        loop {
+            let event = match reader.read_event_into(&mut buf) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+
+            let is_row_empty = matches!(&event, Event::Empty(e) if e.name().as_ref() == row_tag);
+            let is_row_start = matches!(&event, Event::Start(e) if e.name().as_ref() == row_tag);
+
+            if is_row_empty {
+                if let Event::Empty(ref e) = event {
+                    let mut row = HashMap::new();
+                    for a in e.attributes().flatten() {
+                        let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                        row.insert(k, a.unescape_value().unwrap_or_default().into_owned());
+                    }
+                    rows.push(row);
+                }
+                buf.clear();
+                continue;
+            }
+
+            if !is_row_start {
+                if matches!(event, Event::Eof) {
+                    break;
+                }
+                buf.clear();
+                continue;
+            }
+
+            // Row Start event: capture attributes + children
+            let mut row = HashMap::new();
+            if let Event::Start(ref e) = event {
+                for a in e.attributes().flatten() {
+                    let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                    row.insert(k, a.unescape_value().unwrap_or_default().into_owned());
+                }
+            }
+
+            let mut cbuf = Vec::new();
+            loop {
+                match reader.read_event_into(&mut cbuf) {
+                    Ok(Event::Start(ref c)) => {
+                        let tag = c.name().as_ref().to_vec();
+                        if tag == b"Field" {
+                            let key = attr(c, &[b"FieldName", b"Name"]).unwrap_or_else(|| "Field".into());
+                            let val = read_child_text(&mut reader, b"Field", &[b"FormattedValue", b"Value"]);
+                            row.insert(key, val);
+                        } else if tag == b"Text" {
+                            let key = attr(c, &[b"Name"]).unwrap_or_else(|| "Text".into());
+                            let val = read_child_text(&mut reader, b"Text", &[b"TextValue"]);
+                            row.insert(key, val);
+                        } else if tag == b"Section" {
+                            let sn = attr(c, &[b"SectionNumber"]).unwrap_or_default();
+                            row.insert("Section".into(), sn);
+                        } else {
+                            let key = String::from_utf8_lossy(&tag).into_owned();
+                            row.insert(key, String::new());
+                        }
+                    }
+                    Ok(Event::Empty(ref c)) => {
+                        let tag = c.name().as_ref().to_vec();
+                        if tag == b"Field" {
+                            let key = attr(c, &[b"FieldName", b"Name"]).unwrap_or_else(|| "Field".into());
+                            row.insert(key, String::new());
+                        } else if tag == b"Text" {
+                            let key = attr(c, &[b"Name"]).unwrap_or_else(|| "Text".into());
+                            row.insert(key, String::new());
+                        } else if tag == b"Section" {
+                            let sn = attr(c, &[b"SectionNumber"]).unwrap_or_default();
+                            row.insert("Section".into(), sn);
+                        } else {
+                            let key = String::from_utf8_lossy(&tag).into_owned();
+                            row.insert(key, String::new());
+                        }
+                    }
+                    Ok(Event::End(ref e)) if e.name().as_ref() == row_tag => break,
+                    Ok(Event::Eof) | Err(_) => break,
+                    _ => {}
+                }
+                cbuf.clear();
+            }
+
+            rows.push(row);
+            buf.clear();
+        }
+        rows
+    }
+
+    /// Reconstruct row-major hash maps from columnar engine state.
+    fn row_values(engine: &ColumnarEngine) -> Vec<std::collections::HashMap<String, String>> {
+        use std::collections::HashMap;
+        (0..engine.row_count)
+            .map(|i| {
+                let mut m = HashMap::new();
+                for name in &engine.column_order {
+                    if let Some(b) = engine.columns.get(name) {
+                        if let Some(s) = b.get_filter_value(i) {
+                            m.insert(name.clone(), s);
+                        }
+                    }
+                }
+                m
+            })
+            .collect()
+    }
+
+    // ── A2: Ragged late-chunk column debut ────────────────────────────────
+
+    #[test]
+    fn test_ragged_late_chunk_column_debut() {
+        let full = b"<R>\
+            <Details A=\"1\"><Field Name=\"A\"><Value>1</Value></Field><Field Name=\"B\"><Value>2</Value></Field></Details>\
+            <Details A=\"3\"><Field Name=\"A\"><Value>3</Value></Field></Details>\
+            <Details><Field Name=\"B\"><Value>4</Value></Field><Field Name=\"C\"><Value>5</Value></Field></Details>\
+            </R>";
+        let chunk1 = b"<R>\
+            <Details A=\"1\"><Field Name=\"A\"><Value>1</Value></Field><Field Name=\"B\"><Value>2</Value></Field></Details>\
+            <Details A=\"3\"><Field Name=\"A\"><Value>3</Value></Field></Details>";
+        let chunk2 = b"<Details><Field Name=\"B\"><Value>4</Value></Field><Field Name=\"C\"><Value>5</Value></Field></Details></R>";
+        let tag = b"Details";
+
+        let mut single = ColumnarEngine::new();
+        single.parse_bytes(full, tag).unwrap();
+
+        let mut e1 = ColumnarEngine::new();
+        e1.parse_bytes(chunk1, tag).unwrap();
+        let mut e2 = ColumnarEngine::new();
+        e2.parse_bytes(chunk2, tag).unwrap();
+
+        let mut merged = ColumnarEngine::new();
+        merged.extend(e1).unwrap();
+        merged.extend(e2).unwrap();
+
+        // Locked column arrays (simulation-verified).
+        assert_eq!(
+            merged.columns["A"].as_str_vec(),
+            &[Some("1".into()), Some("3".into()), None]
+        );
+        assert_eq!(
+            merged.columns["B"].as_str_vec(),
+            &[Some("2".into()), None, Some("4".into())]
+        );
+        assert_eq!(
+            merged.columns["C"].as_str_vec(),
+            &[None, None, Some("5".into())]
+        );
+
+        // Multi == single == independent oracle.
+        let oracle = row_values_reference(full, tag);
+        assert_eq!(
+            row_values(&single),
+            oracle,
+            "single-chunk must match oracle"
+        );
+        assert_eq!(
+            row_values(&merged),
+            oracle,
+            "merged multi-chunk must match oracle"
+        );
+    }
+
+    // ── A3: Mid-field EOF truncation ──────────────────────────────────────
+
+    #[test]
+    fn test_midfield_eof_truncation_discards_partial_row() {
+        // Chunk ends mid-<Field>: partial row must be discarded.
+        let chunk1 = b"<R><Details><Field Name=\"A\"><Value>1</Value></Field></Details>";
+        let chunk2 = b"<Details><Field Name=\"C\"><Value>5</Value>"; // truncated
+        let tag = b"Details";
+
+        let mut e2 = ColumnarEngine::new();
+        e2.parse_bytes(chunk2, tag).unwrap();
+        e2.normalize();
+        assert_eq!(e2.num_rows(), 0, "partial row must not be counted");
+        for name in e2.column_names() {
+            assert_eq!(
+                e2.columns[name].len(),
+                e2.num_rows(),
+                "column {} ragged after normalize",
+                name
+            );
+        }
+
+        let mut e1 = ColumnarEngine::new();
+        e1.parse_bytes(chunk1, tag).unwrap();
+        let mut merged = ColumnarEngine::new();
+        merged.extend(e1).unwrap();
+        merged.extend(e2).unwrap();
+        merged.normalize();
+        assert_eq!(merged.num_rows(), 1);
+        for name in merged.column_names() {
+            assert_eq!(merged.columns[name].len(), merged.num_rows());
+        }
+    }
+
+    // ── A4: auto_dict upgrade order ───────────────────────────────────────
+
+    #[test]
+    fn test_auto_dict_upgrade_only_post_merge() {
+        let xml = b"<R><Row><Field Name=\"P\"><Value>x</Value></Field></Row>\
+                        <Row><Field Name=\"P\"><Value>y</Value></Field></Row></R>";
+        let tag = b"Row";
+        let mut plan = BuildPlan::new();
+        plan.auto_dict = true;
+
+        let mut a = ColumnarEngine::with_plan(64, plan.clone());
+        a.parse_bytes(xml, tag).unwrap();
+        let mut b = ColumnarEngine::with_plan(64, plan.clone());
+        b.parse_bytes(xml, tag).unwrap();
+
+        let mut merged = ColumnarEngine::with_plan(64, plan);
+        merged.extend(a).unwrap();
+        merged.extend(b).unwrap();
+        merged.auto_dict_upgrade(); // post-merge only; must not panic
+        assert_eq!(merged.num_rows(), 4);
+    }
+
+    // ── B: extend variant mismatch → Err, not panic ───────────────────────
+
+    #[test]
+    fn test_extend_variant_mismatch_errors_not_panics() {
+        let xml = b"<R><Row><Field Name=\"P\"><Value>x</Value></Field></Row></R>";
+        let tag = b"Row";
+
+        let mut e1 = ColumnarEngine::new();
+        e1.parse_bytes(xml, tag).unwrap(); // P as String
+
+        let mut plan = BuildPlan::new();
+        plan.dictionary_columns.insert("P".to_string());
+        let mut e2 = ColumnarEngine::with_plan(64, plan);
+        e2.parse_bytes(xml, tag).unwrap(); // P as Dictionary
+
+        let result = e1.extend(e2);
+        assert!(result.is_err(), "String/Dictionary mismatch must return Err");
+    }
+
+    #[test]
+    fn test_malformed_xml_errors_loudly() {
+        // Unterminated attribute quote is real corruption, not a chunk seam.
+        let xml = b"<R><Row><Field Name=\"Score><Value>10</Value></Field></Row></R>";
+        let mut engine = ColumnarEngine::new();
+        assert!(engine.parse_bytes(xml, b"Row").is_err());
     }
 }

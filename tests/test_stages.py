@@ -107,6 +107,8 @@ class TestDropFields:
 
 
 class TestFilterRows:
+    # ── Callable predicate (existing API) ──────────────────────────
+
     def test_filter_keeps_all(self, sample_rows):
         stage = FilterRows(lambda r: True)
         result = list(stage(iter(sample_rows)))
@@ -132,6 +134,80 @@ class TestFilterRows:
         stage = FilterRows(lambda r: r["name"] == "Alice")
         result = list(stage(iter(sample_rows)))
         assert result[0] is sample_rows[0]
+
+    # ── Declarative constant predicate (fusible) ───────────────────
+
+    def test_declarative_eq(self, sample_rows):
+        stage = FilterRows(field="name", op="==", value="Bob")
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 1
+        assert result[0]["name"] == "Bob"
+
+    def test_declarative_ne(self, sample_rows):
+        stage = FilterRows(field="age", op="!=", value="30")
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 2
+        assert result[0]["name"] == "Bob"
+        assert result[1]["name"] == "Carol"
+
+    def test_declarative_eq_missing_field(self, sample_rows):
+        stage = FilterRows(field="missing", op="==", value="x")
+        result = list(stage(iter(sample_rows)))
+        assert result == []
+
+    def test_declarative_ne_missing_field(self, sample_rows):
+        stage = FilterRows(field="missing", op="!=", value="x")
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 3  # None != "x" → keep all
+
+    # ── Declarative column-compare predicate (post-reduce) ─────────
+
+    def test_declarative_compare_gt(self, sample_rows):
+        stage = FilterRows(field_a="age", op=">", field_b="city")
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 0  # "30" > "NYC"? No (lexicographic)
+
+    def test_declarative_compare_eq(self, sample_rows):
+        stage = FilterRows(field_a="name", op="==", field_b="city")
+        result = list(stage(iter(sample_rows)))
+        assert len(result) == 0
+
+    def test_declarative_compare_missing_field(self, sample_rows):
+        stage = FilterRows(field_a="missing", op="==", field_b="city")
+        result = list(stage(iter(sample_rows)))
+        assert result == []
+
+    # ── _plan_kwargs protocol ──────────────────────────────────────
+
+    def test_plan_kwargs_callable_returns_none(self):
+        stage = FilterRows(lambda r: True)
+        assert stage._plan_kwargs() is None
+
+    def test_plan_kwargs_constant_eq(self):
+        stage = FilterRows(field="Score", op="==", value="42")
+        assert stage._plan_kwargs() == {"filter": {"field": "Score", "op": "==", "value": "42"}}
+
+    def test_plan_kwargs_constant_ne(self):
+        stage = FilterRows(field="Score", op="!=", value="42")
+        assert stage._plan_kwargs() == {"filter": {"field": "Score", "op": "!=", "value": "42"}}
+
+    def test_plan_kwargs_compare(self):
+        stage = FilterRows(field_a="Score", op=">", field_b="Threshold")
+        assert stage._plan_kwargs() == {"filter": {"field_a": "Score", "op": ">", "field_b": "Threshold"}}
+
+    # ── Error cases ────────────────────────────────────────────────
+
+    def test_no_args_raises(self):
+        with pytest.raises(ValueError, match="requires either"):
+            FilterRows()
+
+    def test_invalid_op_constant_raises(self):
+        with pytest.raises(ValueError, match="unsupported operator"):
+            FilterRows(field="x", op=">", value="y")
+
+    def test_invalid_op_compare_raises(self):
+        with pytest.raises(ValueError, match="unsupported operator"):
+            FilterRows(field_a="x", op="xor", field_b="y")
 
 
 # ── Fusable protocol ─────────────────────────────────────────────
@@ -248,6 +324,22 @@ class TestPicklability:
         data = pickle.dumps(stage)
         restored = pickle.loads(data)
         assert restored._predicate is _keep_all
+
+    def test_filter_rows_declarative_constant_picklable(self):
+        stage = FilterRows(field="Score", op="!=", value="42")
+        data = pickle.dumps(stage)
+        restored = pickle.loads(data)
+        assert restored._filter_spec == {"field": "Score", "op": "!=", "value": "42"}
+        assert restored.apply({"Score": "10"}) == {"Score": "10"}  # kept
+        assert restored.apply({"Score": "42"}) is None             # dropped
+
+    def test_filter_rows_declarative_compare_picklable(self):
+        stage = FilterRows(field_a="A", op=">", field_b="B")
+        data = pickle.dumps(stage)
+        restored = pickle.loads(data)
+        assert restored._filter_spec == {"field_a": "A", "op": ">", "field_b": "B"}
+        assert restored.apply({"A": "9", "B": "5"}) == {"A": "9", "B": "5"}  # kept ("9" > "5" lexicographic)
+        assert restored.apply({"A": "3", "B": "7"}) is None                  # dropped
 
 
 def _keep_all(r):
