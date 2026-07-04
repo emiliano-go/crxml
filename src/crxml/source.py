@@ -47,6 +47,7 @@ class CrystalXMLSource:
         "_field_mapping",
         "_drop_fields",
         "_filter",
+        "_use_mmap",
     )
 
     def __init__(
@@ -60,6 +61,7 @@ class CrystalXMLSource:
         field_mapping: Optional[dict[str, str]] = None,
         drop_fields: Optional[list[str]] = None,
         filter: Optional[dict[str, str]] = None,
+        use_mmap: bool = False,
     ):
         self._filepath = Path(source)
         if not self._filepath.exists():
@@ -71,6 +73,7 @@ class CrystalXMLSource:
         self._field_mapping = field_mapping or {}
         self._drop_fields = drop_fields or []
         self._filter = filter  # {"field": ..., "op": ..., "value": ...} or None
+        self._use_mmap = use_mmap
 
         if engine not in ("auto", "stream", "columnar", "parallel"):
             raise ValueError(
@@ -105,7 +108,7 @@ class CrystalXMLSource:
             )
 
     def _build_plan_kwargs(self) -> dict:
-        kwargs = {}
+        kwargs = {"use_mmap": self._use_mmap}
         if self._field_mapping:
             kwargs["field_mapping"] = self._field_mapping
         if self._drop_fields:
@@ -130,9 +133,6 @@ class CrystalXMLSource:
         if not rows:
             return pa.table({})
         return pa.table({k: [r[k] for r in rows] for k in rows[0]})
-
-    def _stream_iter(self):
-        return CrxmlReader(str(self._filepath), self._row_tag)
 
     def schema(self) -> list[str]:
         first_row = next(iter(self), None)
