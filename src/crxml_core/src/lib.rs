@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use pyo3::exceptions::{PyIOError, PyException};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -5,7 +7,14 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::fs::File;
 use std::io::BufReader;
+#[cfg(feature = "columnar")]
+use std::io::Read;
 use std::path::Path;
+
+#[cfg(feature = "columnar")]
+pub mod columnar;
+#[cfg(feature = "columnar")]
+pub mod splitter;
 
 #[pyclass]
 pub struct CrxmlReader {
@@ -55,7 +64,8 @@ impl CrxmlReader {
                     let dict = PyDict::new(py);
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| PyException::new_err(format!("Attribute error: {}", e)))?;
-                        let key = unsafe { std::str::from_utf8_unchecked(attr.key.as_ref()) };
+                        let key = std::str::from_utf8(attr.key.as_ref())
+                            .map_err(|e| PyException::new_err(format!("Non-UTF8 attribute key: {}", e)))?;
                         let value = attr.unescape_value()
                             .map_err(|e| PyException::new_err(format!("Value unescape error: {}", e)))?;
                         dict.set_item(key, value.as_ref())?;
@@ -69,7 +79,8 @@ impl CrxmlReader {
 
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| PyException::new_err(format!("Attribute error: {}", e)))?;
-                        let key = unsafe { std::str::from_utf8_unchecked(attr.key.as_ref()) };
+                        let key = std::str::from_utf8(attr.key.as_ref())
+                            .map_err(|e| PyException::new_err(format!("Non-UTF8 attribute key: {}", e)))?;
                         let value = attr.unescape_value()
                             .map_err(|e| PyException::new_err(format!("Value unescape error: {}", e)))?;
                         row.push((key.to_owned(), value.into_owned()));
@@ -185,7 +196,9 @@ impl CrxmlReader {
                                 }
 
                                 else {
-                                    let key = unsafe { std::str::from_utf8_unchecked(child_tag) }.to_owned();
+                                    let key = std::str::from_utf8(child_tag)
+                                        .map_err(|e| PyException::new_err(format!("Non-UTF8 tag name: {}", e)))?
+                                        .to_owned();
                                     let text = if matches!(child_event, Event::Start(_)) {
                                         let text_event = reader.read_event_into(buf).map_err(|e| {
                                             PyException::new_err(format!("Text read error: {}", e))
@@ -212,7 +225,7 @@ impl CrxmlReader {
                     }
 
                     let dict = PyDict::new(py);
-                    for (k, v) in std::mem::take(row) {
+                    for (k, v) in row.drain(..) {
                         dict.set_item(k, v)?;
                     }
                     return Ok(Some(dict.into()));
@@ -222,6 +235,128 @@ impl CrxmlReader {
                 _ => {}
             }
         }
+    }
+
+    #[cfg(feature = "columnar")]
+    #[staticmethod]
+    fn read_to_columnar(path: String, row_tag: Option<String>) -> PyResult<PyObject> {
+        let p = Path::new(&path);
+        if !p.is_file() {
+            return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
+        }
+        let mut file =
+            File::open(p).map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
+
+        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+
+        let mut engine = columnar::ColumnarEngine::with_capacity(bytes.len() / 512);
+        engine
+            .parse_bytes(&bytes, &row_tag)
+            .map_err(|e| PyException::new_err(format!("Columnar parse error: {}", e)))?;
+
+        Python::with_gil(|py| engine.to_pyarrow_table(py))
+    }
+
+    #[cfg(feature = "columnar")]
+    #[staticmethod]
+    fn read_to_columnar_multi(
+        path: String,
+        row_tag: Option<String>,
+        num_chunks: usize,
+    ) -> PyResult<PyObject> {
+        let p = Path::new(&path);
+        if !p.is_file() {
+            return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
+        }
+        let mut file =
+            File::open(p).map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
+
+        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+
+        let chunks = splitter::compute_splits(&bytes, &row_tag, num_chunks);
+        let mut merged = columnar::ColumnarEngine::new();
+
+        for chunk in &chunks {
+            let estimated = if chunk.len() > 0 {
+                chunk.len() / 512
+            } else {
+                64
+            };
+            let mut engine =
+                columnar::ColumnarEngine::with_capacity(estimated.max(1));
+            engine
+                .parse_bytes(&bytes[chunk.clone()], &row_tag)
+                .map_err(|e| PyException::new_err(format!(
+                    "Columnar parse error in chunk {:?}: {}", chunk, e
+                )))?;
+            merged.extend(engine);
+        }
+
+        let table = Python::with_gil(|py| merged.to_pyarrow_table(py))?;
+        Ok(table)
+    }
+
+    #[cfg(feature = "columnar")]
+    #[staticmethod]
+    fn read_to_columnar_par(
+        path: String,
+        row_tag: Option<String>,
+        num_chunks: usize,
+    ) -> PyResult<PyObject> {
+        let p = Path::new(&path);
+        if !p.is_file() {
+            return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
+        }
+        let mut file =
+            File::open(p).map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
+
+        let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+
+        let chunks = splitter::compute_splits(&bytes, &row_tag, num_chunks);
+
+        use rayon::prelude::*;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let results: Vec<Result<columnar::ColumnarEngine, String>> = chunks
+            .par_iter()
+            .map(|range| {
+                catch_unwind(AssertUnwindSafe(|| {
+                    let est = if range.len() > 0 {
+                        (range.len() / 512).max(64)
+                    } else {
+                        64
+                    };
+                    let mut engine = columnar::ColumnarEngine::with_capacity(est);
+                    engine
+                        .parse_bytes(&bytes[range.clone()], &row_tag)
+                        .map_err(|e| format!("Parse error in chunk {:?}: {}", range, e))?;
+                    Ok(engine)
+                }))
+                .unwrap_or_else(|_| {
+                    Err("Worker panicked during parallel parse".to_string())
+                })
+            })
+            .collect();
+
+        let mut merged = columnar::ColumnarEngine::new();
+        for result in results {
+            let engine = result.map_err(|e| PyException::new_err(e))?;
+            merged.extend(engine);
+        }
+
+        Python::with_gil(|py| merged.to_pyarrow_table(py))
     }
 }
 
