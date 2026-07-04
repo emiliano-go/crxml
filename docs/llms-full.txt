@@ -893,7 +893,7 @@ manifest-path = "src/crxml_core/Cargo.toml"
 - Rust 2021 edition
 - `cargo fmt` for formatting
 - `cargo clippy`, no warnings allowed
-- Unsafe code is prohibited (`#![deny(unsafe_code)]`)
+- Unsafe code is prohibited (`#![forbid(unsafe_code)]`)
 
 ## Testing
 
