@@ -44,6 +44,9 @@ class CrystalXMLSource:
         "_engine",
         "_num_chunks",
         "_memory",
+        "_field_mapping",
+        "_drop_fields",
+        "_filter",
     )
 
     def __init__(
@@ -54,6 +57,9 @@ class CrystalXMLSource:
         engine: str = "auto",
         threads: int = 0,
         memory: Optional[Union[str, int]] = None,
+        field_mapping: Optional[dict[str, str]] = None,
+        drop_fields: Optional[list[str]] = None,
+        filter: Optional[dict[str, str]] = None,
     ):
         self._filepath = Path(source)
         if not self._filepath.exists():
@@ -62,6 +68,9 @@ class CrystalXMLSource:
         self._row_tag = row_tag
         self._memory = _parse_memory(memory)
         self._num_chunks = threads if threads > 0 else _default_threads()
+        self._field_mapping = field_mapping or {}
+        self._drop_fields = drop_fields or []
+        self._filter = filter  # {"field": ..., "op": ..., "value": ...} or None
 
         if engine not in ("auto", "stream", "columnar", "parallel"):
             raise ValueError(
@@ -95,12 +104,25 @@ class CrystalXMLSource:
                 "pip install -e . --config-settings=--features=columnar"
             )
 
+    def _build_plan_kwargs(self) -> dict:
+        kwargs = {}
+        if self._field_mapping:
+            kwargs["field_mapping"] = self._field_mapping
+        if self._drop_fields:
+            kwargs["drop_fields"] = self._drop_fields
+        if self._filter:
+            kwargs["filter"] = self._filter
+        return kwargs
+
     def _read_arrow(self):
+        plan = self._build_plan_kwargs()
         if self._engine == "columnar":
-            return CrxmlReader.read_to_columnar(str(self._filepath), self._row_tag)
+            return CrxmlReader.read_to_columnar(
+                str(self._filepath), self._row_tag, **plan
+            )
         if self._engine == "parallel":
             return CrxmlReader.read_to_columnar_par(
-                str(self._filepath), self._row_tag, self._num_chunks
+                str(self._filepath), self._row_tag, self._num_chunks, **plan
             )
         import pyarrow as pa
 

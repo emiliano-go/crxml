@@ -2,8 +2,77 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+
+/// A compiled build plan that controls field renaming, dropping, and
+/// row filtering during parse.  Default (empty) is a no-op.
+#[derive(Clone, Debug)]
+pub struct BuildPlan {
+    /// Map from raw XML field name to output column name.
+    pub field_map: HashMap<String, String>,
+    /// Set of raw XML field names to drop entirely.
+    pub drop_fields: HashSet<String>,
+    /// Optional row filter predicate.
+    pub filter: Option<FilterPredicate>,
+}
+
+impl BuildPlan {
+    pub fn new() -> Self {
+        BuildPlan {
+            field_map: HashMap::new(),
+            drop_fields: HashSet::new(),
+            filter: None,
+        }
+    }
+
+    /// Resolve a raw field name to its output column name.
+    /// Returns `None` if the field should be dropped.
+    pub fn resolve_field<'a>(&'a self, raw: &'a str) -> Option<&'a str> {
+        if self.drop_fields.contains(raw) {
+            return None;
+        }
+        Some(self.field_map.get(raw).map_or(raw, |s| s.as_str()))
+    }
+}
+
+/// A filter predicate evaluated per-row during parsing.
+#[derive(Clone, Debug)]
+pub enum FilterPredicate {
+    /// Keep row if `field_value != value` (string comparison).
+    NotEqual { field: String, value: String },
+    /// Keep row if `field_value == value` (string comparison).
+    Equal { field: String, value: String },
+}
+
+impl FilterPredicate {
+    /// Check whether a partial row passes the filter.
+    /// `columns` contains all builders; `row_index` is the current
+    /// row number (before finishing).  Returns true to keep the row.
+    /// The filter field is resolved through `plan.field_map` before lookup.
+    pub(crate) fn check(
+        &self,
+        columns: &HashMap<String, ColumnBuilder>,
+        row_index: usize,
+        plan: &BuildPlan,
+    ) -> bool {
+        let (field, expected) = match self {
+            FilterPredicate::NotEqual { field, value } => (field, value),
+            FilterPredicate::Equal { field, value } => (field, value),
+        };
+        // Resolve the filter field name: if renamed, use the new name.
+        let resolved = plan.field_map.get(field).map_or(field, |s| s);
+
+        let actual = columns
+            .get(resolved)
+            .and_then(|b| b.values.get(row_index))
+            .and_then(|v| v.as_deref());
+        match self {
+            FilterPredicate::NotEqual { .. } => actual != Some(expected),
+            FilterPredicate::Equal { .. } => actual == Some(expected),
+        }
+    }
+}
 
 /// Per-column builder: stores all values as optional owned strings.
 struct ColumnBuilder {
@@ -47,6 +116,7 @@ pub struct ColumnarEngine {
     column_order: Vec<String>,
     row_count: usize,
     estimated_rows: usize,
+    plan: BuildPlan,
 }
 
 impl ColumnarEngine {
@@ -56,6 +126,7 @@ impl ColumnarEngine {
             column_order: Vec::new(),
             row_count: 0,
             estimated_rows: 0,
+            plan: BuildPlan::new(),
         }
     }
 
@@ -65,6 +136,17 @@ impl ColumnarEngine {
             column_order: Vec::new(),
             row_count: 0,
             estimated_rows: cap,
+            plan: BuildPlan::new(),
+        }
+    }
+
+    pub fn with_plan(cap: usize, plan: BuildPlan) -> Self {
+        ColumnarEngine {
+            columns: HashMap::new(),
+            column_order: Vec::new(),
+            row_count: 0,
+            estimated_rows: cap,
+            plan,
         }
     }
 
@@ -81,8 +163,14 @@ impl ColumnarEngine {
     }
 
     fn push_field(&mut self, name: &str, value: Option<String>) {
-        self.ensure_column(name);
-        if let Some(b) = self.columns.get_mut(name) {
+        // Resolve field: rename or drop.  Copy to owned String to
+        // break the borrow on self.plan before the mutable borrow.
+        let resolved = match self.plan.resolve_field(name) {
+            Some(n) => n.to_owned(),
+            None => return,
+        };
+        self.ensure_column(&resolved);
+        if let Some(b) = self.columns.get_mut(&resolved) {
             // Last-write-wins: if this column was already pushed for the
             // current (incomplete) row, overwrite instead of append.
             if b.len() > self.row_count {
@@ -92,7 +180,8 @@ impl ColumnarEngine {
         }
     }
 
-    /// Null-fill any column missing this row.
+    /// Null-fill any column missing this row, then apply filter.
+    /// If the filter rejects the row, undo it by popping values.
     fn finish_row(&mut self) {
         let target = self.row_count + 1;
         for b in self.columns.values_mut() {
@@ -100,6 +189,17 @@ impl ColumnarEngine {
                 b.push(None);
             }
         }
+
+        // Check filter; if the row fails, undo the append.
+        if let Some(ref filter) = self.plan.filter {
+            if !filter.check(&self.columns, self.row_count, &self.plan) {
+                for b in self.columns.values_mut() {
+                    b.values.pop();
+                }
+                return;
+            }
+        }
+
         self.row_count += 1;
     }
 
@@ -730,5 +830,84 @@ mod tests {
             "last-write-wins: expected '20' got {:?}",
             score_col.values[0]
         );
+    }
+
+    #[test]
+    fn test_build_plan_rename() {
+        let xml = b"<R><Details Level=\"3\"><Section><Field Name=\"Score\"><Value>100</Value></Field></Section></Details></R>";
+        let mut plan = BuildPlan::new();
+        plan.field_map.insert("Score".to_string(), "Renamed".to_string());
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Details").unwrap();
+        assert_eq!(engine.num_rows(), 1);
+        assert_eq!(engine.num_columns(), 3); // Level, Section, Renamed
+        assert!(engine.columns.contains_key("Renamed"));
+        assert!(!engine.columns.contains_key("Score"));
+        assert_eq!(engine.columns.get("Renamed").unwrap().values[0], Some("100".into()));
+    }
+
+    #[test]
+    fn test_build_plan_drop() {
+        let xml = b"<R><Details Level=\"3\"><Section><Field Name=\"Score\"><Value>100</Value></Field></Section></Details></R>";
+        let mut plan = BuildPlan::new();
+        plan.drop_fields.insert("Score".to_string());
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Details").unwrap();
+        assert_eq!(engine.num_rows(), 1);
+        assert_eq!(engine.num_columns(), 2); // Level + Section
+        assert!(!engine.columns.contains_key("Score"));
+    }
+
+    #[test]
+    fn test_build_plan_filter_ne() {
+        // Three rows, second has Score=42 which should be filtered out by !=.
+        let xml = b"<R><Details Level=\"3\"><Section><Field Name=\"Score\"><Value>10</Value></Field></Section></Details>\
+                       <Details Level=\"2\"><Section><Field Name=\"Score\"><Value>42</Value></Field></Section></Details>\
+                       <Details Level=\"1\"><Section><Field Name=\"Score\"><Value>30</Value></Field></Section></Details></R>";
+        let mut plan = BuildPlan::new();
+        plan.filter = Some(FilterPredicate::NotEqual {
+            field: "Score".to_string(),
+            value: "42".to_string(),
+        });
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Details").unwrap();
+        assert_eq!(engine.num_rows(), 2, "filter should keep rows 1 and 3");
+        let col = engine.columns.get("Score").unwrap();
+        assert_eq!(col.values, vec![Some("10".into()), Some("30".into())]);
+    }
+
+    #[test]
+    fn test_build_plan_filter_eq() {
+        let xml = b"<R><Details Level=\"3\"><Section><Field Name=\"Score\"><Value>10</Value></Field></Section></Details>\
+                       <Details Level=\"2\"><Section><Field Name=\"Score\"><Value>20</Value></Field></Section></Details>\
+                       <Details Level=\"1\"><Section><Field Name=\"Score\"><Value>10</Value></Field></Section></Details></R>";
+        let mut plan = BuildPlan::new();
+        plan.filter = Some(FilterPredicate::Equal {
+            field: "Score".to_string(),
+            value: "10".to_string(),
+        });
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Details").unwrap();
+        assert_eq!(engine.num_rows(), 2, "filter should keep only rows with Score=10");
+        let col = engine.columns.get("Score").unwrap();
+        assert_eq!(col.values, vec![Some("10".into()), Some("10".into())]);
+    }
+
+    #[test]
+    fn test_build_plan_filter_missing_field() {
+        // Second row has no Score field → treated as None (not equal to "10").
+        let xml = b"<R><Details Level=\"3\"><Section><Field Name=\"Score\"><Value>10</Value></Field></Section></Details>\
+                       <Details Level=\"2\"><Section><Field Name=\"Other\"><Value>99</Value></Field></Section></Details></R>";
+        let mut plan = BuildPlan::new();
+        plan.filter = Some(FilterPredicate::NotEqual {
+            field: "Score".to_string(),
+            value: "10".to_string(),
+        });
+        let mut engine = ColumnarEngine::with_plan(64, plan);
+        engine.parse_bytes(xml, b"Details").unwrap();
+        // Row 1 has Score=10 → filtered out. Row 2 has no Score → None != "10" → kept.
+        assert_eq!(engine.num_rows(), 1);
+        let col = engine.columns.get("Level").unwrap();
+        assert_eq!(col.values, vec![Some("2".into())]);
     }
 }
