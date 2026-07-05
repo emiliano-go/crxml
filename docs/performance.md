@@ -8,7 +8,7 @@ Python process per measurement) to isolate page cache effects. Row count
 (90,384) is asserted inside each timed block so no measurement can silently
 return from cache.
 
-**Test machine:** 13th Gen Intel i5-1335U (12 cores), 15 GB RAM, Linux.
+**Test machine:** 13th Gen Intel i5-1335U (12 cores), 15 GB RAM, Linux (hostname: osiris).
 
 ## Native export (Rust-only, no Python dicts)
 

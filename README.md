@@ -446,7 +446,7 @@ Python layer manages the routing, caching, and dict conversion. The Rust layer h
 
 Measured on a 100 MB synthetic Crystal Reports XML file (90,384 rows, about 10 fields per row) with a release build (opt-level=3, lto=true).
 
-**Test machine:** 13th Gen Intel i5-1335U (12 cores), 15 GB RAM, Linux.
+**Test machine:** 13th Gen Intel i5-1335U (12 cores), 15 GB RAM, Linux (hostname: osiris).
 
 ### Native export (Rust only, columnar engine)
 
