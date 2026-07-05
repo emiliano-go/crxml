@@ -102,19 +102,22 @@ fn parse_columnar_par_from_slice(
         })
         .collect();
 
-    let engines = results
-        .into_iter()
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(PyException::new_err)?;
-
     // Fast path: export chunks as record batches in parallel, no merge.
-    // auto_dict must merge first (per-chunk upgrades can disagree on dtype).
     if !plan.auto_dict {
+        let engines = results
+            .into_iter()
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(PyException::new_err)?;
         return Python::with_gil(|py| columnar::engines_to_pyarrow_table(engines, &plan, py));
     }
 
+    // auto_dict path: incremental merge — fold each chunk engine into the
+    // accumulator one at a time, dropping the chunk engine after extend.
+    // This bounds peak RSS to merged-so-far (~1x) plus one chunk (~1x/N)
+    // instead of all chunks at once (~5x).
     let mut merged = columnar::ColumnarEngine::new();
-    for engine in engines {
+    for result in results {
+        let engine = result.map_err(PyException::new_err)?;
         merged.extend(engine).map_err(|e| PyException::new_err(e))?;
     }
     merged.auto_dict_upgrade();
@@ -220,6 +223,55 @@ fn parse_columnar_bounded(
     })
 }
 
+/// Owned mmap with explicit lifecycle: parse phase ends before unmap.
+///
+/// # Safety invariant
+///
+/// All data read through `as_slice()` is **copied** into owned storage
+/// (`ColumnBuilder::push_str` → `StrColumn::push` → `extend_from_slice`,
+/// typed columns parse and discard the string). No borrowed reference to
+/// the mapped bytes survives return from `to_pyarrow_table`. The Arrow C
+/// Data Interface export creates fresh `Arc<[u8]>` buffers via
+/// `Buffer::from_slice_ref`. Therefore the `Mmap` can be safely dropped
+/// (via `schedule_unmap`) after export completes.
+///
+/// If a future change introduces zero-copy Arrow arrays over the mmap
+/// slice, this invariant is broken — the unmap must be synchronous.
+#[cfg(feature = "mmap")]
+struct MmapHandle {
+    mmap: memmap2::Mmap,
+}
+
+#[cfg(feature = "mmap")]
+impl MmapHandle {
+    fn new(path: &Path) -> PyResult<Self> {
+        let file = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path.display(), e)))?;
+        #[allow(unsafe_code)]
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", path.display(), e)))?;
+        #[cfg(unix)]
+        {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
+        }
+        Ok(MmapHandle { mmap })
+    }
+
+    /// Borrow the mapped bytes for parsing. The borrow must end before
+    /// `schedule_unmap` is called — the Rust borrow checker enforces this.
+    fn as_slice(&self) -> &[u8] {
+        &self.mmap[..]
+    }
+
+    /// Consume the handle and drop the mapping on a background thread.
+    /// Must be called *after* the parse result is fully materialized and
+    /// the borrow from `as_slice()` has ended.
+    fn schedule_unmap(self) {
+        std::thread::spawn(move || drop(self.mmap));
+    }
+}
+
 #[cfg(feature = "mmap")]
 fn mmap_and_parse(
     path: &str,
@@ -227,23 +279,40 @@ fn mmap_and_parse(
     plan: columnar::BuildPlan,
 ) -> PyResult<PyObject> {
     let p = Path::new(path);
-    let file = File::open(p)
-        .map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
-    // SAFETY: The caller must not truncate or write to the file while the
-    // mapping exists. crxml is a read-only parser; no writes occur.
-    #[allow(unsafe_code)]
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", path, e)))?;
-    // madvise is Unix-only; memmap2 does not expose Advice on Windows.
-    #[cfg(unix)]
-    {
-        let _ = mmap.advise(memmap2::Advice::Sequential);
-        let _ = mmap.advise(memmap2::Advice::WillNeed);
-    }
-    let result = parse_columnar_from_slice(&mmap[..], row_tag, plan);
-    // UnmapViewOfFile on a 100MB mapping costs ~20ms serially; the result
-    // no longer references the mapping, so unmap off the caller's path.
-    std::thread::spawn(move || drop(mmap));
+    let handle = MmapHandle::new(p)?;
+    let result = parse_columnar_from_slice(handle.as_slice(), row_tag, plan);
+    // parse_columnar_from_slice copies all data into owned Vec<u8> /
+    // Arrow buffers before returning. The borrow of handle.as_slice()
+    // has ended — it is now safe to reclaim the mapping.
+    handle.schedule_unmap();
+    result
+}
+
+#[cfg(feature = "mmap")]
+fn mmap_and_parse_multi(
+    path: &str,
+    row_tag: &[u8],
+    plan: columnar::BuildPlan,
+    num_chunks: usize,
+) -> PyResult<PyObject> {
+    let p = Path::new(path);
+    let handle = MmapHandle::new(p)?;
+    let result = parse_columnar_multi_from_slice(handle.as_slice(), row_tag, plan, num_chunks);
+    handle.schedule_unmap();
+    result
+}
+
+#[cfg(feature = "mmap")]
+fn mmap_and_parse_par(
+    path: &str,
+    row_tag: &[u8],
+    plan: columnar::BuildPlan,
+    num_chunks: usize,
+) -> PyResult<PyObject> {
+    let p = Path::new(path);
+    let handle = MmapHandle::new(p)?;
+    let result = parse_columnar_par_from_slice(handle.as_slice(), row_tag, plan, num_chunks);
+    handle.schedule_unmap();
     result
 }
 
@@ -410,23 +479,7 @@ pub fn read_to_columnar_multi(
     if use_mmap {
         #[cfg(feature = "mmap")]
         {
-            let mmap_path = path.as_str();
-            let p_file = Path::new(mmap_path);
-            let file = File::open(p_file).map_err(|e| {
-                PyIOError::new_err(format!("Cannot open {}: {}", mmap_path, e))
-            })?;
-            #[allow(unsafe_code)]
-            let mmap = unsafe { memmap2::Mmap::map(&file) }
-                .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", mmap_path, e)))?;
-            #[cfg(unix)]
-            {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
-                let _ = mmap.advise(memmap2::Advice::WillNeed);
-            }
-            let result = parse_columnar_multi_from_slice(&mmap[..], &row_tag, plan, num_chunks);
-            // Unmap off the caller's path (~20ms serial for 100MB).
-            std::thread::spawn(move || drop(mmap));
-            return result;
+            return mmap_and_parse_multi(&path, &row_tag, plan, num_chunks);
         }
         #[cfg(not(feature = "mmap"))]
         {
@@ -474,23 +527,7 @@ pub fn read_to_columnar_par(
     if use_mmap {
         #[cfg(feature = "mmap")]
         {
-            let mmap_path = path.as_str();
-            let p_file = Path::new(mmap_path);
-            let file = File::open(p_file).map_err(|e| {
-                PyIOError::new_err(format!("Cannot open {}: {}", mmap_path, e))
-            })?;
-            #[allow(unsafe_code)]
-            let mmap = unsafe { memmap2::Mmap::map(&file) }
-                .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", mmap_path, e)))?;
-            #[cfg(unix)]
-            {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
-                let _ = mmap.advise(memmap2::Advice::WillNeed);
-            }
-            let result = parse_columnar_par_from_slice(&mmap[..], &row_tag, plan, num_chunks);
-            // Unmap off the caller's path (~20ms serial for 100MB).
-            std::thread::spawn(move || drop(mmap));
-            return result;
+            return mmap_and_parse_par(&path, &row_tag, plan, num_chunks);
         }
         #[cfg(not(feature = "mmap"))]
         {
@@ -601,17 +638,8 @@ fn cached_key<'a>(
     &cache[key]
 }
 
-extern "C" {
-    fn _PyDict_NewPresized(size: isize) -> *mut pyo3::ffi::PyObject;
-}
-
-/// Row dicts have known homogeneous width; presize avoids incremental rehashing.
-fn new_dict_presized(py: Python<'_>, width: isize) -> PyResult<Bound<'_, PyDict>> {
-    #[allow(unsafe_code)]
-    unsafe {
-        let ptr = _PyDict_NewPresized(width);
-        Ok(Bound::from_owned_ptr_or_err(py, ptr)?.downcast_into_unchecked())
-    }
+fn new_dict(py: Python<'_>) -> Bound<'_, PyDict> {
+    PyDict::new(py)
 }
 
 // Pure-Rust helpers (not #[pymethods]) — no Python objects touched.
@@ -875,11 +903,11 @@ impl CrxmlReader {
     fn next_row(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         match self.parser.read_one_row().map_err(|e| PyException::new_err(e))? {
             None => Ok(None),
-            Some(n) => {
+            Some(_n) => {
                 #[cfg(feature = "profile")]
                 let _dict_start = Instant::now();
                 let CrxmlReader { parser, key_cache } = self;
-                let dict = new_dict_presized(py, n as isize)?;
+                let dict = new_dict(py);
                 for (k, v) in parser.row.drain(..) {
                     dict.set_item(cached_key(py, key_cache, &k), v)?;
                 }
@@ -920,7 +948,7 @@ impl CrxmlReader {
         let CrxmlReader { parser, key_cache } = &mut *slf;
         let mut cursor = 0usize;
         for &len in &parser.batch_lens {
-            let dict = new_dict_presized(py, len as isize)?;
+            let dict = new_dict(py);
             for (k, v) in &parser.batch_vals[cursor..cursor + len] {
                 dict.set_item(cached_key(py, key_cache, k), v.as_str())?;
             }
@@ -950,6 +978,68 @@ impl CrxmlReader {
 
 }
 
+/// Testing helper: parse bytes with the columnar engine (quick-xml parser).
+/// Retained for API compatibility with the hardening harness.
+#[cfg(feature = "testing")]
+#[pyfunction]
+#[pyo3(signature = (bytes, row_tag=None))]
+fn _test_parse_both(
+    bytes: Vec<u8>,
+    row_tag: Option<String>,
+) -> PyResult<(PyObject, PyObject)> {
+    use columnar::ColumnarEngine;
+    let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+    let plan = columnar::BuildPlan::new();
+    let est = (bytes.len() / 512).max(64);
+    let result: PyObject = Python::with_gil(|py| {
+        let mut engine = ColumnarEngine::with_plan(est, plan);
+        match engine.parse_bytes_quickxml_only(&bytes, &row_tag) {
+            Ok(()) => {
+                engine.auto_dict_upgrade();
+                engine.to_pyarrow_table(py).unwrap_or_else(|_| py.None())
+            }
+            Err(_) => py.None(),
+        }
+    });
+    let r2 = Python::with_gil(|py| result.clone_ref(py));
+    Ok((r2, result))
+}
+
+#[cfg(feature = "testing")]
+fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyObject {
+    use columnar::ColumnarEngine;
+    let plan = columnar::BuildPlan::new();
+    let est = (bytes.len() / 512).max(64);
+    Python::with_gil(|py| {
+        let mut col = ColumnarEngine::with_plan(est, plan);
+        if col.parse_bytes_quickxml_only(bytes, row_tag).is_ok() {
+            col.auto_dict_upgrade();
+            col.to_pyarrow_table(py).unwrap_or_else(|_| py.None())
+        } else {
+            py.None()
+        }
+    })
+}
+
+/// Testing helper: parse bytes (identical to _test_parse_quickxml).
+/// Kept for backward compatibility with benchmarks that reference it.
+#[cfg(feature = "testing")]
+#[pyfunction]
+#[pyo3(signature = (bytes, row_tag=None))]
+fn _test_parse_fast(bytes: Vec<u8>, row_tag: Option<String>) -> PyObject {
+    let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+    _run_parser(&bytes, &row_tag)
+}
+
+/// Testing helper: parse bytes with the columnar engine.
+#[cfg(feature = "testing")]
+#[pyfunction]
+#[pyo3(signature = (bytes, row_tag=None))]
+fn _test_parse_quickxml(bytes: Vec<u8>, row_tag: Option<String>) -> PyObject {
+    let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+    _run_parser(&bytes, &row_tag)
+}
+
 #[pymodule]
 fn _crxml_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CrxmlReader>()?;
@@ -959,6 +1049,12 @@ fn _crxml_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(read_to_columnar_multi, m)?)?;
         m.add_function(wrap_pyfunction!(read_to_columnar_par, m)?)?;
         m.add_function(wrap_pyfunction!(read_to_columnar_bounded, m)?)?;
+        #[cfg(feature = "testing")]
+        {
+            m.add_function(wrap_pyfunction!(_test_parse_both, m)?)?;
+            m.add_function(wrap_pyfunction!(_test_parse_fast, m)?)?;
+            m.add_function(wrap_pyfunction!(_test_parse_quickxml, m)?)?;
+        }
     }
     Ok(())
 }

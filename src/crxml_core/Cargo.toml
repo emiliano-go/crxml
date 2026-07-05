@@ -18,6 +18,8 @@ columnar = ["dep:rayon", "dep:arrow"]
 # Memory-map input files (carries the only unsafe in the crate)
 mmap = ["dep:memmap2"]
 profile = []
+# Testing helpers (implies columnar)
+testing = ["columnar"]
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
