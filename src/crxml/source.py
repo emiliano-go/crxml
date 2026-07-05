@@ -268,8 +268,8 @@ class CrystalXMLSource:
 
         return _arrow_iter(self._read_arrow())
 
-    def to_dataframe(self) -> "pd.DataFrame":
-        return self.to_pandas()
+    def to_dataframe(self, dtype_backend: str = "pyarrow") -> "pd.DataFrame":
+        return self.to_pandas(dtype_backend=dtype_backend)
 
     def to_arrow(self):
         return self._read_arrow()
@@ -279,11 +279,11 @@ class CrystalXMLSource:
 
         return pl.from_arrow(self.to_arrow())
 
-    def to_pandas(self, arrow_backed: bool = True) -> "pd.DataFrame":
+    def to_pandas(self, dtype_backend: str = "pyarrow") -> "pd.DataFrame":
         import pandas as pd
 
         table = self.to_arrow()
-        if arrow_backed:
+        if dtype_backend == "pyarrow":
             return table.to_pandas(types_mapper=pd.ArrowDtype)
         return table.to_pandas()
 
