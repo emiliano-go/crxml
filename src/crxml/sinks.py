@@ -2,15 +2,18 @@ import csv
 from pathlib import Path
 from typing import Iterable
 
-def to_dataframe(pipeline: Iterable[dict], chunksize: int | None = None) -> "pd.DataFrame":
+def to_dataframe(
+    pipeline: Iterable[dict],
+    chunksize: int | None = None,
+    dtype_backend: str = "pyarrow",
+) -> "pd.DataFrame":
     import pandas as pd
+    types_mapper = pd.ArrowDtype if dtype_backend == "pyarrow" else None
     if chunksize is None:
-        # Batch-chain shortcut: the whole pipeline runs vectorized to one
-        # Arrow table, no per-row dicts.
         if hasattr(pipeline, "_to_arrow"):
             table = pipeline._to_arrow()
             if table is not None:
-                return table.to_pandas()
+                return table.to_pandas(types_mapper=types_mapper)
         if hasattr(pipeline, "_iter_batches"):
             chunks = [pd.DataFrame.from_records(batch) for batch in pipeline._iter_batches()]
             return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
