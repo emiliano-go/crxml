@@ -30,12 +30,15 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
+pyarrow = ["pyarrow>=15"]
 pandas = ["pandas>=1.5"]
+polars = ["polars>=0.20"]
+all = ["crxml[pyarrow,pandas,polars]"]
 dev = [
     "pytest>=7",
     "pytest-benchmark>=4",
     "openpyxl>=3.1",
-    "crxml[pandas]",
+    "crxml[all]",
 ]
 
 [project.urls]
@@ -50,10 +53,11 @@ manifest-path = "src/crxml_core/Cargo.toml"
 module-name = "crxml._crxml_core"
 # Include the Python package from src/crxml/ alongside the compiled extension
 python-source = "src"
-# Build in release mode for maximum performance, strip debug symbols
-features = ["pyo3/extension-module"]
-strip = true
+# Build in release mode for maximum performance
+features = ["pyo3/extension-module", "columnar", "mmap"]
 profile = "release"
+# To build with profiling symbols:
+#   maturin build --profile profiling
 # Build with: maturin build --release --manylinux 2014 --zig -o dist
 # (PEP 517 `python -m build` does not support manylinux flags)
 

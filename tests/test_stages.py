@@ -1,12 +1,9 @@
-"""Unit tests for all stages and pipeline internals (no file I/O)."""
 import pickle
 import pytest
 from crxml import Pipeline, RenameFields, CastTypes, DropFields, FilterRows
 from crxml.pipeline import Pipeline as PipelineCls
 from crxml.fusion import fused_iter, is_fusable
 
-
-# ── Stage constructors ────────────────────────────────────────────
 
 class TestRenameFields:
     def test_rename_all_keys(self, sample_rows):
@@ -107,8 +104,6 @@ class TestDropFields:
 
 
 class TestFilterRows:
-    # ── Callable predicate (existing API) ──────────────────────────
-
     def test_filter_keeps_all(self, sample_rows):
         stage = FilterRows(lambda r: True)
         result = list(stage(iter(sample_rows)))
@@ -135,8 +130,6 @@ class TestFilterRows:
         result = list(stage(iter(sample_rows)))
         assert result[0] is sample_rows[0]
 
-    # ── Declarative constant predicate (fusible) ───────────────────
-
     def test_declarative_eq(self, sample_rows):
         stage = FilterRows(field="name", op="==", value="Bob")
         result = list(stage(iter(sample_rows)))
@@ -158,14 +151,12 @@ class TestFilterRows:
     def test_declarative_ne_missing_field(self, sample_rows):
         stage = FilterRows(field="missing", op="!=", value="x")
         result = list(stage(iter(sample_rows)))
-        assert len(result) == 3  # None != "x" → keep all
-
-    # ── Declarative column-compare predicate (post-reduce) ─────────
+        assert len(result) == 3
 
     def test_declarative_compare_gt(self, sample_rows):
         stage = FilterRows(field_a="age", op=">", field_b="city")
         result = list(stage(iter(sample_rows)))
-        assert len(result) == 0  # "30" > "NYC"? No (lexicographic)
+        assert len(result) == 0
 
     def test_declarative_compare_eq(self, sample_rows):
         stage = FilterRows(field_a="name", op="==", field_b="city")
@@ -176,8 +167,6 @@ class TestFilterRows:
         stage = FilterRows(field_a="missing", op="==", field_b="city")
         result = list(stage(iter(sample_rows)))
         assert result == []
-
-    # ── _plan_kwargs protocol ──────────────────────────────────────
 
     def test_plan_kwargs_callable_returns_none(self):
         stage = FilterRows(lambda r: True)
@@ -195,8 +184,6 @@ class TestFilterRows:
         stage = FilterRows(field_a="Score", op=">", field_b="Threshold")
         assert stage._plan_kwargs() == {"filter": {"field_a": "Score", "op": ">", "field_b": "Threshold"}}
 
-    # ── Error cases ────────────────────────────────────────────────
-
     def test_no_args_raises(self):
         with pytest.raises(ValueError, match="requires either"):
             FilterRows()
@@ -210,11 +197,7 @@ class TestFilterRows:
             FilterRows(field_a="x", op="xor", field_b="y")
 
 
-# ── Fusable protocol ─────────────────────────────────────────────
-
 class TestFusable:
-    """Custom fusable stages must implement both apply() and __call__()."""
-
     def test_stages_are_fusable(self):
         assert is_fusable(RenameFields({"a": "b"}))
         assert is_fusable(CastTypes({"a": int}))
@@ -244,8 +227,6 @@ class TestFusable:
                 return stream
         assert not is_fusable(NoApply())
 
-
-# ── Fusion ───────────────────────────────────────────────────────
 
 class TestFusion:
     def test_fused_single_stage(self, sample_rows):
@@ -279,9 +260,9 @@ class TestFusion:
 
     def test_mixed_fusable_and_non_fusable(self, sample_rows):
         stages = [
-            RenameFields({"name": "full_name"}),    # fusable
-            lambda stream: map(lambda r: {**r, "seen": True}, stream),  # non-fusable
-            DropFields(["city"]),                    # fusable
+            RenameFields({"name": "full_name"}),
+            lambda stream: map(lambda r: {**r, "seen": True}, stream),
+            DropFields(["city"]),
         ]
         result = list(fused_iter(iter(sample_rows), stages))
         assert "full_name" in result[0]
@@ -292,8 +273,6 @@ class TestFusion:
         result = list(fused_iter(iter(sample_rows), []))
         assert result == sample_rows
 
-
-# ── Picklability ─────────────────────────────────────────────────
 
 class TestPicklability:
     def test_rename_fields_picklable(self):
@@ -330,16 +309,16 @@ class TestPicklability:
         data = pickle.dumps(stage)
         restored = pickle.loads(data)
         assert restored._filter_spec == {"field": "Score", "op": "!=", "value": "42"}
-        assert restored.apply({"Score": "10"}) == {"Score": "10"}  # kept
-        assert restored.apply({"Score": "42"}) is None             # dropped
+        assert restored.apply({"Score": "10"}) == {"Score": "10"}
+        assert restored.apply({"Score": "42"}) is None
 
     def test_filter_rows_declarative_compare_picklable(self):
         stage = FilterRows(field_a="A", op=">", field_b="B")
         data = pickle.dumps(stage)
         restored = pickle.loads(data)
         assert restored._filter_spec == {"field_a": "A", "op": ">", "field_b": "B"}
-        assert restored.apply({"A": "9", "B": "5"}) == {"A": "9", "B": "5"}  # kept ("9" > "5" lexicographic)
-        assert restored.apply({"A": "3", "B": "7"}) is None                  # dropped
+        assert restored.apply({"A": "9", "B": "5"}) == {"A": "9", "B": "5"}
+        assert restored.apply({"A": "3", "B": "7"}) is None
 
 
 def _keep_all(r):

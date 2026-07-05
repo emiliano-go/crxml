@@ -75,3 +75,48 @@ To use a custom stage with `.parallel()`, it must be picklable:
 
 crxml validates picklability at pipeline construction time and raises
 `UnpicklableStageError` for incompatible stages.
+
+## Columnar plan fusion
+
+For maximum performance, a stage can implement `_plan_kwargs(self) -> dict | None`.
+When this method returns a dict, the stage is compiled into the Rust columnar
+engine's `BuildPlan` and runs during XML parsing, before any Python dict is
+created. This bypasses Python entirely for that stage.
+
+Built-in stages that support columnar plan fusion:
+
+| Stage | `_plan_kwargs` effect |
+|-------|----------------------|
+| `RenameFields` | Adds `field_mapping` to the plan |
+| `CastTypes` | Adds `field_types` to the plan |
+| `DropFields` | Adds `drop_fields` to the plan |
+| `FilterRows` | Adds `filter` to the plan (constant/column predicates only) |
+
+Example of a custom stage that fuses into the columnar plan:
+
+```python
+class DropFieldsIfEmpty:
+    def __init__(self, fields: list[str]):
+        self.fields = fields
+
+    def apply(self, record: dict) -> dict | None:
+        for f in self.fields:
+            record.pop(f, None)
+        return record
+
+    def __call__(self, stream):
+        for row in stream:
+            yield self.apply(row)
+
+    def _plan_kwargs(self) -> dict | None:
+        return {"drop_fields": self.fields}
+```
+
+Notes:
+
+- `_plan_kwargs` is only called by `CrystalXMLSource` objects that support the
+  columnar engine (requires the `columnar` feature).
+- If `_plan_kwargs` returns `None`, the stage is treated as a regular fusable
+  stage (dict-level fusion).
+- Non-fusable stages in the pipeline are always applied as Python generators
+  on the dict stream after columnar fusion completes.

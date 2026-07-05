@@ -3,7 +3,7 @@
 use pyo3::exceptions::{PyIOError, PyException};
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyString};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::fs::File;
@@ -15,6 +15,11 @@ use std::path::Path;
 use std::collections::HashMap;
 #[cfg(feature = "profile")]
 use std::time::Instant;
+
+// Fast allocator: replaces the system heap for all Rust-side
+// allocations (profiling showed ~27% of CPU in malloc/free).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(feature = "columnar")]
 pub mod columnar;
@@ -97,9 +102,19 @@ fn parse_columnar_par_from_slice(
         })
         .collect();
 
+    let engines = results
+        .into_iter()
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(PyException::new_err)?;
+
+    // Fast path: export chunks as record batches in parallel, no merge.
+    // auto_dict must merge first (per-chunk upgrades can disagree on dtype).
+    if !plan.auto_dict {
+        return Python::with_gil(|py| columnar::engines_to_pyarrow_table(engines, &plan, py));
+    }
+
     let mut merged = columnar::ColumnarEngine::new();
-    for result in results {
-        let engine = result.map_err(|e| PyException::new_err(e))?;
+    for engine in engines {
         merged.extend(engine).map_err(|e| PyException::new_err(e))?;
     }
     merged.auto_dict_upgrade();
@@ -219,8 +234,12 @@ fn mmap_and_parse(
     #[allow(unsafe_code)]
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", path, e)))?;
-    let _ = mmap.advise(memmap2::Advice::Sequential);
-    let _ = mmap.advise(memmap2::Advice::WillNeed);
+    // madvise is Unix-only; memmap2 does not expose Advice on Windows.
+    #[cfg(unix)]
+    {
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let _ = mmap.advise(memmap2::Advice::WillNeed);
+    }
     parse_columnar_from_slice(&mmap[..], row_tag, plan)
 }
 
@@ -237,7 +256,7 @@ fn build_plan_from_kwargs(
     let mut plan = columnar::BuildPlan::new();
 
     if let Some(map) = field_mapping {
-        plan.field_map = map;
+        plan.field_map = map.into_iter().collect();
     }
 
     if let Some(drop) = drop_fields {
@@ -395,8 +414,11 @@ pub fn read_to_columnar_multi(
             #[allow(unsafe_code)]
             let mmap = unsafe { memmap2::Mmap::map(&file) }
                 .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", mmap_path, e)))?;
-            let _ = mmap.advise(memmap2::Advice::Sequential);
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
+            #[cfg(unix)]
+            {
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
+            }
             return parse_columnar_multi_from_slice(&mmap[..], &row_tag, plan, num_chunks);
         }
         #[cfg(not(feature = "mmap"))]
@@ -453,8 +475,11 @@ pub fn read_to_columnar_par(
             #[allow(unsafe_code)]
             let mmap = unsafe { memmap2::Mmap::map(&file) }
                 .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", mmap_path, e)))?;
-            let _ = mmap.advise(memmap2::Advice::Sequential);
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
+            #[cfg(unix)]
+            {
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
+            }
             return parse_columnar_par_from_slice(&mmap[..], &row_tag, plan, num_chunks);
         }
         #[cfg(not(feature = "mmap"))]
@@ -522,14 +547,14 @@ macro_rules! measure_el {
     ($profile:expr, $field:ident, $body:expr) => { $body };
 }
 
-/// Streaming CR XML row parser.
+/// Pure-Rust parsing state for the stream engine.
 ///
 /// # Load-bearing invariants
-/// - Holds **no** `Py<...>` objects. This is required for `py.allow_threads` to
-///   compile (the `Send` bound on the closure). If key-interning is ever revived
-///   it must live separately, not on this struct.
-#[pyclass]
-pub struct CrxmlReader {
+/// - Holds **no** `Py<...>` objects. This is required for `py.allow_threads`
+///   to compile (the `Ungil` bound on the closure). Python-object state (the
+///   interned-key cache) lives on `CrxmlReader` beside this struct, and only
+///   the GIL-held dict-build code touches it.
+struct RowParser {
     reader: Reader<BufReader<File>>,
     buf: Vec<u8>,
     inner_buf: Vec<u8>,
@@ -544,12 +569,46 @@ pub struct CrxmlReader {
     profile: ProfileCounters,
 }
 
+/// Streaming CR XML row parser exposed to Python.
+#[pyclass]
+pub struct CrxmlReader {
+    parser: RowParser,
+    /// Field names repeat identically every row; interning the PyString per
+    /// key lets every dict reuse the same object instead of building a fresh
+    /// PyUnicode per field per row.
+    key_cache: rustc_hash::FxHashMap<String, Py<PyString>>,
+}
+
+/// Look up (or create) the interned PyString for `key`.
+fn cached_key<'a>(
+    py: Python<'_>,
+    cache: &'a mut rustc_hash::FxHashMap<String, Py<PyString>>,
+    key: &str,
+) -> &'a Py<PyString> {
+    if !cache.contains_key(key) {
+        cache.insert(key.to_owned(), PyString::new(py, key).unbind());
+    }
+    &cache[key]
+}
+
+extern "C" {
+    fn _PyDict_NewPresized(size: isize) -> *mut pyo3::ffi::PyObject;
+}
+
+fn new_dict_presized(py: Python<'_>, width: isize) -> PyResult<Bound<'_, PyDict>> {
+    #[allow(unsafe_code)]
+    unsafe {
+        let ptr = _PyDict_NewPresized(width);
+        Ok(Bound::from_owned_ptr_or_err(py, ptr)?.downcast_into_unchecked())
+    }
+}
+
 // Pure-Rust helpers (not #[pymethods]) — no Python objects touched.
-impl CrxmlReader {
+impl RowParser {
     fn read_one_row(&mut self) -> Result<Option<usize>, String> {
         #[cfg(feature = "profile")]
         let profile = &mut self.profile;
-        let CrxmlReader { reader, buf, inner_buf, row, row_tag, .. } = self;
+        let RowParser { reader, buf, inner_buf, row, row_tag, .. } = self;
         row.clear();
 
         loop {
@@ -783,15 +842,18 @@ impl CrxmlReader {
         let reader = Reader::from_reader(BufReader::with_capacity(128 * 1024, file));
         let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
         Ok(CrxmlReader {
-            reader,
-            buf: Vec::with_capacity(4096),
-            inner_buf: Vec::with_capacity(4096),
-            row: Vec::with_capacity(16),
-            row_tag,
-            batch_vals: Vec::with_capacity(16 * 1024),
-            batch_lens: Vec::with_capacity(1024),
-            #[cfg(feature = "profile")]
-            profile: ProfileCounters::default(),
+            parser: RowParser {
+                reader,
+                buf: Vec::with_capacity(4096),
+                inner_buf: Vec::with_capacity(4096),
+                row: Vec::with_capacity(16),
+                row_tag,
+                batch_vals: Vec::with_capacity(16 * 1024),
+                batch_lens: Vec::with_capacity(1024),
+                #[cfg(feature = "profile")]
+                profile: ProfileCounters::default(),
+            },
+            key_cache: rustc_hash::FxHashMap::default(),
         })
     }
 
@@ -800,18 +862,19 @@ impl CrxmlReader {
     }
 
     fn next_row(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        match self.read_one_row().map_err(|e| PyException::new_err(e))? {
+        match self.parser.read_one_row().map_err(|e| PyException::new_err(e))? {
             None => Ok(None),
-            Some(_) => {
+            Some(n) => {
                 #[cfg(feature = "profile")]
                 let _dict_start = Instant::now();
-                let dict = PyDict::new(py);
-                for (k, v) in self.row.drain(..) {
-                    dict.set_item(k, v)?;
+                let CrxmlReader { parser, key_cache } = self;
+                let dict = new_dict_presized(py, n as isize)?;
+                for (k, v) in parser.row.drain(..) {
+                    dict.set_item(cached_key(py, key_cache, &k), v)?;
                 }
                 #[cfg(feature = "profile")]
                 {
-                    self.profile.dict_build_ns += _dict_start.elapsed().as_nanos() as u64;
+                    self.parser.profile.dict_build_ns += _dict_start.elapsed().as_nanos() as u64;
                 }
                 Ok(Some(dict.into()))
             }
@@ -828,32 +891,34 @@ impl CrxmlReader {
     fn next_batch(mut slf: PyRefMut<'_, Self>, n: usize) -> PyResult<Option<PyObject>> {
         let py = slf.py();
 
-        // Parse into flat buffers with GIL released.
-        let this: &mut CrxmlReader = &mut *slf;
+        // Parse into flat buffers with GIL released. Only the pure-Rust
+        // RowParser crosses into the closure; key_cache (Py objects) stays out.
+        let parser: &mut RowParser = &mut slf.parser;
         let rows = py
-            .allow_threads(move || this.read_batch_into(n))
+            .allow_threads(move || parser.read_batch_into(n))
             .map_err(PyException::new_err)?;
 
         if rows == 0 {
             return Ok(None);
         }
 
-        // GIL held: build dicts from flat buffers.
+        // GIL held: build dicts from flat buffers with interned keys.
         #[cfg(feature = "profile")]
         let _dict_start = Instant::now();
         let out = PyList::empty(py);
+        let CrxmlReader { parser, key_cache } = &mut *slf;
         let mut cursor = 0usize;
-        for &len in &slf.batch_lens {
-            let dict = PyDict::new(py);
-            for (k, v) in &slf.batch_vals[cursor..cursor + len] {
-                dict.set_item(k.as_str(), v.as_str())?;
+        for &len in &parser.batch_lens {
+            let dict = new_dict_presized(py, len as isize)?;
+            for (k, v) in &parser.batch_vals[cursor..cursor + len] {
+                dict.set_item(cached_key(py, key_cache, k), v.as_str())?;
             }
             cursor += len;
             out.append(dict)?;
         }
         #[cfg(feature = "profile")]
         {
-            slf.profile.dict_build_ns += _dict_start.elapsed().as_nanos() as u64;
+            slf.parser.profile.dict_build_ns += _dict_start.elapsed().as_nanos() as u64;
         }
         Ok(Some(out.into_any().unbind()))
     }
@@ -861,15 +926,15 @@ impl CrxmlReader {
     #[cfg(feature = "profile")]
     fn get_profile_data(&self, py: Python<'_>) -> PyResult<PyObject> {
         let d = PyDict::new(py);
-        d.set_item("event_loop_ns", self.profile.event_loop_ns)?;
-        d.set_item("unescape_ns", self.profile.unescape_ns)?;
-        d.set_item("dict_build_ns", self.profile.dict_build_ns)?;
+        d.set_item("event_loop_ns", self.parser.profile.event_loop_ns)?;
+        d.set_item("unescape_ns", self.parser.profile.unescape_ns)?;
+        d.set_item("dict_build_ns", self.parser.profile.dict_build_ns)?;
         Ok(d.into())
     }
 
     #[cfg(feature = "profile")]
     fn reset_profile(&mut self) {
-        self.profile = ProfileCounters::default();
+        self.parser.profile = ProfileCounters::default();
     }
 
 }

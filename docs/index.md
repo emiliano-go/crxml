@@ -16,12 +16,12 @@ Parse 100 MB in 0.42 seconds. RSS stays well below file size.
 ```python
 from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe
 
-df = (
+pipe = (
     CrystalXMLSource("report.xml")
     | RenameFields({"f1": "invoice", "f2": "amount"})
     | CastTypes({"amount": float})
-    |> to_dataframe
 )
+df = to_dataframe(pipe)
 ```
 
 ## License

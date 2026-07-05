@@ -44,7 +44,7 @@ Call `.schema()` to discover fields without consuming the stream:
 
 ```python
 src = CrystalXMLSource("report.xml")
-fields = src.schema()  # list of (key, sample_value) tuples
+fields = src.schema()  # list of field name strings
 ```
 
 The source yields rows internally and caches them, so the first batch is not

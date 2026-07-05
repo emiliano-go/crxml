@@ -41,8 +41,7 @@ def to_csv(
         )
         writer.writeheader()
         writer.writerow(first)
-        for rec in stream:
-            writer.writerow(rec)
+        writer.writerows(stream)
 
 def collect(pipeline: Iterable[dict]) -> list[dict]:
     if hasattr(pipeline, "_iter_batches"):

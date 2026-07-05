@@ -36,22 +36,11 @@ def _default_threads() -> int:
 
 
 def _arrow_iter(table) -> Iterator[dict]:
-    """Yield dicts from a pyarrow Table.
-
-    Compatibility helper — for columnar/parallel engines when row iteration
-    is requested.  Table-oriented callers should use ``to_arrow()`` or
-    ``to_dataframe()`` directly to avoid the dict reconstruction overhead.
-    """
-    for i in range(table.num_rows):
-        yield {col: table.column(col)[i].as_py() for col in table.column_names}
+    for batch in table.to_batches():
+        yield from batch.to_pylist()
 
 
 class _BatchIter:
-    """Batched row iterator backed by CrxmlReader.next_batch.
-
-    Reduces Python↔Rust boundary crossings from one-per-row to one-per-batch.
-    """
-
     __slots__ = ("_reader", "_n", "_batch", "_i")
 
     def __init__(self, reader, batch_size: int = 1024):
@@ -107,12 +96,10 @@ class CrystalXMLSource:
         drop_fields: Optional[list[str]] = None,
         filter: Optional[dict[str, str]] = None,
         field_types: Optional[dict[str, str]] = None,
-        #   Example: field_types={"Score": "int64", "Amount": "float64", "IsValid": "bool"}
-        #   Typed columns set unparseable values to null (cross-chunk conflict = null).
         dictionary_columns: Optional[list[str]] = None,
         schema: Optional[list[str]] = None,
         auto_dict: bool = False,
-        use_mmap: bool = False,
+        use_mmap: bool = True,
         batch_size: int = 1024,
     ):
         self._filepath = Path(source)
@@ -121,10 +108,10 @@ class CrystalXMLSource:
 
         self._row_tag = row_tag
         self._memory = _parse_memory(memory)
-        self._num_chunks = threads if threads > 0 else _default_threads()
+        self._num_chunks = 2 * (threads if threads > 0 else _default_threads())
         self._field_mapping = field_mapping or {}
         self._drop_fields = drop_fields or []
-        self._filter = filter  # {"field": ..., "op": ..., "value": ...} or None
+        self._filter = filter
         self._field_types = field_types or {}
         self._dictionary_columns = dictionary_columns or []
         self._use_mmap = use_mmap
@@ -141,7 +128,6 @@ class CrystalXMLSource:
 
         self._engine_desired = engine
 
-        # Construction-time resolution (validates feature availability).
         if engine == "auto":
             self._engine = "stream"
         else:
@@ -155,12 +141,6 @@ class CrystalXMLSource:
             )
 
     def _resolve_engine(self, goal: str) -> str:
-        """Return engine for *goal* ('iter' or 'table').
-
-        When ``engine='auto'``, iteration always uses the stream (dict) path
-        and table methods (to_arrow/to_dataframe) use the columnar/parallel
-        path — avoiding the dict loop entirely for the DataFrame use case.
-        """
         explicit = self._engine_desired
 
         if explicit != "auto":
@@ -176,7 +156,6 @@ class CrystalXMLSource:
             )
             return "stream"
 
-        # goal == "table": route to columnar (parallel if large enough).
         if size >= 8 * 1024 * 1024 and _HAS_PARALLEL and mem_ok:
             logger.info(
                 "engine=auto → table → parallel (%.1f MB file, %d threads)",
@@ -216,24 +195,12 @@ class CrystalXMLSource:
         return kwargs
 
     def _read_arrow(self, plan_overrides=None):
-        """Parse to a pyarrow.Table.
-
-        Parameters
-        ----------
-        plan_overrides : dict or None
-            Extra BuildPlan kwargs merged on top of the source's own
-            configuration.  Used by pipeline stage fusion (Phase 4) to
-            avoid a dict round-trip for fusible stages.
-            When supplied the cache is bypassed.
-        """
         if self._cached_arrow is not None and plan_overrides is None:
             return self._cached_arrow
         engine = self._resolve_engine("table")
         plan = self._build_plan_kwargs()
         if plan_overrides:
             plan.update(plan_overrides)
-        # Use bounded-batch parsing when memory budget is specified and
-        # the file is larger than the budget (for columnar/parallel engines)
         if (
             self._memory is not None
             and self._filepath.stat().st_size > self._memory
@@ -292,9 +259,8 @@ class CrystalXMLSource:
                 yield batch
             return
 
-        rows = self.to_arrow().to_pylist()
-        for i in range(0, len(rows), batch_size):
-            yield rows[i : i + batch_size]
+        for batch in self.to_arrow().to_batches(max_chunksize=batch_size):
+            yield batch.to_pylist()
 
     def __iter__(self) -> Iterator[dict]:
         engine = self._resolve_engine("iter")
@@ -308,25 +274,14 @@ class CrystalXMLSource:
         return self.to_pandas()
 
     def to_arrow(self):
-        """Return a pyarrow.Table of the parsed data."""
         return self._read_arrow()
 
     def to_polars(self):
-        """Return a polars DataFrame (zero-copy from Arrow)."""
         import polars as pl
 
         return pl.from_arrow(self.to_arrow())
 
     def to_pandas(self, arrow_backed: bool = True) -> "pd.DataFrame":
-        """Return a pandas DataFrame.
-
-        Parameters
-        ----------
-        arrow_backed : bool
-            If True (default), use ``pd.ArrowDtype`` for zero-copy string
-            columns (requires pandas ≥ 1.5).  If False, materialise
-            strings as Python ``str`` objects.
-        """
         import pandas as pd
 
         table = self.to_arrow()
@@ -335,15 +290,6 @@ class CrystalXMLSource:
         return table.to_pandas()
 
     def to_parquet(self, path: Union[str, Path], **kwargs):
-        """Write the data to a Parquet file.
-
-        Parameters
-        ----------
-        path : str or Path
-            Destination file path.
-        **kwargs
-            Forwarded to ``pyarrow.parquet.write_table``.
-        """
         import pyarrow.parquet as pq
 
         pq.write_table(self.to_arrow(), str(path), **kwargs)

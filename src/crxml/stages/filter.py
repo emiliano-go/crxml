@@ -1,6 +1,4 @@
 class _ConstantPredicate:
-    """Picklable predicate for constant field-value comparisons."""
-
     __slots__ = ("_field", "_op", "_value")
 
     _VALID_OPS = frozenset({"==", "eq", "!=", "ne"})
@@ -23,8 +21,6 @@ class _ConstantPredicate:
 
 
 class _ComparePredicate:
-    """Picklable predicate for column-to-column comparisons."""
-
     __slots__ = ("_field_a", "_op", "_field_b")
 
     _OPS = {
