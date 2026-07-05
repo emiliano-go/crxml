@@ -240,7 +240,11 @@ fn mmap_and_parse(
         let _ = mmap.advise(memmap2::Advice::Sequential);
         let _ = mmap.advise(memmap2::Advice::WillNeed);
     }
-    parse_columnar_from_slice(&mmap[..], row_tag, plan)
+    let result = parse_columnar_from_slice(&mmap[..], row_tag, plan);
+    // UnmapViewOfFile on a 100MB mapping costs ~20ms serially; the result
+    // no longer references the mapping, so unmap off the caller's path.
+    std::thread::spawn(move || drop(mmap));
+    result
 }
 
 #[cfg(feature = "columnar")]
@@ -419,7 +423,10 @@ pub fn read_to_columnar_multi(
                 let _ = mmap.advise(memmap2::Advice::Sequential);
                 let _ = mmap.advise(memmap2::Advice::WillNeed);
             }
-            return parse_columnar_multi_from_slice(&mmap[..], &row_tag, plan, num_chunks);
+            let result = parse_columnar_multi_from_slice(&mmap[..], &row_tag, plan, num_chunks);
+            // Unmap off the caller's path (~20ms serial for 100MB).
+            std::thread::spawn(move || drop(mmap));
+            return result;
         }
         #[cfg(not(feature = "mmap"))]
         {
@@ -480,7 +487,10 @@ pub fn read_to_columnar_par(
                 let _ = mmap.advise(memmap2::Advice::Sequential);
                 let _ = mmap.advise(memmap2::Advice::WillNeed);
             }
-            return parse_columnar_par_from_slice(&mmap[..], &row_tag, plan, num_chunks);
+            let result = parse_columnar_par_from_slice(&mmap[..], &row_tag, plan, num_chunks);
+            // Unmap off the caller's path (~20ms serial for 100MB).
+            std::thread::spawn(move || drop(mmap));
+            return result;
         }
         #[cfg(not(feature = "mmap"))]
         {
@@ -595,6 +605,7 @@ extern "C" {
     fn _PyDict_NewPresized(size: isize) -> *mut pyo3::ffi::PyObject;
 }
 
+/// Row dicts have known homogeneous width; presize avoids incremental rehashing.
 fn new_dict_presized(py: Python<'_>, width: isize) -> PyResult<Bound<'_, PyDict>> {
     #[allow(unsafe_code)]
     unsafe {

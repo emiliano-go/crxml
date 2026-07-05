@@ -528,6 +528,217 @@ impl ColumnBuilder {
     }
 }
 
+/// Bytes are chunk-validated UTF-8 (see `parse_bytes` entry) — skip
+/// std's per-call revalidation.
+#[allow(unsafe_code)]
+#[inline]
+fn utf8_unchecked(b: &[u8]) -> &str {
+    unsafe { std::str::from_utf8_unchecked(b) }
+}
+
+/// Attribute value without revalidation; unescapes only when an entity is
+/// actually present (memchr probe — CR values almost never contain `&`).
+fn attr_value<'v>(
+    attr: &quick_xml::events::attributes::Attribute<'v>,
+) -> Result<std::borrow::Cow<'v, str>, String> {
+    use std::borrow::Cow;
+    match &attr.value {
+        Cow::Borrowed(b) => {
+            let s = utf8_unchecked(b);
+            if memchr::memchr(b'&', b).is_none() {
+                Ok(Cow::Borrowed(s))
+            } else {
+                quick_xml::escape::unescape(s).map_err(|e| e.to_string())
+            }
+        }
+        // Owned never occurs for the borrowed-slice reader; fall back.
+        Cow::Owned(_) => attr
+            .unescape_value()
+            .map_err(|e| e.to_string())
+            .map(|c| Cow::Owned(c.into_owned())),
+    }
+}
+
+/// Text content without revalidation; same `&` probe as `attr_value`.
+fn text_value(txt: quick_xml::events::BytesText<'_>) -> Result<std::borrow::Cow<'_, str>, String> {
+    use std::borrow::Cow;
+    match txt.into_inner() {
+        Cow::Borrowed(b) => {
+            let s = utf8_unchecked(b);
+            if memchr::memchr(b'&', b).is_none() {
+                Ok(Cow::Borrowed(s))
+            } else {
+                quick_xml::escape::unescape(s).map_err(|e| e.to_string())
+            }
+        }
+        // Owned never occurs for the borrowed-slice reader; fall back.
+        Cow::Owned(o) => {
+            let s = String::from_utf8(o).map_err(|e| e.to_string())?;
+            Ok(Cow::Owned(
+                match quick_xml::escape::unescape(&s).map_err(|e| e.to_string())? {
+                    Cow::Borrowed(x) => x.to_owned(),
+                    Cow::Owned(x) => x,
+                },
+            ))
+        }
+    }
+}
+
+/// Raw byte value known to be chunk-validated UTF-8; unescape only when an
+/// entity is present.
+fn raw_value(b: &[u8]) -> Result<std::borrow::Cow<'_, str>, String> {
+    use std::borrow::Cow;
+    let s = utf8_unchecked(b);
+    if memchr::memchr(b'&', b).is_none() {
+        Ok(Cow::Borrowed(s))
+    } else {
+        quick_xml::escape::unescape(s).map_err(|e| e.to_string())
+    }
+}
+
+/// The fast scanner met something outside the CR shape — fall back.
+struct FastBail;
+
+/// Byte cursor over one chunk.
+struct Scan<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+
+impl<'a> Scan<'a> {
+    #[inline]
+    fn rest(&self) -> &'a [u8] {
+        &self.b[self.p..]
+    }
+
+    /// Advance to just past the next '<'. false = end of chunk.
+    #[inline]
+    fn seek_lt(&mut self) -> bool {
+        match memchr::memchr(b'<', self.rest()) {
+            Some(r) => {
+                self.p += r + 1;
+                true
+            }
+            None => {
+                self.p = self.b.len();
+                false
+            }
+        }
+    }
+
+    /// Read a tag name at the cursor; leaves the cursor after the name.
+    #[inline]
+    fn tag_name(&mut self) -> &'a [u8] {
+        let s = self.rest();
+        let mut i = 0;
+        while i < s.len() && !matches!(s[i], b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/') {
+            i += 1;
+        }
+        self.p += i;
+        &s[..i]
+    }
+
+    /// Skip to the end of the current tag (past '>'), honoring quoted
+    /// attribute values (which may legally contain '>'). Returns whether
+    /// the tag was self-closing.
+    fn tag_close(&mut self) -> Result<bool, FastBail> {
+        loop {
+            let s = self.rest();
+            match memchr::memchr3(b'>', b'"', b'\'', s) {
+                Some(r) => match s[r] {
+                    b'>' => {
+                        let self_closing = r > 0 && s[r - 1] == b'/';
+                        self.p += r + 1;
+                        return Ok(self_closing);
+                    }
+                    q => match memchr::memchr(q, &s[r + 1..]) {
+                        Some(c) => self.p += r + 1 + c + 1,
+                        None => return Err(FastBail),
+                    },
+                },
+                None => return Err(FastBail),
+            }
+        }
+    }
+
+    /// Iterate `name="value"` attributes from the cursor to the tag end;
+    /// leaves the cursor past '>'. Returns whether the tag self-closed.
+    fn attrs(&mut self, mut f: impl FnMut(&'a [u8], &'a [u8])) -> Result<bool, FastBail> {
+        loop {
+            // Skip whitespace.
+            {
+                let s = self.rest();
+                let mut i = 0;
+                while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\r' | b'\n') {
+                    i += 1;
+                }
+                self.p += i;
+            }
+            let s = self.rest();
+            match s.first() {
+                None => return Err(FastBail),
+                Some(b'>') => {
+                    self.p += 1;
+                    return Ok(false);
+                }
+                Some(b'/') => {
+                    if s.get(1) == Some(&b'>') {
+                        self.p += 2;
+                        return Ok(true);
+                    }
+                    return Err(FastBail);
+                }
+                _ => {
+                    let mut j = 0;
+                    while j < s.len()
+                        && !matches!(s[j], b'=' | b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
+                    {
+                        j += 1;
+                    }
+                    let name = &s[..j];
+                    self.p += j;
+                    // Skip whitespace, expect '='.
+                    {
+                        let s2 = self.rest();
+                        let mut i = 0;
+                        while i < s2.len() && matches!(s2[i], b' ' | b'\t' | b'\r' | b'\n') {
+                            i += 1;
+                        }
+                        self.p += i;
+                    }
+                    if self.rest().first() != Some(&b'=') {
+                        return Err(FastBail); // valueless attribute: not CR shape
+                    }
+                    self.p += 1;
+                    // Skip whitespace, expect quote.
+                    {
+                        let s2 = self.rest();
+                        let mut i = 0;
+                        while i < s2.len() && matches!(s2[i], b' ' | b'\t' | b'\r' | b'\n') {
+                            i += 1;
+                        }
+                        self.p += i;
+                    }
+                    let s2 = self.rest();
+                    let q = match s2.first() {
+                        Some(&q @ (b'"' | b'\'')) => q,
+                        _ => return Err(FastBail),
+                    };
+                    self.p += 1;
+                    let s3 = self.rest();
+                    match memchr::memchr(q, s3) {
+                        Some(c) => {
+                            f(name, &s3[..c]);
+                            self.p += c + 1;
+                        }
+                        None => return Err(FastBail),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Columnar engine: parses XML rows into column-oriented storage,
 /// then exports to a PyArrow table in one shot.
 pub struct ColumnarEngine {
@@ -708,7 +919,229 @@ impl ColumnarEngine {
     /// Uses a streaming quick-xml reader.  When the reader hits an error
     /// (unmatched parent end tag), falls back to per-row readers for the
     /// remaining data in the chunk.
+    /// Fast path: hand-rolled flat scanner for the fixed CR row shape.
+    ///
+    /// Mirrors `parse_bytes_quickxml` exactly for the shapes it accepts:
+    /// row attributes, flat Field/Text/Section/unknown children, value text
+    /// from FormattedValue/Value/TextValue, stray end tags ignored, EOF
+    /// mid-row leaves the partial row for `normalize()` to pop. Anything
+    /// else (comments, CDATA, DOCTYPE, unquoted attrs) returns `FastBail`.
+    fn parse_bytes_fast(&mut self, bytes: &[u8], row_tag: &[u8]) -> Result<(), FastBail> {
+        let mut sc = Scan { b: bytes, p: 0 };
+
+        loop {
+            if !sc.seek_lt() {
+                return Ok(());
+            }
+            match sc.rest().first() {
+                None => return Ok(()),
+                Some(b'/') => {
+                    // Stray end tag (chunk tails: </Group>, </CrystalReport>)
+                    sc.p += 1;
+                    sc.tag_name();
+                    sc.tag_close()?;
+                }
+                Some(b'?') => {
+                    // XML declaration / processing instruction
+                    match memchr::memmem::find(sc.rest(), b"?>") {
+                        Some(r) => sc.p += r + 2,
+                        None => return Ok(()),
+                    }
+                }
+                Some(b'!') => return Err(FastBail),
+                _ => {
+                    let name = sc.tag_name();
+                    if name == row_tag {
+                        self.scan_row(&mut sc, row_tag)?;
+                    } else {
+                        sc.tag_close()?;
+                    }
+                }
+            }
+        }
+    }
+
+    fn scan_row<'a>(&mut self, sc: &mut Scan<'a>, row_tag: &[u8]) -> Result<(), FastBail> {
+        let mut err = false;
+        let self_closing = {
+            let this = &mut *self;
+            sc.attrs(|k, v| {
+                if err {
+                    return;
+                }
+                match raw_value(v) {
+                    Ok(val) => this.push_field_str(utf8_unchecked(k), Some(val.as_ref())),
+                    Err(_) => err = true,
+                }
+            })?
+        };
+        if err {
+            return Err(FastBail);
+        }
+        if self_closing {
+            self.finish_row();
+            return Ok(());
+        }
+
+        loop {
+            if !sc.seek_lt() {
+                // EOF mid-row: partial pushes are popped by normalize().
+                return Ok(());
+            }
+            match sc.rest().first() {
+                None => return Ok(()),
+                Some(b'/') => {
+                    sc.p += 1;
+                    let name = sc.tag_name();
+                    sc.tag_close()?;
+                    if name == row_tag {
+                        self.finish_row();
+                        return Ok(());
+                    }
+                    // Other end tags: flat traversal ignores them.
+                }
+                Some(b'!') | Some(b'?') => return Err(FastBail),
+                _ => {
+                    let name = sc.tag_name();
+                    match name {
+                        b"Field" => self.scan_child(
+                            sc,
+                            b"Field",
+                            &[b"FormattedValue" as &[u8], b"Value"],
+                            &[b"FieldName" as &[u8], b"Name"],
+                            "Field",
+                        )?,
+                        b"Text" => self.scan_child(
+                            sc,
+                            b"Text",
+                            &[b"TextValue" as &[u8]],
+                            &[b"Name" as &[u8]],
+                            "Text",
+                        )?,
+                        b"Section" => {
+                            let mut sn = std::borrow::Cow::Borrowed("");
+                            let mut serr = false;
+                            sc.attrs(|k, v| {
+                                if k == b"SectionNumber" {
+                                    match raw_value(v) {
+                                        Ok(x) => sn = x,
+                                        Err(_) => serr = true,
+                                    }
+                                }
+                            })?;
+                            if serr {
+                                return Err(FastBail);
+                            }
+                            // Contents are NOT consumed: Section children are
+                            // handled by this same flat loop.
+                            self.push_field_str("Section", Some(sn.as_ref()));
+                        }
+                        _ => {
+                            sc.tag_close()?;
+                            self.push_field_str(utf8_unchecked(name), Some(""));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One Field/Text child: extract the key from `name_attrs`, the value
+    /// text from the last non-empty `value_tags` element, consume through
+    /// `</end_tag>`.
+    fn scan_child<'a>(
+        &mut self,
+        sc: &mut Scan<'a>,
+        end_tag: &[u8],
+        value_tags: &[&[u8]],
+        name_attrs: &[&[u8]],
+        default_key: &str,
+    ) -> Result<(), FastBail> {
+        use std::borrow::Cow;
+
+        let mut key: Option<Cow<'a, str>> = None;
+        let mut err = false;
+        let self_closing = sc.attrs(|k, v| {
+            if key.is_none() && name_attrs.iter().any(|na| *na == k) {
+                match raw_value(v) {
+                    Ok(val) => key = Some(val),
+                    Err(_) => err = true,
+                }
+            }
+        })?;
+        if err {
+            return Err(FastBail);
+        }
+
+        let mut text: Cow<'a, str> = Cow::Borrowed("");
+        if !self_closing {
+            loop {
+                if !sc.seek_lt() {
+                    break;
+                }
+                match sc.rest().first() {
+                    None => break,
+                    Some(b'/') => {
+                        sc.p += 1;
+                        let n = sc.tag_name();
+                        sc.tag_close()?;
+                        if n == end_tag {
+                            break;
+                        }
+                    }
+                    Some(b'!') | Some(b'?') => return Err(FastBail),
+                    _ => {
+                        let n = sc.tag_name();
+                        let closed = sc.tag_close()?;
+                        if !closed && value_tags.iter().any(|vt| *vt == n) {
+                            let s = sc.rest();
+                            let e = memchr::memchr(b'<', s).ok_or(FastBail)?;
+                            if e > 0 {
+                                text = raw_value(&s[..e]).map_err(|_| FastBail)?;
+                            }
+                            sc.p += e;
+                        }
+                    }
+                }
+            }
+        }
+        let key_str: &str = key.as_deref().unwrap_or(default_key);
+        self.push_field_str(key_str, Some(text.as_ref()));
+        Ok(())
+    }
+
     pub fn parse_bytes(&mut self, bytes: &[u8], row_tag: &[u8]) -> Result<(), String> {
+        // Validate the whole chunk once (SIMD, ~10+ GB/s); every value/key
+        // conversion below then uses from_utf8_unchecked instead of paying
+        // per-value revalidation (~5% CPU in profiles). Chunk boundaries sit
+        // on ASCII '<', so per-chunk validation covers the whole file.
+        simdutf8::basic::from_utf8(bytes)
+            .map_err(|_| "invalid UTF-8 in input".to_string())?;
+
+        // Hand-rolled scanner for the fixed CR row shape (quick-xml's
+        // generic event machinery was ~21% of CPU). Bails out to the
+        // quick-xml path on anything it doesn't recognize, rolling back
+        // any rows it committed from this chunk first.
+        let start_rows = self.row_count;
+        match self.parse_bytes_fast(bytes, row_tag) {
+            Ok(()) => return Ok(()),
+            Err(FastBail) => self.rollback_to(start_rows),
+        }
+        self.parse_bytes_quickxml(bytes, row_tag)
+    }
+
+    /// Undo everything pushed since `rows` committed rows (partial row
+    /// pushes included) so a fallback reparse starts clean.
+    fn rollback_to(&mut self, rows: usize) {
+        for b in self.columns.values_mut() {
+            while b.len() > rows {
+                b.pop();
+            }
+        }
+        self.row_count = rows;
+    }
+
+    fn parse_bytes_quickxml(&mut self, bytes: &[u8], row_tag: &[u8]) -> Result<(), String> {
         // Borrowed-slice reader: events reference `bytes` directly, so no
         // event is ever copied into a scratch buffer (the Cursor +
         // read_event_into variant showed up as memmove in profiles).
@@ -743,11 +1176,8 @@ impl ColumnarEngine {
                 Event::Empty(ref e) if e.name().as_ref() == row_tag_owned => {
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| e.to_string())?;
-                        let key = std::str::from_utf8(attr.key.as_ref())
-                            .map_err(|e| e.to_string())?;
-                        let value = attr
-                            .unescape_value()
-                            .map_err(|e| e.to_string())?;
+                        let key = utf8_unchecked(attr.key.as_ref());
+                        let value = attr_value(&attr)?;
                         self.push_field_str(key, Some(value.as_ref()));
                     }
                     self.finish_row();
@@ -756,11 +1186,8 @@ impl ColumnarEngine {
                 Event::Start(ref e) if e.name().as_ref() == row_tag_owned => {
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| e.to_string())?;
-                        let key = std::str::from_utf8(attr.key.as_ref())
-                            .map_err(|e| e.to_string())?;
-                        let value = attr
-                            .unescape_value()
-                            .map_err(|e| e.to_string())?;
+                        let key = utf8_unchecked(attr.key.as_ref());
+                        let value = attr_value(&attr)?;
                         self.push_field_str(key, Some(value.as_ref()));
                     }
 
@@ -782,7 +1209,7 @@ impl ColumnarEngine {
                                             if attr_key == b"FieldName"
                                                 || attr_key == b"Name"
                                             {
-                                                if let Ok(value) = attr.unescape_value() {
+                                                if let Ok(value) = attr_value(&attr) {
                                                     field_name = Some(value);
                                                     break;
                                                 }
@@ -818,11 +1245,7 @@ impl ColumnarEngine {
                                                             if let Event::Text(txt) =
                                                                 text_event
                                                             {
-                                                                text = txt
-                                                                    .unescape()
-                                                                    .map_err(|e| {
-                                                                        e.to_string()
-                                                                    })?;
+                                                                text = text_value(txt)?;
                                                             }
                                                         }
                                                     }
@@ -843,7 +1266,7 @@ impl ColumnarEngine {
                                     for attr in child.attributes() {
                                         if let Ok(attr) = attr {
                                             if attr.key.as_ref() == b"Name" {
-                                                if let Ok(value) = attr.unescape_value() {
+                                                if let Ok(value) = attr_value(&attr) {
                                                     text_name = Some(value);
                                                     break;
                                                 }
@@ -877,11 +1300,7 @@ impl ColumnarEngine {
                                                             if let Event::Text(txt) =
                                                                 text_event
                                                             {
-                                                                text = txt
-                                                                    .unescape()
-                                                                    .map_err(|e| {
-                                                                        e.to_string()
-                                                                    })?;
+                                                                text = text_value(txt)?;
                                                             }
                                                         }
                                                     }
@@ -904,13 +1323,12 @@ impl ColumnarEngine {
                                         .attributes()
                                         .filter_map(|a| a.ok())
                                         .find(|a| a.key.as_ref() == b"SectionNumber")
-                                        .and_then(|a| a.unescape_value().ok())
+                                        .and_then(|a| attr_value(&a).ok())
                                         .unwrap_or_default();
                                     self.push_field_str("Section", Some(sn.as_ref()));
                                 } else {
                                     // Unknown tag: push tag name with empty value.
-                                    let key = std::str::from_utf8(child_tag)
-                                        .map_err(|e| e.to_string())?;
+                                    let key = utf8_unchecked(child_tag);
                                     self.push_field_str(key, Some(""));
                                 }
                             }

@@ -17,6 +17,8 @@ class CastTypes:
         mapping = self._mapping
         if not mapping:
             return record
+        # Mutates in place: records come fresh off the parser and flow through
+        # the pipeline exactly once, so the defensive copy was pure overhead.
         for field, cast_fn in mapping.items():
             try:
                 record[field] = cast_fn(record[field])

@@ -36,32 +36,27 @@ def _default_threads() -> int:
 
 
 def _arrow_iter(table) -> Iterator[dict]:
+    """Yield dicts from a pyarrow Table.
+
+    Compatibility helper — for columnar/parallel engines when row iteration
+    is requested.  Table-oriented callers should use ``to_arrow()`` or
+    ``to_dataframe()`` directly to avoid the dict reconstruction overhead.
+    """
     for batch in table.to_batches():
         yield from batch.to_pylist()
 
 
-class _BatchIter:
-    __slots__ = ("_reader", "_n", "_batch", "_i")
+def _batch_iter(reader, batch_size: int = 1024) -> Iterator[dict]:
+    """Batched row iterator backed by CrxmlReader.next_batch.
 
-    def __init__(self, reader, batch_size: int = 1024):
-        self._reader = reader
-        self._n = batch_size
-        self._batch: list[dict] = []
-        self._i = 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> dict:
-        if self._i >= len(self._batch):
-            b = self._reader.next_batch(self._n)
-            if b is None:
-                raise StopIteration
-            self._batch = b
-            self._i = 0
-        item = self._batch[self._i]
-        self._i += 1
-        return item
+    One Rust call per batch; ``yield from`` walks each batch list at
+    C speed (no per-row Python-level __next__ or index bookkeeping).
+    """
+    while True:
+        batch = reader.next_batch(batch_size)
+        if batch is None:
+            return
+        yield from batch
 
 
 class CrystalXMLSource:
@@ -108,7 +103,10 @@ class CrystalXMLSource:
 
         self._row_tag = row_tag
         self._memory = _parse_memory(memory)
-        self._num_chunks = 2 * (threads if threads > 0 else _default_threads())
+        # 4x threads: finer chunks even out per-chunk parse-time variance,
+        # but beyond ~4x the rayon join/spin overhead wins (VTune showed 43%
+        # spin at 8x on 24 cores; 3-4x measured fastest with the scanner).
+        self._num_chunks = 4 * (threads if threads > 0 else _default_threads())
         self._field_mapping = field_mapping or {}
         self._drop_fields = drop_fields or []
         self._filter = filter
@@ -266,7 +264,7 @@ class CrystalXMLSource:
         engine = self._resolve_engine("iter")
 
         if engine == "stream":
-            return _BatchIter(self._stream_iter(), batch_size=self._batch_size)
+            return _batch_iter(self._stream_iter(), batch_size=self._batch_size)
 
         return _arrow_iter(self._read_arrow())
 
