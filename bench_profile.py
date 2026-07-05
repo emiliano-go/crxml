@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Phase 0 profiling — emit bench_results/<sha>.json with measured breakdown.
+"""
+Phase 0 profiling — emit bench_results/<sha>.json with measured breakdown.
 
 Usage (profile build required):
     pip install -e . --config-settings=--features=profile
@@ -36,7 +37,6 @@ def get_git_sha() -> str:
 
 
 def run_reader(path: str, row_tag: str = "Details") -> dict:
-    """Run full parse and return profile counters + wall time."""
     from crxml import _crxml_core as _core
 
     reader = _core.CrxmlReader(path, row_tag)
@@ -54,7 +54,6 @@ def run_reader(path: str, row_tag: str = "Details") -> dict:
 
 
 def run_pyspy(path: str, duration: float = 5.0) -> dict:
-    """Run py-spy record with native frames, emit SVG flamegraph."""
     pyspy_bin = shutil.which("py-spy") or str(Path(sys.executable).parent / "py-spy")
     flamegraph_path = BENCH_RESULTS / "flamegraph.svg"
 
@@ -146,7 +145,6 @@ def main():
         json.dump(results, f, indent=2, default=str)
     print(f"\n  → {output_path}")
 
-    # Update latest symlink
     latest = BENCH_RESULTS / "latest.json"
     if latest.exists() or latest.is_symlink():
         latest.unlink()

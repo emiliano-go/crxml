@@ -34,9 +34,7 @@ Use `.schema()` to see the fields without consuming the stream:
 
 ```python
 src = CrystalXMLSource("report.xml")
-fields = src.schema()  # list of (key, sample_value) tuples
-for key, sample in fields:
-    print(f"{key}: {sample!r}")
+fields = src.schema()  # list of field name strings
 ```
 
 This is useful for building dynamic pipelines.
@@ -69,7 +67,7 @@ for row in pipe:
 ```python
 from crxml import to_dataframe
 
-df = pipe |> to_dataframe
+df = to_dataframe(pipe)
 ```
 
 This collects all rows into a pandas DataFrame. For large files use

@@ -113,6 +113,117 @@ def import_sales_report(path: str):
     return len(records)
 ```
 
+## Admin action for file upload
+
+Add a Django admin action that accepts a file, parses it, and imports into
+a model:
+
+```python
+# yourapp/admin.py
+from django.contrib import admin, messages
+from django import forms
+from django.shortcuts import render
+from crxml import CrystalXMLSource, collect
+
+from .models import Invoice
+
+
+class UploadXMLForm(forms.Form):
+    file = forms.FileField()
+
+
+@admin.action(description="Import from Crystal Reports XML")
+def import_from_xml(modeladmin, request, queryset):
+    if "file" not in request.FILES:
+        if request.method == "POST":
+            form = UploadXMLForm(request.POST, request.FILES)
+            if form.is_valid():
+                uploaded = request.FILES["file"]
+                rows = collect(CrystalXMLSource(uploaded.read(), row_tag="Details"))
+                for row in rows:
+                    Invoice.objects.create(
+                        number=row.get("{Report.InvoiceNo}", ""),
+                        customer=row.get("{Report.Customer}", ""),
+                        amount=row.get("{Report.Amount", 0),
+                    )
+                modeladmin.message_user(request, f"Imported {len(rows)} invoices")
+                return
+        else:
+            form = UploadXMLForm()
+        return render(request, "admin/upload_xml.html", {"form": form})
+    return
+
+
+@admin.register(Invoice)
+class InvoiceAdmin(admin.ModelAdmin):
+    actions = [import_from_xml]
+```
+
+## Celery task with progress tracking
+
+Track import progress using the Celery task state:
+
+```python
+# yourapp/tasks.py
+from celery import shared_task, current_task
+from crxml import CrystalXMLSource, RenameFields, CastTypes
+from django.db import transaction
+
+from .models import SalesRecord
+
+
+@shared_task(bind=True)
+def import_report(self, path: str):
+    pipe = (
+        CrystalXMLSource(path, row_tag="Details")
+        | RenameFields({
+            "{Report.Product}": "product",
+            "{Report.Qty}": "quantity",
+            "{Report.Price}": "price",
+        })
+        | CastTypes({"quantity": int, "price": float})
+    )
+
+    batch = []
+    total = 0
+    for row in pipe:
+        batch.append(SalesRecord(
+            product=row["product"],
+            quantity=row["quantity"],
+            price=row["price"],
+        ))
+        if len(batch) >= 1000:
+            with transaction.atomic():
+                SalesRecord.objects.bulk_create(batch, ignore_conflicts=True)
+            total += len(batch)
+            current_task.update_state(
+                state="PROGRESS",
+                meta={"current": total}
+            )
+            batch.clear()
+
+    if batch:
+        with transaction.atomic():
+            SalesRecord.objects.bulk_create(batch, ignore_conflicts=True)
+        total += len(batch)
+
+    return {"imported": total}
+```
+
+Query the result from the view:
+
+```python
+from celery.result import AsyncResult
+
+
+def task_status(request, task_id):
+    result = AsyncResult(task_id)
+    return JsonResponse({
+        "state": result.state,
+        "progress": result.info.get("current", 0) if result.info else 0,
+    })
+```
+
 ## Thread safety
 
 Django's ORM is thread-safe. Each request or task gets its own

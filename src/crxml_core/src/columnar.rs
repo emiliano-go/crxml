@@ -3,7 +3,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use std::collections::{HashMap, HashSet};
+// Fx-hashed maps: field-name dispatch is a per-field, per-row lookup;
+// SipHash showed at ~7-9% CPU in VTune. Aliased so the rest of the file
+// keeps the familiar names.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -66,10 +69,10 @@ pub struct BuildPlan {
 impl BuildPlan {
     pub fn new() -> Self {
         BuildPlan {
-            field_map: HashMap::new(),
-            drop_fields: HashSet::new(),
-            field_types: HashMap::new(),
-            dictionary_columns: HashSet::new(),
+            field_map: HashMap::default(),
+            drop_fields: HashSet::default(),
+            field_types: HashMap::default(),
+            dictionary_columns: HashSet::default(),
             filter: None,
             schema_order: Vec::new(),
             auto_dict: false,
@@ -202,26 +205,121 @@ impl FilterPredicate {
     }
 }
 
+/// Flat string column storage in arrow layout: one contiguous byte arena +
+/// offsets + validity. No per-cell String allocation, and arrow export is a
+/// block copy of two buffers instead of a per-value re-copy.
+#[derive(Default)]
+pub(crate) struct StrColumn {
+    data: Vec<u8>,
+    /// len + 1 entries; offsets[i]..offsets[i+1] is value i.
+    offsets: Vec<i32>,
+    validity: Vec<bool>,
+}
+
+impl StrColumn {
+    fn with_capacity(cap: usize) -> Self {
+        let mut offsets = Vec::with_capacity(cap + 1);
+        offsets.push(0);
+        StrColumn {
+            data: Vec::with_capacity(cap * 16),
+            offsets,
+            validity: Vec::with_capacity(cap),
+        }
+    }
+
+    fn push(&mut self, v: Option<&str>) {
+        if let Some(s) = v {
+            self.data.extend_from_slice(s.as_bytes());
+        }
+        self.offsets.push(self.data.len() as i32);
+        self.validity.push(v.is_some());
+    }
+
+    fn pop(&mut self) {
+        if self.validity.pop().is_some() {
+            self.offsets.pop();
+            self.data.truncate(*self.offsets.last().unwrap() as usize);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.validity.len()
+    }
+
+    fn get(&self, i: usize) -> Option<&str> {
+        if !*self.validity.get(i)? {
+            return None;
+        }
+        let start = self.offsets[i] as usize;
+        let end = self.offsets[i + 1] as usize;
+        std::str::from_utf8(&self.data[start..end]).ok()
+    }
+
+    /// Move all values from `other` onto the end of `self`.
+    fn append(&mut self, other: &StrColumn) {
+        let base = self.data.len() as i32;
+        self.data.extend_from_slice(&other.data);
+        self.offsets
+            .extend(other.offsets[1..].iter().map(|o| o + base));
+        self.validity.extend_from_slice(&other.validity);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Option<&str>> {
+        (0..self.len()).map(move |i| self.get(i))
+    }
+
+    fn to_arrow(&self) -> Result<ArrayRef, String> {
+        use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(self.offsets.clone()));
+        let data = Buffer::from_slice_ref(&self.data);
+        let nulls = if self.validity.iter().all(|&v| v) {
+            None
+        } else {
+            Some(NullBuffer::from(self.validity.clone()))
+        };
+        let arr = StringArray::try_new(offsets, data, nulls).map_err(|e| e.to_string())?;
+        Ok(Arc::new(arr))
+    }
+}
+
 /// Per-column builder: stores all values.  The variant determines
 /// the storage type (String, Int64, Float64, Boolean, or Dictionary).
-enum ColumnBuilder {
-    String(Vec<Option<String>>),
+pub(crate) enum ColumnBuilder {
+    String(StrColumn),
     Int64(Vec<Option<i64>>),
     Float64(Vec<Option<f64>>),
     Boolean(Vec<Option<bool>>),
-    Dictionary { codes: Vec<Option<i32>>, dict: Vec<String> },
+    Dictionary {
+        codes: Vec<Option<i32>>,
+        dict: Vec<String>,
+        /// value → code side-index; linear scans over `dict` were O(n) per
+        /// pushed value (quadratic overall).
+        index: HashMap<String, i32>,
+    },
+}
+
+/// Look up `v` in the dictionary index, inserting a new code if absent.
+fn dict_code(dict: &mut Vec<String>, index: &mut HashMap<String, i32>, v: &str) -> i32 {
+    if let Some(&code) = index.get(v) {
+        return code;
+    }
+    let code = dict.len() as i32;
+    dict.push(v.to_owned());
+    index.insert(v.to_owned(), code);
+    code
 }
 
 impl ColumnBuilder {
     fn with_capacity(cap: usize, field_type: &FieldType) -> Self {
         match field_type {
-            FieldType::String => ColumnBuilder::String(Vec::with_capacity(cap)),
+            FieldType::String => ColumnBuilder::String(StrColumn::with_capacity(cap)),
             FieldType::Int64 => ColumnBuilder::Int64(Vec::with_capacity(cap)),
             FieldType::Float64 => ColumnBuilder::Float64(Vec::with_capacity(cap)),
             FieldType::Boolean => ColumnBuilder::Boolean(Vec::with_capacity(cap)),
             FieldType::Dictionary => ColumnBuilder::Dictionary {
                 codes: Vec::with_capacity(cap),
                 dict: Vec::new(),
+                index: HashMap::default(),
             },
         }
     }
@@ -232,7 +330,7 @@ impl ColumnBuilder {
     /// to null as well (widest type is the declared type).
     fn push(&mut self, value: Option<String>) {
         match self {
-            ColumnBuilder::String(v) => v.push(value),
+            ColumnBuilder::String(v) => v.push(value.as_deref()),
             ColumnBuilder::Int64(v) => {
                 v.push(value.and_then(|s| lexical::parse::<i64, _>(s.as_bytes()).ok()));
             }
@@ -242,15 +340,9 @@ impl ColumnBuilder {
             ColumnBuilder::Boolean(v) => {
                 v.push(value.and_then(|s| s.parse::<bool>().ok()));
             }
-            ColumnBuilder::Dictionary { codes, dict } => match value {
+            ColumnBuilder::Dictionary { codes, dict, index } => match value {
                 Some(v) => {
-                    let idx = if let Some(pos) = dict.iter().position(|d| d == &v) {
-                        pos as i32
-                    } else {
-                        let idx = dict.len() as i32;
-                        dict.push(v);
-                        idx
-                    };
+                    let idx = dict_code(dict, index, &v);
                     codes.push(Some(idx));
                 }
                 None => codes.push(None),
@@ -262,7 +354,7 @@ impl ColumnBuilder {
     /// typed columns that parse and discard the string.
     fn push_str(&mut self, value: Option<&str>) {
         match self {
-            ColumnBuilder::String(v) => v.push(value.map(|s| s.to_owned())),
+            ColumnBuilder::String(v) => v.push(value),
             ColumnBuilder::Int64(v) => {
                 v.push(value.and_then(|s| lexical::parse::<i64, _>(s.as_bytes()).ok()));
             }
@@ -272,16 +364,9 @@ impl ColumnBuilder {
             ColumnBuilder::Boolean(v) => {
                 v.push(value.and_then(|s| s.parse::<bool>().ok()));
             }
-            ColumnBuilder::Dictionary { codes, dict } => match value {
+            ColumnBuilder::Dictionary { codes, dict, index } => match value {
                 Some(v) => {
-                    let s = v.to_owned();
-                    let idx = if let Some(pos) = dict.iter().position(|d| d == &s) {
-                        pos as i32
-                    } else {
-                        let idx = dict.len() as i32;
-                        dict.push(s);
-                        idx
-                    };
+                    let idx = dict_code(dict, index, v);
                     codes.push(Some(idx));
                 }
                 None => codes.push(None),
@@ -291,7 +376,7 @@ impl ColumnBuilder {
 
     fn pop(&mut self) {
         match self {
-            ColumnBuilder::String(v) => drop(v.pop()),
+            ColumnBuilder::String(v) => v.pop(),
             ColumnBuilder::Int64(v) => drop(v.pop()),
             ColumnBuilder::Float64(v) => drop(v.pop()),
             ColumnBuilder::Boolean(v) => drop(v.pop()),
@@ -312,52 +397,45 @@ impl ColumnBuilder {
     /// Value at `index` formatted as a string for filter comparison.
     fn get_filter_value(&self, index: usize) -> Option<String> {
         match self {
-            ColumnBuilder::String(v) => v.get(index)?.clone(),
+            ColumnBuilder::String(v) => v.get(index).map(|s| s.to_owned()),
             ColumnBuilder::Int64(v) => v.get(index).map(|o| o.map(|n| n.to_string())).unwrap_or(None),
             ColumnBuilder::Float64(v) => v.get(index).map(|o| o.map(|n| n.to_string())).unwrap_or(None),
             ColumnBuilder::Boolean(v) => v.get(index).map(|o| o.map(|n| n.to_string())).unwrap_or(None),
-            ColumnBuilder::Dictionary { codes, dict } => codes
+            ColumnBuilder::Dictionary { codes, dict, .. } => codes
                 .get(index)
                 .and_then(|code| code.map(|idx| dict[idx as usize].clone())),
         }
     }
 
-    /// Merge all values from `other` into `self`.  Both must be the same variant.
-    /// Returns `Err` if the two builders are different variants (e.g. String vs Dictionary).
-    fn extend_from(&mut self, other: &ColumnBuilder) -> Result<(), String> {
+    /// Merge all values from `other` into `self`, consuming `other` — values
+    /// are moved (Vec::append), never cloned. Both must be the same variant.
+    /// Returns `Err` if the two builders are different variants.
+    fn extend_owned(&mut self, other: ColumnBuilder) -> Result<(), String> {
         match (self, other) {
             (ColumnBuilder::String(a), ColumnBuilder::String(b)) => {
-                a.extend(b.iter().cloned());
+                a.append(&b);
             }
-            (ColumnBuilder::Int64(a), ColumnBuilder::Int64(b)) => {
-                a.extend(b.iter().copied());
+            (ColumnBuilder::Int64(a), ColumnBuilder::Int64(mut b)) => {
+                a.append(&mut b);
             }
-            (ColumnBuilder::Float64(a), ColumnBuilder::Float64(b)) => {
-                a.extend(b.iter().copied());
+            (ColumnBuilder::Float64(a), ColumnBuilder::Float64(mut b)) => {
+                a.append(&mut b);
             }
-            (ColumnBuilder::Boolean(a), ColumnBuilder::Boolean(b)) => {
-                a.extend(b.iter().copied());
+            (ColumnBuilder::Boolean(a), ColumnBuilder::Boolean(mut b)) => {
+                a.append(&mut b);
             }
-            (ColumnBuilder::Dictionary { codes: a_codes, dict: a_dict },
-             ColumnBuilder::Dictionary { codes: b_codes, dict: b_dict }) => {
-                for code in b_codes {
-                    match code {
-                        Some(idx) => {
-                            let val = &b_dict[*idx as usize];
-                            let new_idx = if let Some(pos) = a_dict.iter().position(|d| d == val) {
-                                pos as i32
-                            } else {
-                                let idx = a_dict.len() as i32;
-                                a_dict.push(val.clone());
-                                idx
-                            };
-                            a_codes.push(Some(new_idx));
-                        }
-                        None => a_codes.push(None),
-                    }
-                }
+            (ColumnBuilder::Dictionary { codes: a_codes, dict: a_dict, index: a_index },
+             ColumnBuilder::Dictionary { codes: b_codes, dict: b_dict, .. }) => {
+                // Remap b's dictionary into a's once, then translate codes.
+                let remap: Vec<i32> = b_dict
+                    .iter()
+                    .map(|val| dict_code(a_dict, a_index, val))
+                    .collect();
+                a_codes.extend(
+                    b_codes.iter().map(|c| c.map(|idx| remap[idx as usize])),
+                );
             }
-            _ => return Err("extend_from: column type mismatch across chunks".to_string()),
+            _ => return Err("extend_owned: column type mismatch across chunks".to_string()),
         }
         Ok(())
     }
@@ -374,10 +452,10 @@ impl ColumnBuilder {
             return;
         }
         // Count distinct values
-        let mut seen = std::collections::HashSet::new();
-        for v in &old {
+        let mut seen: HashSet<&str> = HashSet::default();
+        for v in old.iter() {
             if let Some(s) = v {
-                seen.insert(s.as_str());
+                seen.insert(s);
             }
         }
         // Threshold: at most 5% distinct, clamped to [16, 256]
@@ -388,24 +466,18 @@ impl ColumnBuilder {
         }
         // Upgrade: build dictionary + codes
         let mut dict: Vec<String> = Vec::new();
+        let mut index: HashMap<String, i32> = HashMap::default();
         let mut codes: Vec<Option<i32>> = Vec::with_capacity(old.len());
-        for v in &old {
+        for v in old.iter() {
             match v {
                 Some(s) => {
-                    let idx = match dict.iter().position(|d| d == s) {
-                        Some(i) => i as i32,
-                        None => {
-                            let i = dict.len() as i32;
-                            dict.push(s.clone());
-                            i
-                        }
-                    };
+                    let idx = dict_code(&mut dict, &mut index, s);
                     codes.push(Some(idx));
                 }
                 None => codes.push(None),
             }
         }
-        *self = ColumnBuilder::Dictionary { codes, dict };
+        *self = ColumnBuilder::Dictionary { codes, dict, index };
     }
 
     /// Arrow logical type for this column (used to build the schema Field).
@@ -425,9 +497,7 @@ impl ColumnBuilder {
     /// No per-cell Python objects are created.
     fn to_arrow_array(&self) -> Result<ArrayRef, String> {
         Ok(match self {
-            ColumnBuilder::String(v) => {
-                Arc::new(v.iter().map(|o| o.as_deref()).collect::<StringArray>())
-            }
+            ColumnBuilder::String(v) => v.to_arrow()?,
             ColumnBuilder::Int64(v) => {
                 Arc::new(v.iter().copied().collect::<Int64Array>())
             }
@@ -437,7 +507,7 @@ impl ColumnBuilder {
             ColumnBuilder::Boolean(v) => {
                 Arc::new(v.iter().copied().collect::<BooleanArray>())
             }
-            ColumnBuilder::Dictionary { codes, dict } => {
+            ColumnBuilder::Dictionary { codes, dict, .. } => {
                 let keys: Int32Array = codes.iter().copied().collect();
                 let values: ArrayRef = Arc::new(
                     dict.iter().map(|s| Some(s.as_str())).collect::<StringArray>(),
@@ -450,9 +520,9 @@ impl ColumnBuilder {
     }
 
     #[cfg(test)]
-    fn as_str_vec(&self) -> &[Option<String>] {
+    fn as_str_vec(&self) -> Vec<Option<String>> {
         match self {
-            ColumnBuilder::String(v) => v,
+            ColumnBuilder::String(v) => v.iter().map(|o| o.map(str::to_owned)).collect(),
             _ => panic!("as_str_vec called on non-String ColumnBuilder"),
         }
     }
@@ -502,7 +572,7 @@ impl ColumnarEngine {
 
     pub fn new() -> Self {
         ColumnarEngine {
-            columns: HashMap::new(),
+            columns: HashMap::default(),
             column_order: Vec::new(),
             row_count: 0,
             estimated_rows: 0,
@@ -512,7 +582,7 @@ impl ColumnarEngine {
 
     pub fn with_capacity(cap: usize) -> Self {
         ColumnarEngine {
-            columns: HashMap::new(),
+            columns: HashMap::default(),
             column_order: Vec::new(),
             row_count: 0,
             estimated_rows: cap,
@@ -522,7 +592,7 @@ impl ColumnarEngine {
 
     pub fn with_plan(cap: usize, plan: BuildPlan) -> Self {
         ColumnarEngine {
-            columns: HashMap::new(),
+            columns: HashMap::default(),
             column_order: Vec::new(),
             row_count: 0,
             estimated_rows: cap,
@@ -580,25 +650,31 @@ impl ColumnarEngine {
         }
     }
 
-    /// Push a borrowed str — avoids `into_owned()` for typed columns.
-    /// Falls back to `push_field` with owned String for String/Dictionary.
+    /// Push a borrowed str — the builder owns the value only when its
+    /// storage requires it (String copies; Dictionary allocs only for new
+    /// dictionary entries; typed columns parse and never allocate).
     fn push_field_str(&mut self, name: &str, value: Option<&str>) {
-        let resolved = match self.plan.resolve_field(name) {
-            Some(n) => n.to_owned(),
-            None => return,
+        // Fast path: no rename/drop configured — skip the plan lookup and
+        // the owned copy it needs to break the borrow on self.plan.
+        let owned;
+        let resolved: &str = if self.plan.field_map.is_empty() && self.plan.drop_fields.is_empty() {
+            name
+        } else {
+            match self.plan.resolve_field(name) {
+                Some(n) => {
+                    owned = n.to_owned();
+                    &owned
+                }
+                None => return,
+            }
         };
-        self.ensure_column(&resolved);
-        if let Some(b) = self.columns.get_mut(&resolved) {
-            if b.len() > self.row_count {
+        self.ensure_column(resolved);
+        let row_count = self.row_count;
+        if let Some(b) = self.columns.get_mut(resolved) {
+            if b.len() > row_count {
                 b.pop();
             }
-            // Use push_str for non-string types to avoid allocation
-            match self.plan.column_type(&resolved) {
-                FieldType::Int64 | FieldType::Float64 | FieldType::Boolean => {
-                    b.push_str(value);
-                }
-                _ => b.push(value.map(|s| s.to_owned())),
-            }
+            b.push_str(value);
         }
     }
 
@@ -633,15 +709,16 @@ impl ColumnarEngine {
     /// (unmatched parent end tag), falls back to per-row readers for the
     /// remaining data in the chunk.
     pub fn parse_bytes(&mut self, bytes: &[u8], row_tag: &[u8]) -> Result<(), String> {
-        let mut reader = Reader::from_reader(Cursor::new(bytes));
+        // Borrowed-slice reader: events reference `bytes` directly, so no
+        // event is ever copied into a scratch buffer (the Cursor +
+        // read_event_into variant showed up as memmove in profiles).
+        let mut reader = Reader::from_reader(bytes);
         reader.config_mut().check_end_names = false;
-        let mut buf = Vec::with_capacity(4096);
-        let mut inner_buf = Vec::with_capacity(4096);
 
         let row_tag_owned = row_tag.to_vec();
 
         loop {
-            let event = match reader.read_event_into(&mut buf) {
+            let event = match reader.read_event() {
                 Ok(e) => e,
                 Err(e) => {
                     let err_msg = e.to_string();
@@ -670,12 +747,10 @@ impl ColumnarEngine {
                             .map_err(|e| e.to_string())?;
                         let value = attr
                             .unescape_value()
-                            .map_err(|e| e.to_string())?
-                            .into_owned();
-                        self.push_field(key, Some(value));
+                            .map_err(|e| e.to_string())?;
+                        self.push_field_str(key, Some(value.as_ref()));
                     }
                     self.finish_row();
-                    buf.clear();
                 }
 
                 Event::Start(ref e) if e.name().as_ref() == row_tag_owned => {
@@ -685,14 +760,13 @@ impl ColumnarEngine {
                             .map_err(|e| e.to_string())?;
                         let value = attr
                             .unescape_value()
-                            .map_err(|e| e.to_string())?
-                            .into_owned();
-                        self.push_field(key, Some(value));
+                            .map_err(|e| e.to_string())?;
+                        self.push_field_str(key, Some(value.as_ref()));
                     }
 
                     loop {
                         let child_event = reader
-                            .read_event_into(&mut buf)
+                            .read_event()
                             .map_err(|e| e.to_string())?;
 
                         match child_event {
@@ -701,7 +775,7 @@ impl ColumnarEngine {
                                 let child_tag = child_name.as_ref();
 
                                 if child_tag == b"Field" {
-                                    let mut field_name: Option<String> = None;
+                                    let mut field_name = None;
                                     for attr in child.attributes() {
                                         if let Ok(attr) = attr {
                                             let attr_key = attr.key.as_ref();
@@ -709,21 +783,23 @@ impl ColumnarEngine {
                                                 || attr_key == b"Name"
                                             {
                                                 if let Ok(value) = attr.unescape_value() {
-                                                    field_name = Some(value.into_owned());
+                                                    field_name = Some(value);
                                                     break;
                                                 }
                                             }
                                         }
                                     }
-                                    let key =
-                                        field_name.unwrap_or_else(|| "Field".to_string());
+                                    let key: &str =
+                                        field_name.as_deref().unwrap_or("Field");
 
-                                    let mut text = String::new();
+                                    let mut text = std::borrow::Cow::Borrowed("");
                                     if matches!(child_event, Event::Start(_)) {
-                                        let field_end_bytes = child_name.as_ref().to_vec();
+                                        // Branch condition guarantees the tag is
+                                        // "Field"; no need to copy the name bytes.
+                                        let field_end_bytes: &[u8] = b"Field";
                                         loop {
                                             let inner = reader
-                                                .read_event_into(&mut inner_buf)
+                                                .read_event()
                                                 .map_err(|e| e.to_string())?;
                                             match inner {
                                                 Event::Start(ref inner_child)
@@ -735,9 +811,7 @@ impl ColumnarEngine {
                                                     {
                                                         if matches!(inner, Event::Start(_)) {
                                                             let text_event = reader
-                                                                .read_event_into(
-                                                                    &mut inner_buf,
-                                                                )
+                                                                .read_event()
                                                                 .map_err(|e| {
                                                                     e.to_string()
                                                                 })?;
@@ -748,11 +822,9 @@ impl ColumnarEngine {
                                                                     .unescape()
                                                                     .map_err(|e| {
                                                                         e.to_string()
-                                                                    })?
-                                                                    .into_owned();
+                                                                    })?;
                                                             }
                                                         }
-                                                        inner_buf.clear();
                                                     }
                                                 }
                                                 Event::End(ref e)
@@ -765,29 +837,29 @@ impl ColumnarEngine {
                                             }
                                         }
                                     }
-                                    self.push_field(&key, Some(text));
+                                    self.push_field_str(key, Some(text.as_ref()));
                                 } else if child_tag == b"Text" {
-                                    let mut text_name: Option<String> = None;
+                                    let mut text_name = None;
                                     for attr in child.attributes() {
                                         if let Ok(attr) = attr {
                                             if attr.key.as_ref() == b"Name" {
                                                 if let Ok(value) = attr.unescape_value() {
-                                                    text_name = Some(value.into_owned());
+                                                    text_name = Some(value);
                                                     break;
                                                 }
                                             }
                                         }
                                     }
-                                    let key =
-                                        text_name.unwrap_or_else(|| "Text".to_string());
+                                    let key: &str =
+                                        text_name.as_deref().unwrap_or("Text");
 
-                                    let mut text = String::new();
+                                    let mut text = std::borrow::Cow::Borrowed("");
                                     if matches!(child_event, Event::Start(_)) {
-                                        let text_end_bytes =
-                                            child_name.as_ref().to_vec();
+                                        // Branch condition guarantees the tag is "Text".
+                                        let text_end_bytes: &[u8] = b"Text";
                                         loop {
                                             let inner = reader
-                                                .read_event_into(&mut inner_buf)
+                                                .read_event()
                                                 .map_err(|e| e.to_string())?;
                                             match inner {
                                                 Event::Start(ref inner_child)
@@ -798,9 +870,7 @@ impl ColumnarEngine {
                                                     {
                                                         if matches!(inner, Event::Start(_)) {
                                                             let text_event = reader
-                                                                .read_event_into(
-                                                                    &mut inner_buf,
-                                                                )
+                                                                .read_event()
                                                                 .map_err(|e| {
                                                                     e.to_string()
                                                                 })?;
@@ -811,11 +881,9 @@ impl ColumnarEngine {
                                                                     .unescape()
                                                                     .map_err(|e| {
                                                                         e.to_string()
-                                                                    })?
-                                                                    .into_owned();
+                                                                    })?;
                                                             }
                                                         }
-                                                        inner_buf.clear();
                                                     }
                                                 }
                                                 Event::End(ref e)
@@ -829,7 +897,7 @@ impl ColumnarEngine {
                                             }
                                         }
                                     }
-                                    self.push_field(&key, Some(text));
+                                    self.push_field_str(key, Some(text.as_ref()));
                                 } else if child_tag == b"Section" {
                                     // Section carries SectionNumber; extract it.
                                     let sn = child
@@ -837,15 +905,13 @@ impl ColumnarEngine {
                                         .filter_map(|a| a.ok())
                                         .find(|a| a.key.as_ref() == b"SectionNumber")
                                         .and_then(|a| a.unescape_value().ok())
-                                        .unwrap_or_default()
-                                        .into_owned();
-                                    self.push_field("Section", Some(sn));
+                                        .unwrap_or_default();
+                                    self.push_field_str("Section", Some(sn.as_ref()));
                                 } else {
                                     // Unknown tag: push tag name with empty value.
                                     let key = std::str::from_utf8(child_tag)
-                                        .map_err(|e| e.to_string())?
-                                        .to_owned();
-                                    self.push_field(&key, Some(String::new()));
+                                        .map_err(|e| e.to_string())?;
+                                    self.push_field_str(key, Some(""));
                                 }
                             }
 
@@ -860,7 +926,6 @@ impl ColumnarEngine {
                     }
 
                     self.finish_row();
-                    buf.clear();
                 }
 
                 Event::Eof => return Ok(()),
@@ -1041,7 +1106,7 @@ impl ColumnarEngine {
     /// order across both engines.
     ///
     /// Returns `Err` if any column has a type mismatch between chunks.
-    pub fn extend(&mut self, other: ColumnarEngine) -> Result<(), String> {
+    pub fn extend(&mut self, mut other: ColumnarEngine) -> Result<(), String> {
         let self_rows = self.row_count;
         let other_rows = other.row_count;
 
@@ -1064,10 +1129,10 @@ impl ColumnarEngine {
         }
 
         // 2. Append other's values to all columns, null-pad missing ones
-        for name in &self.column_order.clone() {
+        for name in &self.column_order {
             if let Some(self_b) = self.columns.get_mut(name) {
-                if let Some(other_b) = other.columns.get(name) {
-                    self_b.extend_from(other_b)?;
+                if let Some(other_b) = other.columns.remove(name) {
+                    self_b.extend_owned(other_b)?;
                 } else {
                     for _ in 0..other_rows {
                         self_b.push(None);
@@ -1158,6 +1223,89 @@ impl ColumnarEngine {
             }
         }
     }
+}
+
+/// Export per-chunk engines as one pyarrow Table without merging them:
+/// each engine becomes a RecordBatch (arrays built in parallel, off-GIL),
+/// and the table's columns arrive chunked. This skips the serial
+/// merge-then-re-copy of every value that `extend` + `to_pyarrow_table` does.
+///
+/// Not valid with `auto_dict` (per-chunk upgrades could disagree on the
+/// column datatype) — callers must fall back to the merge path there.
+pub fn engines_to_pyarrow_table(
+    mut engines: Vec<ColumnarEngine>,
+    plan: &BuildPlan,
+    py: Python<'_>,
+) -> PyResult<PyObject> {
+    use rayon::prelude::*;
+
+    for e in engines.iter_mut() {
+        e.normalize();
+    }
+    engines.retain(|e| e.row_count > 0);
+
+    // Unified column order + datatypes across chunks. Types are
+    // deterministic from the plan, so first sighting wins.
+    let mut order: Vec<String> = Vec::new();
+    let mut types: HashMap<String, DataType> = HashMap::default();
+    for e in &engines {
+        for name in &e.column_order {
+            if !types.contains_key(name) {
+                if let Some(b) = e.columns.get(name) {
+                    types.insert(name.clone(), b.arrow_datatype());
+                    order.push(name.clone());
+                }
+            }
+        }
+    }
+
+    if order.is_empty() {
+        let pa = PyModule::import(py, "pyarrow")?;
+        return Ok(pa.call_method1("table", (PyDict::new(py),))?.into());
+    }
+
+    let fields: Vec<ArrowField> = order
+        .iter()
+        .map(|n| ArrowField::new(n.as_str(), types[n].clone(), true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+
+    let batches: Result<Vec<RecordBatch>, String> = engines
+        .par_iter()
+        .map(|e| {
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(order.len());
+            for name in &order {
+                match e.columns.get(name) {
+                    Some(b) => arrays.push(b.to_arrow_array()?),
+                    None => arrays.push(arrow::array::new_null_array(&types[name], e.row_count)),
+                }
+            }
+            RecordBatch::try_new(schema.clone(), arrays).map_err(|er| er.to_string())
+        })
+        .collect();
+    let batches = batches.map_err(PyValueError::new_err)?;
+
+    let py_batches: Vec<PyObject> = batches
+        .iter()
+        .map(|b| b.to_pyarrow(py))
+        .collect::<PyResult<_>>()?;
+    let pa = PyModule::import(py, "pyarrow")?;
+    let mut table: PyObject = pa
+        .getattr("Table")?
+        .call_method1("from_batches", (py_batches,))?
+        .into();
+
+    // Per-chunk dictionary arrays carry per-chunk dictionaries; unify them
+    // so downstream comparisons see one dictionary. Only pay this when
+    // dictionary columns are actually configured.
+    if !plan.dictionary_columns.is_empty() {
+        table = table.call_method0(py, "combine_chunks")?;
+    }
+
+    if let Some(ref filter) = plan.filter {
+        return filter.apply_pyarrow(table, py);
+    }
+    Ok(table)
 }
 
 #[cfg(test)]
@@ -1449,7 +1597,7 @@ mod tests {
         let mut engine = ColumnarEngine::with_plan(64, plan);
         engine.parse_bytes(xml, b"Row").unwrap();
         assert_eq!(engine.num_rows(), 3);
-        if let ColumnBuilder::Dictionary { codes, dict } = &engine.columns["Product"] {
+        if let ColumnBuilder::Dictionary { codes, dict, .. } = &engine.columns["Product"] {
             assert_eq!(dict.len(), 2); // Widget, Gadget
             assert_eq!(codes[0], Some(0)); // Widget
             assert_eq!(codes[1], Some(1)); // Gadget
@@ -1522,7 +1670,7 @@ mod tests {
 
             if is_row_empty {
                 if let Event::Empty(ref e) = event {
-                    let mut row = HashMap::new();
+                    let mut row = HashMap::default();
                     for a in e.attributes().flatten() {
                         let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
                         row.insert(k, a.unescape_value().unwrap_or_default().into_owned());
@@ -1542,7 +1690,7 @@ mod tests {
             }
 
             // Row Start event: capture attributes + children
-            let mut row = HashMap::new();
+            let mut row = HashMap::default();
             if let Event::Start(ref e) = event {
                 for a in e.attributes().flatten() {
                     let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
@@ -1605,7 +1753,7 @@ mod tests {
         use std::collections::HashMap;
         (0..engine.row_count)
             .map(|i| {
-                let mut m = HashMap::new();
+                let mut m = HashMap::default();
                 for name in &engine.column_order {
                     if let Some(b) = engine.columns.get(name) {
                         if let Some(s) = b.get_filter_value(i) {

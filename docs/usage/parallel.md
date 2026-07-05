@@ -13,7 +13,7 @@ pipe = (
     | CastTypes({"total": float})
 )
 
-df = pipe.parallel(workers=4, batch_size=5000) |> to_dataframe
+df = to_dataframe(pipe.parallel(workers=4, batch_size=5000))
 ```
 
 ## Parameters
@@ -21,7 +21,7 @@ df = pipe.parallel(workers=4, batch_size=5000) |> to_dataframe
 | Param        | Type  | Default | Description                            |
 |--------------|-------|---------|----------------------------------------|
 | `workers`    | `int` | `None`  | Number of worker processes (CPU count) |
-| `batch_size` | `int` | `10000` | Rows per batch sent to workers         |
+| `batch_size` | `int` | `1000` | Rows per batch sent to workers         |
 
 ## Requirements
 
@@ -43,7 +43,7 @@ Parallel mode adds overhead for batch serialization and IPC. The heuristic:
 | File size  | Recommended |
 |------------|-------------|
 | < 50 MB    | Sequential  |
-| 50–200 MB  | Recommended |
+| 50 MB to 200 MB  | Recommended |
 | > 200 MB   | Parallel    |
 
 ## Validation

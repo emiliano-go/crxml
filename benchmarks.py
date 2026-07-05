@@ -7,12 +7,15 @@ with random data, then measures throughput and memory usage.
 import os
 import random
 import time
-import tracemalloc
-import resource
 import subprocess
 import sys
 from pathlib import Path
 from xml.sax.saxutils import escape
+
+try:
+    import resource  # Unix-only
+except ImportError:
+    resource = None
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / "src"))
@@ -22,8 +25,6 @@ OUT_DIR = HERE / "bench_data"
 OUT_DIR.mkdir(exist_ok=True)
 
 random.seed(42)
-
-# ── Random data generators ───────────────────────────────────────────
 
 NAMES = [
     "Distribuidora del Sur S.A.", "Comercial Norte Ltda.",
@@ -81,8 +82,6 @@ def rand_doc():
     return random.choice(["Vta.Cred.", "Vta.Cont.", "N.Cred.", "N.Deb."])
 
 
-# ── XML building blocks ───────────────────────────────────────────────
-
 NS = "urn:crystal-reports:schemas:report-detail"
 
 HEAD = f"""<?xml version="1.0" encoding="UTF-8" ?>
@@ -112,7 +111,6 @@ def make_field(name, fieldname, formatted, value):
 
 
 def make_group_header():
-    """Generate <GroupHeader> for one invoice."""
     gh_fields = [
         make_field("Field24", "{@FNroBoleta}", chr(rint(65,90)), chr(rint(65,90))),
         make_field("Field9", "{@FSTotal}", fmt(rflt(100,500000)), raw(rflt(100,500000))),
@@ -128,7 +126,6 @@ def make_group_header():
 
 
 def make_detail():
-    """Generate one <Details Level="3"> block."""
     det_fields = [
         make_field("Field22", "{lstDiarioVentas.PrecioImp}", fmt(rflt(50,10000)), raw(rflt(50,10000))),
         make_field("Field23", "{lstDiarioVentas.Cantidad}", fmt(rflt(1,999)), raw(rflt(1,999))),
@@ -137,7 +134,6 @@ def make_detail():
         make_field("Field61", "{lstDiarioVentas.ValorImp}", fmt(rflt(10,10000)), raw(rflt(10,10000))),
         make_field("Field73", "{lstDiarioVentas.PorcDesc}", fmt(rflt(0,30)), raw(rflt(0,30))),
     ]
-    # Sometimes add extra fields and Text
     extra = ""
     if random.random() < 0.3:
         v = rflt(0, 30)
@@ -148,13 +144,10 @@ def make_detail():
 
 
 def make_group_block(min_det=1, max_det=12):
-    """Generate one <Group Level="2"> block (invoice + line items)."""
     n_det = random.randint(min_det, max_det)
     details = "".join(make_detail() for _ in range(n_det))
     return f"<Group Level=\"2\">{make_group_header()}{details}</Group>"
 
-
-# ── File generation ────────────────────────────────────────────────────
 
 def generate_file(target_mb: int, path: Path):
     target = target_mb * 1024 * 1024
@@ -181,8 +174,6 @@ def generate_file(target_mb: int, path: Path):
     print(f"\n  Done: {path.name} — {actual:.1f} MB, {count} invoice groups")
     return actual
 
-
-# ── Benchmarks ─────────────────────────────────────────────────────────
 
 def bench_native_speed(path, label, fn, **kwargs):
     t0 = time.perf_counter()
@@ -237,7 +228,7 @@ def bench_native_mem(path, label, fn, **kwargs):
     tbl = fn(path, **kwargs)
     t1 = time.perf_counter()
     _, peak = tracemalloc.get_traced_memory()
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 if resource else 0.0
     print(f"  {label:30s}  {tbl.num_rows:>7,} rows  {t1 - t0:.3f}s  {peak / 1024 / 1024:>5.1f} MB py  {rss:>5.1f} MB rss")
 
 
@@ -251,7 +242,7 @@ def bench_source_mem(path, label, engine):
     n = sum(1 for _ in CrystalXMLSource(path, row_tag="Details", engine=engine))
     t1 = time.perf_counter()
     _, peak = tracemalloc.get_traced_memory()
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 if resource else 0.0
     print(f"  {label:30s}  {n:>7,} rows  {t1 - t0:.3f}s  {peak / 1024 / 1024:>5.1f} MB py  {rss:>5.1f} MB rss")
 
 
@@ -265,11 +256,9 @@ def bench_source_dataframe_mem(path, label, engine):
     df = CrystalXMLSource(path, row_tag="Details", engine=engine).to_dataframe()
     t1 = time.perf_counter()
     _, peak = tracemalloc.get_traced_memory()
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 if resource else 0.0
     print(f"  {label:30s}  {len(df):>7,} rows  {t1 - t0:.3f}s  {peak / 1024 / 1024:>5.1f} MB py  {rss:>5.1f} MB rss")
 
-
-# ── Main ───────────────────────────────────────────────────────────────
 
 def run():
     import argparse

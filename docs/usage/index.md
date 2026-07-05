@@ -12,5 +12,7 @@ like parallel execution and custom stage authoring.
 -   :material-multicast: __Parallel Execution__, Multi-core batch processing
 -   :material-download: __Sinks__, DataFrame, CSV, list collection
 -   :material-fork: __Branching__, Reuse a base pipeline for multiple outputs
+-   :material-fusion: __Pipeline Fusion__, How stages compile into the Rust engine
+-   :material-alert: __Troubleshooting__, Common errors, FAQs, debugging tips
 
 </div>

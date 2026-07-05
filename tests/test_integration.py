@@ -1,18 +1,15 @@
-"""Integration tests spanning source → stages → sinks with benchmark files."""
 import pytest
 from crxml import CrystalXMLSource, RenameFields, CastTypes, DropFields, FilterRows, to_dataframe, to_csv, collect
 
 
 class TestEndToEnd10MB:
-    """Smoke tests against the 10 MB benchmark file (9010 rows)."""
-
     def test_parse_all_rows(self, bench_10mb):
         rows = collect(CrystalXMLSource(bench_10mb, row_tag="Details"))
         assert len(rows) == 9010
 
     def test_schema_fields(self, bench_10mb):
         fields = CrystalXMLSource(bench_10mb, row_tag="Details").schema()
-        assert len(fields) >= 8  # CR XML has multiple fields per row
+        assert len(fields) >= 8
 
     def test_pipeline_rename(self, bench_10mb):
         first_key = None
@@ -39,8 +36,6 @@ class TestEndToEnd10MB:
         assert first_key not in rows[0]
 
     def test_pipeline_cast(self, bench_10mb):
-        # Find a numeric field – synthetic file may not have one
-        # Just test that CastTypes with no-op mapping works
         rows = collect(
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | CastTypes({})
@@ -82,7 +77,7 @@ class TestEndToEnd10MB:
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | DropFields(["Level", "Section"])
         )
-        assert df.shape[1] == 8  # dropped 2 of 10 fields
+        assert df.shape[1] == 8
 
     def test_csv_roundtrip(self, bench_10mb, tmp_path):
         out = tmp_path / "out.csv"
@@ -125,8 +120,6 @@ class TestEndToEnd100MB:
 
 
 class TestCustomStages:
-    """Test that custom stages compose correctly."""
-
     def test_generator_stage(self, bench_10mb):
         def upper_names(stream):
             for r in stream:

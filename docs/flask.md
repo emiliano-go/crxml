@@ -121,6 +121,54 @@ def to_xlsx():
 | 422    | Unsupported file extension         |
 | 500    | Parse failure (bad XML, CR format) |
 
+## Config-based field mapping
+
+Define a mapping in app config so non-developers can adjust field names:
+
+```python
+app.config["CRXML_FIELD_MAP"] = {
+    "{Report.InvoiceNo}": "invoice",
+    "{Report.Customer}": "customer",
+    "{Report.Amount}": "amount",
+}
+
+
+@app.post("/parse-mapped")
+def parse_mapped():
+    file = request.files["file"]
+    mapping = app.config["CRXML_FIELD_MAP"]
+
+    with NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
+
+    try:
+        src = CrystalXMLSource(tmp_path)
+        pipe = src | RenameFields(mapping)
+        rows = collect(pipe)
+        return jsonify({"rows": len(rows), "data": rows[:100]})
+    finally:
+        os.unlink(tmp_path)
+```
+
+## Error handling middleware
+
+Register an error handler for crxml-specific errors:
+
+```python
+from crxml import UnpicklableStageError
+
+
+@app.errorhandler(UnpicklableStageError)
+def handle_unpicklable(e):
+    return jsonify({"error": "Stage not compatible with parallel mode"}), 400
+
+
+@app.errorhandler(ValueError)
+def handle_value_error(e):
+    return jsonify({"error": f"Parse error: {e}"}), 422
+```
+
 ## Thread safety
 
 Flask's development server is single-threaded by default. In production with

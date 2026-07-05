@@ -1,9 +1,3 @@
-"""Integration tests for columnar → PyArrow export via C Data Interface.
-
-Requires the native module built with `--features columnar`:
-  maturin develop --features columnar
-"""
-
 import pyarrow as pa
 import pytest
 
@@ -43,7 +37,6 @@ GROUND_TRUTH_XML = b"""\
 
 
 def test_columnar_default_schema(tmp_path):
-    """Default (string) export yields utf8 columns."""
     p = tmp_path / "test.xml"
     p.write_bytes(SAMPLE_XML)
     tbl = _core.read_to_columnar(str(p), row_tag="Row")
@@ -53,7 +46,6 @@ def test_columnar_default_schema(tmp_path):
 
 
 def test_typed_int64_column(tmp_path):
-    """field_types={'amount': 'int64'} yields an int64 Arrow column."""
     p = tmp_path / "test.xml"
     p.write_bytes(INT_SAMPLE_XML)
     tbl = _core.read_to_columnar(
@@ -68,7 +60,6 @@ def test_typed_int64_column(tmp_path):
 
 
 def test_typed_float64_column(tmp_path):
-    """field_types={'amount': 'float64'} yields a float64 Arrow column."""
     p = tmp_path / "test.xml"
     p.write_bytes(SAMPLE_XML)
     tbl = _core.read_to_columnar(
@@ -83,7 +74,6 @@ def test_typed_float64_column(tmp_path):
 
 
 def test_dictionary_column(tmp_path):
-    """dictionary_columns=['product'] yields a dictionary Arrow column."""
     p = tmp_path / "test.xml"
     p.write_bytes(SAMPLE_XML)
     tbl = _core.read_to_columnar(
@@ -101,7 +91,6 @@ def test_dictionary_column(tmp_path):
 
 
 def test_typed_parse_failure_yields_null(tmp_path):
-    """Unparseable typed values become null (not a Python error)."""
     xml = b"""<R><Row><Field Name="score"><Value>42</Value></Field></Row>\
 <Row><Field Name="score"><Value>N/A</Value></Field></Row>\
 <Row><Field Name="score"><Value>100</Value></Field></Row></R>"""
@@ -119,7 +108,6 @@ def test_typed_parse_failure_yields_null(tmp_path):
 
 
 def test_full_table_ground_truth_matches_all_export_paths(tmp_path):
-    """One table-level assertion covering dtype, values, and chunk parity."""
     p = tmp_path / "ground_truth.xml"
     p.write_bytes(GROUND_TRUTH_XML)
 
@@ -160,7 +148,6 @@ def test_full_table_ground_truth_matches_all_export_paths(tmp_path):
 
 
 def test_filter_constant_eq_columnar(tmp_path):
-    """Filter equal constant via columnar engine."""
     p = tmp_path / "test.xml"
     p.write_bytes(SAMPLE_XML)
     tbl = _core.read_to_columnar(
@@ -172,7 +159,6 @@ def test_filter_constant_eq_columnar(tmp_path):
 
 
 def test_filter_constant_ne_columnar(tmp_path):
-    """Filter not-equal constant via columnar engine."""
     p = tmp_path / "test.xml"
     p.write_bytes(SAMPLE_XML)
     tbl = _core.read_to_columnar(
@@ -184,7 +170,6 @@ def test_filter_constant_ne_columnar(tmp_path):
 
 
 def test_filter_compare_columnar(tmp_path):
-    """Column-to-column filter via columnar engine."""
     xml = b"""<R><Row><Field Name="min"><Value>10</Value></Field>\
 <Field Name="max"><Value>20</Value></Field></Row>\
 <Row><Field Name="min"><Value>30</Value></Field>\
@@ -195,13 +180,11 @@ def test_filter_compare_columnar(tmp_path):
         str(p), row_tag="Row",
         filter={"field_a": "max", "op": ">", "field_b": "min"},
     )
-    # First row: max(20) > min(10) → keep. Second: max(15) > min(30) → false → drop.
     assert tbl.num_rows == 1
     assert tbl.column("min").to_pylist() == ["10"]
 
 
 def test_filter_with_field_mapping(tmp_path):
-    """Filter on a renamed field: use the original (raw) field name."""
     p = tmp_path / "test.xml"
     p.write_bytes(SAMPLE_XML)
     tbl = _core.read_to_columnar(

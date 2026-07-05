@@ -76,7 +76,27 @@ Created implicitly via `|`. Not typically constructed directly.
 |-------------|-----------------------------------------|----------------------------|
 | `__or__`    | `(self, stage) -> Pipeline`             | Append a stage             |
 | `__iter__`  | `(self) -> Iterator[dict]`              | Iterate rows               |
-| `parallel`  | `(self, workers=None, batch_size=10000)`| Return parallel variant    |
+| `parallel`  | `(self, workers=None, batch_size=1000)`| Return parallel variant    |
+
+## CrystalXMLSource.schema
+
+```python
+source.schema() -> list[str]
+```
+
+Returns the field name keys from the first row. The source caches the first
+batch internally, so calling `schema()` before building a pipeline does not
+lose data.
+
+**Raises:** `StopIteration` if the source is empty.
+
+```python
+from crxml import CrystalXMLSource
+
+src = CrystalXMLSource("report.xml")
+fields = src.schema()
+print(fields)  # ['{Report.InvoiceNo}', '{Report.Amount}', ...]
+```
 
 ## to_dataframe
 

@@ -37,7 +37,7 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 |-------------|--------------------------------|
 | `pyo3`      | Python bindings                |
 | `quick-xml` | Streaming XML reader           |
-| `memchr`    | Fast byte searching (used internally by quick-xml) |
+| `memchr`    | Fast byte searching (direct dependency, also used by quick-xml) |
 
 ## Building
 
@@ -62,7 +62,7 @@ manifest-path = "src/crxml_core/Cargo.toml"
 - Rust 2021 edition
 - `cargo fmt` for formatting
 - `cargo clippy`, no warnings allowed
-- Unsafe code is prohibited (`#![forbid(unsafe_code)]`)
+- Unsafe code is denied by default (`#![deny(unsafe_code)]`)
 
 ## Testing
 
@@ -76,7 +76,9 @@ python -c "from crxml._crxml_core import CrxmlReader; r = CrxmlReader('test.xml'
 
 ## Security
 
-- **No unsafe code**, the entire crate is safe Rust
+- **Unsafe denied by default** (`#![deny(unsafe_code)]`). A single `unsafe`
+  block guarded by `#[allow(unsafe_code)]` calls `_PyDict_NewPresized` for
+  pre-sized dict allocation.
 - **Input validation**, XML is assumed trusted (users control their source
   files). Buffer sizes are managed by quick-xml.
 - **Buffer limits**, individual field values are bounded by the XML entity
