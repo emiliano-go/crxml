@@ -78,9 +78,11 @@ python -c "from crxml._crxml_core import CrxmlReader; r = CrxmlReader('test.xml'
 
 ## Security
 
-- **Unsafe denied by default** (`#![deny(unsafe_code)]`). A single `unsafe`
-  block guarded by `#[allow(unsafe_code)]` calls `_PyDict_NewPresized` for
-  pre-sized dict allocation.
+- **Unsafe denied by default** (`#![deny(unsafe_code)]`). Two `unsafe`
+  blocks guarded by `#[allow(unsafe_code)]` handle `Mmap::map` (mmap I/O)
+  and `from_utf8_unchecked` (SIMD-validated UTF-8). The
+  `_PyDict_NewPresized` private-CAPI call was removed after benchmarking
+  showed only a 3.5% overall gain.
 - **Input validation**, XML is assumed trusted (users control their source
   files). Buffer sizes are managed by quick-xml.
 - **Buffer limits**, individual field values are bounded by the XML entity
