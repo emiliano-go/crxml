@@ -37,7 +37,9 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 |-------------|--------------------------------|
 | `pyo3`      | Python bindings                |
 | `quick-xml` | Streaming XML reader           |
+| `simdutf8`  | SIMD-accelerated UTF-8 validation for parse chunks |
 | `memchr`    | Fast byte searching (direct dependency, also used by quick-xml) |
+| `mimalloc`  | Fast allocator (replaces system malloc, ~27% CPU savings) |
 
 ## Building
 

@@ -41,11 +41,25 @@ strips namespace prefixes via local-name matching on the XML reader.
 
 - `__or__` creates a new `Pipeline` with the stage appended.
 - `__iter__` decides execution strategy:
-  - **Layer B (fusion):** if all stages are Fusable, runs a single tight loop
+  - **Layer A (columnar fusion):** Rust `BuildPlan` pushdown + batchpipe chain
+  - **Layer B (dict fusion):** fusable stages fused into a single tight loop
   - **Layer C (prefetch):** producer thread + consumer thread with bounded queue
   - **Layer D (parallel):** `ProcessPoolExecutor` with batch dispatch
 
-### Fusion (Layer B)
+### Columnar fusion (Layer A)
+
+When the source supports the columnar engine and stages export `_plan_kwargs`,
+the pipeline compiles into a Rust `BuildPlan` that runs during XML parsing,
+producing a `pyarrow.Table` directly. Remaining stages then execute as a
+vectorized batch chain over Arrow `RecordBatch` objects via the `batchpipe`
+engine, keeping data in columnar format and avoiding per-row Python dict
+construction:
+
+```
+XML ──► Rust BuildPlan ──► Arrow Table ──► batchpipe ops ──► sinks
+```
+
+### Dict fusion (Layer B)
 
 A contiguous run of fusable stages (implementing `apply` + `__call__`) is
 fused into a single inner loop. This avoids Python generator overhead:

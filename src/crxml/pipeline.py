@@ -42,6 +42,30 @@ class Pipeline:
         from .fusion import fused_iter
         return fused_iter(self._source, self._stages)
 
+    def _to_arrow(self):
+        """Run the whole pipeline as a batch chain to one pyarrow Table.
+
+        Returns None when this pipeline cannot short-circuit to a table
+        (worker mode, non-columnar source, or trailing stateful stages) —
+        callers then fall back to the dict stream.
+        """
+        if self._workers:
+            return None
+        src = self._source
+        if not (hasattr(src, "_read_arrow") and hasattr(src, "_build_plan_kwargs")):
+            return None
+        from .batchpipe import build_chain, collect_table
+        from .fusion import plan_split
+
+        plan_overrides, remaining = plan_split(self._stages)
+        table = src._read_arrow(plan_overrides=plan_overrides or None)
+        op, trailing = build_chain(
+            table, remaining, batch_size=getattr(src, "_batch_size", 1024)
+        )
+        if trailing:
+            return None
+        return collect_table(op)
+
     def parallel(self, workers: int | None = None, batch_size: int = 1000) -> "Pipeline":
         return Pipeline(
             self._source,

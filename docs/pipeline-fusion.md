@@ -3,14 +3,15 @@
 Pipeline fusion compresses multiple transformation stages into a single
 execution pass, reducing Python overhead and memory allocations.
 
-## Two levels of fusion
+## Three levels of fusion
 
-crxml has two fusion mechanisms:
+crxml has three fusion mechanisms:
 
 | Level | Mechanism | When it applies |
 |-------|-----------|-----------------|
 | Dict-level fusion | `apply` + `__call__` protocol | Any pipeline with fusable stages |
 | Columnar fusion | `_plan_kwargs` into Rust `BuildPlan` | Source supports columnar engine, stages export a plan |
+| Vectorized batch chain | Volcano-style pull on Arrow `RecordBatch` | After columnar fusion, remaining stages implement `_plan_kwargs` |
 
 A stage is **fusable** if it has both `apply(self, record) -> dict | None` and
 `__call__(self, stream)`. When a contiguous run of fusable stages exists at
@@ -28,14 +29,14 @@ When you iterate a pipeline, `fusion.py` follows this logic:
 
 1. **Try columnar fusion**: if the source has a `_read_arrow` method and
    stages export `_plan_kwargs`, the pipeline runs entirely in Rust.
-2. **Dict-level fusion**: if columnar fusion is not possible, the first
+2. **Vectorized batch chain**: if columnar fusion found pushdown stages but
+   remaining stages exist, they run on Arrow `RecordBatch` objects via the
+   batchpipe engine, keeping data in columnar format and avoiding per-row
+   Python dict construction.
+3. **Dict-level fusion**: if columnar fusion is not possible, the first
    contiguous run of fusable stages is fused into a single loop.
-3. **Sequential**: remaining stages run as Python generators on the dict
+4. **Sequential**: remaining stages run as Python generators on the dict
    stream.
-
-Columnar fusion produces an Arrow table internally. If non-columnar stages
-follow in the pipeline, the table is converted to dicts row by row and those
-stages operate on dicts as usual.
 
 ## When fusion applies
 
