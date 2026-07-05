@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Text Processing :: Markup :: XML",
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["seoslug"]
 
 [project.optional-dependencies]
 pyarrow = ["pyarrow>=15"]
