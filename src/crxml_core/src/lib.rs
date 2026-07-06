@@ -21,6 +21,23 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "profile")]
+use std::sync::Mutex;
+#[cfg(feature = "profile")]
+static PAR_PROFILE: Mutex<ParProfileSnapshot> = Mutex::new(ParProfileSnapshot {
+    split_scan_ns: 0,
+    parse_ns: 0,
+    assembly_export_ns: 0,
+});
+
+#[cfg(feature = "profile")]
+#[derive(Default, Clone)]
+struct ParProfileSnapshot {
+    pub split_scan_ns: u64,
+    pub parse_ns: u64,
+    pub assembly_export_ns: u64,
+}
+
 #[cfg(feature = "columnar")]
 pub mod columnar;
 #[cfg(feature = "columnar")]
@@ -76,11 +93,17 @@ fn parse_columnar_par_from_slice(
     plan: columnar::BuildPlan,
     num_chunks: usize,
 ) -> PyResult<PyObject> {
+    #[cfg(feature = "profile")]
+    let split_start = Instant::now();
     let chunks = splitter::compute_splits(bytes, row_tag, num_chunks);
+    #[cfg(feature = "profile")]
+    let split_scan_ns = split_start.elapsed().as_nanos() as u64;
 
     use rayon::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
+    #[cfg(feature = "profile")]
+    let parse_start = Instant::now();
     let results: Vec<Result<columnar::ColumnarEngine, String>> = chunks
         .par_iter()
         .map(|range| {
@@ -101,6 +124,8 @@ fn parse_columnar_par_from_slice(
             .unwrap_or_else(|_| Err("Worker panicked during parallel parse".to_string()))
         })
         .collect();
+    #[cfg(feature = "profile")]
+    let parse_ns = parse_start.elapsed().as_nanos() as u64;
 
     // Fast path: export chunks as record batches in parallel, no merge.
     if !plan.auto_dict {
@@ -108,20 +133,43 @@ fn parse_columnar_par_from_slice(
             .into_iter()
             .collect::<Result<Vec<_>, String>>()
             .map_err(PyException::new_err)?;
-        return Python::with_gil(|py| columnar::engines_to_pyarrow_table(engines, &plan, py));
+        #[cfg(feature = "profile")]
+        let gil_start = Instant::now();
+        let result = Python::with_gil(|py| columnar::engines_to_pyarrow_table(engines, &plan, py));
+        #[cfg(feature = "profile")]
+        {
+            if let Ok(mut p) = PAR_PROFILE.lock() {
+                p.split_scan_ns = split_scan_ns;
+                p.parse_ns = parse_ns;
+                p.assembly_export_ns = gil_start.elapsed().as_nanos() as u64;
+            }
+        }
+        return result;
     }
 
     // auto_dict path: incremental merge — fold each chunk engine into the
     // accumulator one at a time, dropping the chunk engine after extend.
     // This bounds peak RSS to merged-so-far (~1x) plus one chunk (~1x/N)
     // instead of all chunks at once (~5x).
-    let mut merged = columnar::ColumnarEngine::new();
+    #[cfg(feature = "profile")]
+    let gil_start = Instant::now();
+    let mut merged =
+        columnar::ColumnarEngine::with_plan(results.len().max(64) * 512, plan);
     for result in results {
         let engine = result.map_err(PyException::new_err)?;
         merged.extend(engine).map_err(|e| PyException::new_err(e))?;
     }
     merged.auto_dict_upgrade();
-    Python::with_gil(|py| merged.to_pyarrow_table(py))
+    let result = Python::with_gil(|py| merged.to_pyarrow_table(py));
+    #[cfg(feature = "profile")]
+    {
+        if let Ok(mut p) = PAR_PROFILE.lock() {
+            p.split_scan_ns = split_scan_ns;
+            p.parse_ns = parse_ns;
+            p.assembly_export_ns = gil_start.elapsed().as_nanos() as u64;
+        }
+    }
+    result
 }
 
 /// Parse a file in bounded batches to stay within a memory budget.
@@ -129,23 +177,40 @@ fn parse_columnar_par_from_slice(
 /// builder storage.  Each batch is parsed independently and exported
 /// to a pyarrow table, then all batch tables are concatenated.
 #[cfg(feature = "columnar")]
+fn concat_tables(a: PyObject, b: PyObject) -> PyResult<PyObject> {
+    Python::with_gil(|py| {
+        let pa = PyModule::import(py, "pyarrow")?;
+        let tables_list = PyList::new(py, vec![a, b])?;
+
+        // Fast path: schemas match — no promotion needed.
+        let a_schema = tables_list.get_item(0)?.getattr("schema")?;
+        let b_schema = tables_list.get_item(1)?.getattr("schema")?;
+        let schemas_match = a_schema.call_method1("__eq__", (b_schema,))?.is_truthy()?;
+
+        if schemas_match {
+            return Ok(pa.call_method1("concat_tables", (tables_list,))?.into());
+        }
+
+        // Schemas differ (column order or auto_dict promotion): use promote.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("promote_options", "default")?;
+        Ok(pa.call_method("concat_tables", (tables_list,), Some(&kwargs))?.into())
+    })
+}
+
 fn parse_columnar_bounded(
     path: &str,
     row_tag: &[u8],
     plan: columnar::BuildPlan,
     budget_bytes: usize,
+    prefault: bool,
 ) -> PyResult<PyObject> {
-    use std::fs::File;
-    use std::io::Read;
-
     let p = std::path::Path::new(path);
-    let mut file = File::open(p)
-        .map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
+    let mmap_handle = MmapHandle::new(p, prefault)?;
+    let bytes = mmap_handle.as_slice();
+    let file_len = bytes.len();
 
-    if bytes.is_empty() {
+    if file_len == 0 {
         return Python::with_gil(|py| {
             let pa = PyModule::import(py, "pyarrow")?;
             Ok(pa.call_method1("table", (PyDict::new(py),))?.into())
@@ -153,46 +218,68 @@ fn parse_columnar_bounded(
     }
 
     // Estimate bytes per row from the Row tag density in first 64KB
-    let sample_end = bytes.len().min(65536);
+    let sample_end = file_len.min(65536);
     let row_tag_count = memchr::memmem::find_iter(&bytes[..sample_end], row_tag).count();
     let bytes_per_row = if row_tag_count > 0 {
         sample_end / row_tag_count
     } else {
-        // Fallback: estimate from first Row tag position
         memchr::memmem::find(&bytes[..sample_end], row_tag)
             .map(|pos| pos + row_tag.len())
             .unwrap_or(512)
     }
     .max(1);
 
-    let total_rows_est = bytes.len() / bytes_per_row;
+    let total_rows_est = file_len / bytes_per_row;
     let rows_per_batch = (budget_bytes / bytes_per_row).max(1).min(total_rows_est.max(1));
 
     let num_batches = (total_rows_est / rows_per_batch).max(1);
-    let chunks = splitter::compute_splits(&bytes, row_tag, num_batches.min(64));
+    let chunks = splitter::compute_splits(bytes, row_tag, num_batches.min(64));
 
-    let mut batch_tables: Vec<PyObject> = Vec::new();
+    // Explicitly end the mmap borrow before creating Python objects
+    drop(mmap_handle);
+
+    // ---- processing phase (mmap is gone, no Python refs to mmaped memory) ----
+    let mut result_table: Option<PyObject> = None;
     let mut batch_engine = columnar::ColumnarEngine::with_plan(bytes_per_row.max(64), plan.clone());
     let mut rows_in_batch = 0usize;
 
+    // Re-read the file chunk by chunk, seeking to each range
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(p)
+        .map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
+
     for chunk in &chunks {
+        let chunk_len = chunk.len();
+        let mut chunk_buf = vec![0u8; chunk_len];
+        file.seek(SeekFrom::Start(chunk.start as u64))
+            .map_err(|e| PyIOError::new_err(format!("Seek error: {}", e)))?;
+        file.read_exact(&mut chunk_buf)
+            .map_err(|e| PyIOError::new_err(format!("Read error: {}", e)))?;
+
         let mut chunk_engine = columnar::ColumnarEngine::with_plan(
-            (chunk.len() / 512).max(64),
+            (chunk_len / 512).max(64),
             plan.clone(),
         );
         chunk_engine
-            .parse_bytes(&bytes[chunk.clone()], row_tag)
+            .parse_bytes(&chunk_buf, row_tag)
             .map_err(|e| {
                 PyException::new_err(format!("Parse error in batch: {}", e))
             })?;
+        // chunk_buf dropped here
+
         let chunk_rows = chunk_engine.num_rows();
         batch_engine.extend(chunk_engine).map_err(|e| PyException::new_err(e))?;
         rows_in_batch += chunk_rows;
 
         if rows_in_batch >= rows_per_batch {
             batch_engine.auto_dict_upgrade();
+            batch_engine.sort_columns();
             let table = Python::with_gil(|py| batch_engine.to_pyarrow_table(py))?;
-            batch_tables.push(table);
+            result_table = match result_table {
+                None => Some(table),
+                Some(prev) => Some(concat_tables(prev, table)?),
+            };
             batch_engine.reset();
             rows_in_batch = 0;
         }
@@ -200,27 +287,21 @@ fn parse_columnar_bounded(
 
     if batch_engine.num_rows() > 0 {
         batch_engine.auto_dict_upgrade();
+        batch_engine.sort_columns();
         let table = Python::with_gil(|py| batch_engine.to_pyarrow_table(py))?;
-        batch_tables.push(table);
+        result_table = match result_table {
+            None => Some(table),
+            Some(prev) => Some(concat_tables(prev, table)?),
+        };
     }
 
-    if batch_tables.is_empty() {
-        return Python::with_gil(|py| {
+    match result_table {
+        None => Python::with_gil(|py| {
             let pa = PyModule::import(py, "pyarrow")?;
             Ok(pa.call_method1("table", (PyDict::new(py),))?.into())
-        });
+        }),
+        Some(t) => Ok(t),
     }
-
-    if batch_tables.len() == 1 {
-        return Ok(batch_tables.into_iter().next().unwrap());
-    }
-
-    Python::with_gil(|py| {
-        let pa = PyModule::import(py, "pyarrow")?;
-        let tables_list = PyList::new(py, &batch_tables)?;
-        let concat = pa.call_method1("concat_tables", (tables_list,))?;
-        Ok(concat.into())
-    })
 }
 
 /// Owned mmap with explicit lifecycle: parse phase ends before unmap.
@@ -233,10 +314,10 @@ fn parse_columnar_bounded(
 /// the mapped bytes survives return from `to_pyarrow_table`. The Arrow C
 /// Data Interface export creates fresh `Arc<[u8]>` buffers via
 /// `Buffer::from_slice_ref`. Therefore the `Mmap` can be safely dropped
-/// (via `schedule_unmap`) after export completes.
+/// (via `unmap_now`) after export completes.
 ///
 /// If a future change introduces zero-copy Arrow arrays over the mmap
-/// slice, this invariant is broken — the unmap must be synchronous.
+/// slice, this invariant is broken — the unmap must remain synchronous.
 #[cfg(feature = "mmap")]
 struct MmapHandle {
     mmap: memmap2::Mmap,
@@ -244,7 +325,7 @@ struct MmapHandle {
 
 #[cfg(feature = "mmap")]
 impl MmapHandle {
-    fn new(path: &Path) -> PyResult<Self> {
+    fn new(path: &Path, prefault: bool) -> PyResult<Self> {
         let file = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path.display(), e)))?;
         #[allow(unsafe_code)]
@@ -252,23 +333,34 @@ impl MmapHandle {
             .map_err(|e| PyIOError::new_err(format!("Cannot mmap {}: {}", path.display(), e)))?;
         #[cfg(unix)]
         {
-            let _ = mmap.advise(memmap2::Advice::Sequential);
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
+            if prefault {
+                // WillNeed: pre-fault the entire file into RSS.  Use when
+                // the goal is parse speed (DataFrame, file fits in RAM) and
+                // the RSS cost is acceptable.
+                let _ = mmap.advise(memmap2::Advice::WillNeed);
+            } else {
+                // Sequential: kernel drops behind pages we have already read.
+                // Use when RSS matters (bounded path, large files).
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+            }
         }
         Ok(MmapHandle { mmap })
     }
 
     /// Borrow the mapped bytes for parsing. The borrow must end before
-    /// `schedule_unmap` is called — the Rust borrow checker enforces this.
+    /// `unmap_now` is called — the Rust borrow checker enforces this.
     fn as_slice(&self) -> &[u8] {
         &self.mmap[..]
     }
 
-    /// Consume the handle and drop the mapping on a background thread.
+    /// Consume the handle and drop the mapping synchronously.
     /// Must be called *after* the parse result is fully materialized and
     /// the borrow from `as_slice()` has ended.
-    fn schedule_unmap(self) {
-        std::thread::spawn(move || drop(self.mmap));
+    /// Synchronous unmap ensures file-backed pages are released from the
+    /// process address space before any downstream work (Arrow export,
+    /// pandas conversion) begins, keeping peak RSS lower.
+    fn unmap_now(self) {
+        drop(self.mmap);
     }
 }
 
@@ -277,14 +369,15 @@ fn mmap_and_parse(
     path: &str,
     row_tag: &[u8],
     plan: columnar::BuildPlan,
+    prefault: bool,
 ) -> PyResult<PyObject> {
     let p = Path::new(path);
-    let handle = MmapHandle::new(p)?;
+    let handle = MmapHandle::new(p, prefault)?;
     let result = parse_columnar_from_slice(handle.as_slice(), row_tag, plan);
     // parse_columnar_from_slice copies all data into owned Vec<u8> /
     // Arrow buffers before returning. The borrow of handle.as_slice()
     // has ended — it is now safe to reclaim the mapping.
-    handle.schedule_unmap();
+    handle.unmap_now();
     result
 }
 
@@ -294,11 +387,12 @@ fn mmap_and_parse_multi(
     row_tag: &[u8],
     plan: columnar::BuildPlan,
     num_chunks: usize,
+    prefault: bool,
 ) -> PyResult<PyObject> {
     let p = Path::new(path);
-    let handle = MmapHandle::new(p)?;
+    let handle = MmapHandle::new(p, prefault)?;
     let result = parse_columnar_multi_from_slice(handle.as_slice(), row_tag, plan, num_chunks);
-    handle.schedule_unmap();
+    handle.unmap_now();
     result
 }
 
@@ -308,11 +402,12 @@ fn mmap_and_parse_par(
     row_tag: &[u8],
     plan: columnar::BuildPlan,
     num_chunks: usize,
+    prefault: bool,
 ) -> PyResult<PyObject> {
     let p = Path::new(path);
-    let handle = MmapHandle::new(p)?;
+    let handle = MmapHandle::new(p, prefault)?;
     let result = parse_columnar_par_from_slice(handle.as_slice(), row_tag, plan, num_chunks);
-    handle.schedule_unmap();
+    handle.unmap_now();
     result
 }
 
@@ -405,7 +500,7 @@ fn build_plan_from_kwargs(
 
 #[cfg(feature = "columnar")]
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false))]
+#[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false))]
 pub fn read_to_columnar(
     path: String,
     row_tag: Option<String>,
@@ -417,6 +512,7 @@ pub fn read_to_columnar(
     use_mmap: bool,
     schema: Option<Vec<String>>,
     auto_dict: bool,
+    prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
@@ -431,7 +527,7 @@ pub fn read_to_columnar(
     if use_mmap {
         #[cfg(feature = "mmap")]
         {
-            return mmap_and_parse(&path, &row_tag, plan);
+            return mmap_and_parse(&path, &row_tag, plan, prefault);
         }
         #[cfg(not(feature = "mmap"))]
         {
@@ -452,7 +548,7 @@ pub fn read_to_columnar(
 
 #[cfg(feature = "columnar")]
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, num_chunks=2, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false))]
+#[pyo3(signature = (path, row_tag=None, num_chunks=2, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false))]
 pub fn read_to_columnar_multi(
     path: String,
     row_tag: Option<String>,
@@ -465,6 +561,7 @@ pub fn read_to_columnar_multi(
     use_mmap: bool,
     schema: Option<Vec<String>>,
     auto_dict: bool,
+    prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
@@ -479,7 +576,7 @@ pub fn read_to_columnar_multi(
     if use_mmap {
         #[cfg(feature = "mmap")]
         {
-            return mmap_and_parse_multi(&path, &row_tag, plan, num_chunks);
+            return mmap_and_parse_multi(&path, &row_tag, plan, num_chunks, prefault);
         }
         #[cfg(not(feature = "mmap"))]
         {
@@ -500,7 +597,7 @@ pub fn read_to_columnar_multi(
 
 #[cfg(feature = "columnar")]
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, num_chunks=4, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false))]
+#[pyo3(signature = (path, row_tag=None, num_chunks=4, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, use_mmap=false, schema=None, auto_dict=false, prefault=false))]
 pub fn read_to_columnar_par(
     path: String,
     row_tag: Option<String>,
@@ -513,6 +610,7 @@ pub fn read_to_columnar_par(
     use_mmap: bool,
     schema: Option<Vec<String>>,
     auto_dict: bool,
+    prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
@@ -527,7 +625,7 @@ pub fn read_to_columnar_par(
     if use_mmap {
         #[cfg(feature = "mmap")]
         {
-            return mmap_and_parse_par(&path, &row_tag, plan, num_chunks);
+            return mmap_and_parse_par(&path, &row_tag, plan, num_chunks, prefault);
         }
         #[cfg(not(feature = "mmap"))]
         {
@@ -548,6 +646,7 @@ pub fn read_to_columnar_par(
 
 #[cfg(feature = "columnar")]
 #[pyfunction]
+#[pyo3(signature = (path, row_tag, memory, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false))]
 pub fn read_to_columnar_bounded(
     path: String,
     row_tag: Option<String>,
@@ -559,13 +658,14 @@ pub fn read_to_columnar_bounded(
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
     auto_dict: bool,
+    prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
         field_mapping, drop_fields, filter, field_types, dictionary_columns,
         schema, auto_dict,
     )?;
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
-    parse_columnar_bounded(&path, &row_tag, plan, memory)
+    parse_columnar_bounded(&path, &row_tag, plan, memory, prefault)
 }
 
 #[cfg(feature = "profile")]
@@ -1040,6 +1140,17 @@ fn _test_parse_quickxml(bytes: Vec<u8>, row_tag: Option<String>) -> PyObject {
     _run_parser(&bytes, &row_tag)
 }
 
+#[cfg(feature = "profile")]
+#[pyfunction]
+fn get_par_profile(py: Python<'_>) -> PyResult<PyObject> {
+    let snap = PAR_PROFILE.lock().map_err(|e| PyException::new_err(e.to_string()))?.clone();
+    let d = PyDict::new(py);
+    d.set_item("split_scan_ns", snap.split_scan_ns)?;
+    d.set_item("parse_ns", snap.parse_ns)?;
+    d.set_item("assembly_export_ns", snap.assembly_export_ns)?;
+    Ok(d.into())
+}
+
 #[pymodule]
 fn _crxml_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CrxmlReader>()?;
@@ -1049,6 +1160,10 @@ fn _crxml_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(read_to_columnar_multi, m)?)?;
         m.add_function(wrap_pyfunction!(read_to_columnar_par, m)?)?;
         m.add_function(wrap_pyfunction!(read_to_columnar_bounded, m)?)?;
+        #[cfg(feature = "profile")]
+        {
+            m.add_function(wrap_pyfunction!(get_par_profile, m)?)?;
+        }
         #[cfg(feature = "testing")]
         {
             m.add_function(wrap_pyfunction!(_test_parse_both, m)?)?;

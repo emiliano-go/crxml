@@ -192,6 +192,18 @@ class CrystalXMLSource:
         kwargs["auto_dict"] = self._auto_dict
         return kwargs
 
+    def _build_bounded_kwargs(self) -> dict:
+        return {
+            "field_mapping": self._field_mapping or None,
+            "drop_fields": self._drop_fields or None,
+            "filter": self._filter or None,
+            "field_types": self._field_types or None,
+            "dictionary_columns": self._dictionary_columns or None,
+            "schema": self._schema or None,
+            "auto_dict": self._auto_dict,
+            "prefault": False,
+        }
+
     def _read_arrow(self, plan_overrides=None):
         if self._cached_arrow is not None and plan_overrides is None:
             return self._cached_arrow
@@ -205,20 +217,20 @@ class CrystalXMLSource:
             and _HAS_BOUNDED
             and engine in ("columnar", "parallel")
         ):
-            kwargs_flat = {
-                k: v for k, v in plan.items()
-                if k not in ("use_mmap", "num_chunks")
-            }
+            bounded_kwargs = self._build_bounded_kwargs()
+            if plan_overrides:
+                bounded_kwargs.update(plan_overrides)
             table = _core.read_to_columnar_bounded(
-                str(self._filepath), self._row_tag, self._memory, **kwargs_flat
+                str(self._filepath), self._row_tag, self._memory,
+                **bounded_kwargs,
             )
         elif engine == "columnar":
             table = _core.read_to_columnar(
-                str(self._filepath), self._row_tag, **plan
+                str(self._filepath), self._row_tag, prefault=True, **plan
             )
         elif engine == "parallel":
             table = _core.read_to_columnar_par(
-                str(self._filepath), self._row_tag, self._num_chunks, **plan
+                str(self._filepath), self._row_tag, self._num_chunks, prefault=True, **plan
             )
         else:
             import pyarrow as pa

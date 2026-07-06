@@ -595,6 +595,18 @@ pub struct ColumnarEngine {
     row_count: usize,
     estimated_rows: usize,
     plan: BuildPlan,
+    #[cfg(feature = "profile")]
+    profile: ColumnarProfileCounters,
+}
+
+#[cfg(feature = "profile")]
+#[derive(Default, Clone)]
+pub struct ColumnarProfileCounters {
+    pub parse_ns: u64,
+    pub export_ns: u64,
+    pub event_loop_ns: u64,
+    pub unescape_ns: u64,
+    pub copy_ns: u64,
 }
 
 impl ColumnarEngine {
@@ -636,6 +648,8 @@ impl ColumnarEngine {
             row_count: 0,
             estimated_rows: 0,
             plan: BuildPlan::new(),
+            #[cfg(feature = "profile")]
+            profile: ColumnarProfileCounters::default(),
         }
     }
 
@@ -646,6 +660,8 @@ impl ColumnarEngine {
             row_count: 0,
             estimated_rows: cap,
             plan: BuildPlan::new(),
+            #[cfg(feature = "profile")]
+            profile: ColumnarProfileCounters::default(),
         }
     }
 
@@ -656,6 +672,8 @@ impl ColumnarEngine {
             row_count: 0,
             estimated_rows: cap,
             plan,
+            #[cfg(feature = "profile")]
+            profile: ColumnarProfileCounters::default(),
         }
     }
 
@@ -784,7 +802,14 @@ impl ColumnarEngine {
     pub fn parse_bytes(&mut self, bytes: &[u8], row_tag: &[u8]) -> Result<(), String> {
         simdutf8::basic::from_utf8(bytes)
             .map_err(|_| "invalid UTF-8 in input".to_string())?;
-        self.parse_bytes_quickxml(bytes, row_tag)
+        #[cfg(feature = "profile")]
+        let _start = std::time::Instant::now();
+        self.parse_bytes_quickxml(bytes, row_tag)?;
+        #[cfg(feature = "profile")]
+        {
+            self.profile.parse_ns += _start.elapsed().as_nanos() as u64;
+        }
+        Ok(())
     }
 
     /// Undo everything pushed since `rows` committed rows (partial row
@@ -798,6 +823,8 @@ impl ColumnarEngine {
         let row_tag_owned = row_tag.to_vec();
 
         loop {
+            #[cfg(feature = "profile")]
+            let _ev_start = std::time::Instant::now();
             let event = match reader.read_event() {
                 Ok(e) => e,
                 Err(e) => {
@@ -818,14 +845,26 @@ impl ColumnarEngine {
                     ));
                 }
             };
+            #[cfg(feature = "profile")]
+            {
+                self.profile.event_loop_ns += _ev_start.elapsed().as_nanos() as u64;
+            }
 
             match event {
                 Event::Empty(ref e) if e.name().as_ref() == row_tag_owned => {
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| e.to_string())?;
                         let key = utf8_unchecked(attr.key.as_ref());
+                        #[cfg(feature = "profile")]
+                        let _un_start = std::time::Instant::now();
                         let value = attr_value(&attr)?;
+                        #[cfg(feature = "profile")]
+                        let _ = self.profile.unescape_ns += _un_start.elapsed().as_nanos() as u64;
+                        #[cfg(feature = "profile")]
+                        let _cp_start = std::time::Instant::now();
                         self.push_field_str(key, Some(value.as_ref()));
+                        #[cfg(feature = "profile")]
+                        let _ = self.profile.copy_ns += _cp_start.elapsed().as_nanos() as u64;
                     }
                     self.finish_row();
                 }
@@ -834,8 +873,16 @@ impl ColumnarEngine {
                     for attr in e.attributes() {
                         let attr = attr.map_err(|e| e.to_string())?;
                         let key = utf8_unchecked(attr.key.as_ref());
+                        #[cfg(feature = "profile")]
+                        let _un_start = std::time::Instant::now();
                         let value = attr_value(&attr)?;
+                        #[cfg(feature = "profile")]
+                        let _ = self.profile.unescape_ns += _un_start.elapsed().as_nanos() as u64;
+                        #[cfg(feature = "profile")]
+                        let _cp_start = std::time::Instant::now();
                         self.push_field_str(key, Some(value.as_ref()));
+                        #[cfg(feature = "profile")]
+                        let _ = self.profile.copy_ns += _cp_start.elapsed().as_nanos() as u64;
                     }
 
                     loop {
@@ -856,7 +903,12 @@ impl ColumnarEngine {
                                             if attr_key == b"FieldName"
                                                 || attr_key == b"Name"
                                             {
-                                                if let Ok(value) = attr_value(&attr) {
+                                                #[cfg(feature = "profile")]
+                                                let _un_start = std::time::Instant::now();
+                                                let value = attr_value(&attr);
+                                                #[cfg(feature = "profile")]
+                                                let _ = self.profile.unescape_ns += _un_start.elapsed().as_nanos() as u64;
+                                                if let Ok(value) = value {
                                                     field_name = Some(value);
                                                     break;
                                                 }
@@ -868,8 +920,6 @@ impl ColumnarEngine {
 
                                     let mut text = std::borrow::Cow::Borrowed("");
                                     if matches!(child_event, Event::Start(_)) {
-                                        // Branch condition guarantees the tag is
-                                        // "Field"; no need to copy the name bytes.
                                         let field_end_bytes: &[u8] = b"Field";
                                         loop {
                                             let inner = reader
@@ -892,7 +942,11 @@ impl ColumnarEngine {
                                                             if let Event::Text(txt) =
                                                                 text_event
                                                             {
+                                                                #[cfg(feature = "profile")]
+                                                                let _un_start = std::time::Instant::now();
                                                                 text = text_value(txt)?;
+                                                                #[cfg(feature = "profile")]
+                                                                let _ = self.profile.unescape_ns += _un_start.elapsed().as_nanos() as u64;
                                                             }
                                                         }
                                                     }
@@ -907,13 +961,22 @@ impl ColumnarEngine {
                                             }
                                         }
                                     }
+                                    #[cfg(feature = "profile")]
+                                    let _cp_start = std::time::Instant::now();
                                     self.push_field_str(key, Some(text.as_ref()));
+                                    #[cfg(feature = "profile")]
+                                    let _ = self.profile.copy_ns += _cp_start.elapsed().as_nanos() as u64;
                                 } else if child_tag == b"Text" {
                                     let mut text_name = None;
                                     for attr in child.attributes() {
                                         if let Ok(attr) = attr {
                                             if attr.key.as_ref() == b"Name" {
-                                                if let Ok(value) = attr_value(&attr) {
+                                                #[cfg(feature = "profile")]
+                                                let _un_start = std::time::Instant::now();
+                                                let value = attr_value(&attr);
+                                                #[cfg(feature = "profile")]
+                                                let _ = self.profile.unescape_ns += _un_start.elapsed().as_nanos() as u64;
+                                                if let Ok(value) = value {
                                                     text_name = Some(value);
                                                     break;
                                                 }
@@ -925,7 +988,6 @@ impl ColumnarEngine {
 
                                     let mut text = std::borrow::Cow::Borrowed("");
                                     if matches!(child_event, Event::Start(_)) {
-                                        // Branch condition guarantees the tag is "Text".
                                         let text_end_bytes: &[u8] = b"Text";
                                         loop {
                                             let inner = reader
@@ -947,7 +1009,11 @@ impl ColumnarEngine {
                                                             if let Event::Text(txt) =
                                                                 text_event
                                                             {
+                                                                #[cfg(feature = "profile")]
+                                                                let _un_start = std::time::Instant::now();
                                                                 text = text_value(txt)?;
+                                                                #[cfg(feature = "profile")]
+                                                                let _ = self.profile.unescape_ns += _un_start.elapsed().as_nanos() as u64;
                                                             }
                                                         }
                                                     }
@@ -963,20 +1029,39 @@ impl ColumnarEngine {
                                             }
                                         }
                                     }
+                                    #[cfg(feature = "profile")]
+                                    let _cp_start = std::time::Instant::now();
                                     self.push_field_str(key, Some(text.as_ref()));
+                                    #[cfg(feature = "profile")]
+                                    let _ = self.profile.copy_ns += _cp_start.elapsed().as_nanos() as u64;
                                 } else if child_tag == b"Section" {
-                                    // Section carries SectionNumber; extract it.
                                     let sn = child
                                         .attributes()
                                         .filter_map(|a| a.ok())
                                         .find(|a| a.key.as_ref() == b"SectionNumber")
-                                        .and_then(|a| attr_value(&a).ok())
+                                        .and_then(|a| {
+                                            #[cfg(feature = "profile")]
+                                            let _un_start = std::time::Instant::now();
+                                            let result = attr_value(&a).ok();
+                                            #[cfg(feature = "profile")]
+                                            {
+                                                self.profile.unescape_ns += _un_start.elapsed().as_nanos() as u64;
+                                            }
+                                            result
+                                        })
                                         .unwrap_or_default();
+                                    #[cfg(feature = "profile")]
+                                    let _cp_start = std::time::Instant::now();
                                     self.push_field_str("Section", Some(sn.as_ref()));
+                                    #[cfg(feature = "profile")]
+                                    let _ = self.profile.copy_ns += _cp_start.elapsed().as_nanos() as u64;
                                 } else {
-                                    // Unknown tag: push tag name with empty value.
                                     let key = utf8_unchecked(child_tag);
+                                    #[cfg(feature = "profile")]
+                                    let _cp_start = std::time::Instant::now();
                                     self.push_field_str(key, Some(""));
+                                    #[cfg(feature = "profile")]
+                                    let _ = self.profile.copy_ns += _cp_start.elapsed().as_nanos() as u64;
                                 }
                             }
 
@@ -1120,19 +1205,32 @@ impl ColumnarEngine {
                                     }
                                     if matches!(child, Event::Start(_)) {
                                         let end = tag;
+                                        let mut text = String::new();
                                         loop {
                                             match rr.read_event_into(&mut buf) {
-                                                Ok(Event::End(ref ne)) if ne.name().as_ref() == end => {
-                                                    break;
-                                                }
-                                                Ok(Event::Text(txt)) => {
-                                                    if let Ok(v) = txt.unescape() {
-                                                        self.push_field(&name, Some(v.into_owned()));
+                                                Ok(Event::Start(ref ic))
+                                                | Ok(Event::Empty(ref ic)) => {
+                                                    if ic.name().as_ref() == b"TextValue" {
+                                                        if let Ok(Event::Text(txt)) =
+                                                            rr.read_event_into(&mut buf)
+                                                        {
+                                                            if let Ok(v) = txt.unescape() {
+                                                                text = v.into_owned();
+                                                            }
+                                                        }
                                                     }
+                                                }
+                                                Ok(Event::End(ref ne))
+                                                    if ne.name().as_ref() == end =>
+                                                {
+                                                    break;
                                                 }
                                                 Ok(Event::Eof) => return Ok(()),
                                                 _ => {}
                                             }
+                                        }
+                                        if !text.is_empty() {
+                                            self.push_field(&name, Some(text));
                                         }
                                     }
                                 } else if tag == b"Section" {
@@ -1235,6 +1333,9 @@ impl ColumnarEngine {
             return Ok(table);
         }
 
+        #[cfg(feature = "profile")]
+        let _export_start = std::time::Instant::now();
+
         let mut fields = Vec::with_capacity(self.column_order.len());
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.column_order.len());
         for name in &self.column_order {
@@ -1253,6 +1354,11 @@ impl ColumnarEngine {
         let pa = PyModule::import(py, "pyarrow")?;
         let table: PyObject = pa.call_method1("table", (rb,))?.into();
 
+        #[cfg(feature = "profile")]
+        {
+            self.profile.export_ns += _export_start.elapsed().as_nanos() as u64;
+        }
+
         // Apply post-reduce filter (column-to-column compare)
         if let Some(ref filter) = self.plan.filter {
             return filter.apply_pyarrow(table, py);
@@ -1270,6 +1376,12 @@ impl ColumnarEngine {
 
     pub fn column_names(&self) -> &[String] {
         &self.column_order
+    }
+
+    /// Sort columns alphabetically so multiple engines produce identical
+    /// schemas for pyarrow.concat_tables.
+    pub fn sort_columns(&mut self) {
+        self.column_order.sort();
     }
 
     /// Reset all data while preserving the plan and estimated rows.
