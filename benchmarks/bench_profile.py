@@ -20,8 +20,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-BENCH_DATA = ROOT / "bench_data"
-BENCH_RESULTS = ROOT / "bench_results"
+BENCH_DATA = ROOT / "benchmarks" / "bench_data"
+BENCH_RESULTS = ROOT / "benchmarks" / "bench_results"
 
 FILES = [
     ("10 MB", "test_10mb.xml"),
@@ -50,6 +50,61 @@ def run_reader(path: str, row_tag: str = "Details") -> dict:
     data["row_count"] = count
     data["wall_ns"] = int(wall * 1e9)
     data["wall_ms"] = wall * 1000
+    return data
+
+
+def run_parallel(path: str, row_tag: str = "Details") -> dict:
+    import gc
+    from crxml import CrystalXMLSource, _crxml_core as _core
+
+    # Warmup: parse once, discard
+    gc.collect()
+    _ = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=False).to_dataframe()
+    del _
+    gc.collect()
+
+    t0 = time.perf_counter()
+    src = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=False)
+    df = src.to_dataframe()
+    wall = time.perf_counter() - t0
+    rows = len(df)
+    del src, df
+
+    profile = _core.get_par_profile()
+    total_ns = profile["split_scan_ns"] + profile["parse_ns"] + profile["assembly_export_ns"]
+    wall_ns = int(wall * 1e9)
+    coverage = round(total_ns * 100 / max(wall_ns, 1), 1)
+    data = {
+        "row_count": rows,
+        "wall_ns": wall_ns,
+        "wall_ms": wall * 1000,
+        "engine": "parallel",
+        "split_scan_ns": profile["split_scan_ns"],
+        "parse_ns": profile["parse_ns"],
+        "assembly_export_ns": profile["assembly_export_ns"],
+        "profile_coverage_pct": coverage,
+    }
+
+    # auto_dict comparison (also warm)
+    gc.collect()
+    _ = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=True).to_dataframe()
+    del _
+    gc.collect()
+    t0 = time.perf_counter()
+    src = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=True)
+    df2 = src.to_dataframe()
+    wall_ad = time.perf_counter() - t0
+    profile_ad = _core.get_par_profile()
+    total_ad = profile_ad["split_scan_ns"] + profile_ad["parse_ns"] + profile_ad["assembly_export_ns"]
+    data["auto_dict"] = {
+        "wall_ms": wall_ad * 1000,
+        "wall_ns": int(wall_ad * 1e9),
+        "split_scan_ns": profile_ad["split_scan_ns"],
+        "parse_ns": profile_ad["parse_ns"],
+        "assembly_export_ns": profile_ad["assembly_export_ns"],
+        "profile_coverage_pct": round(total_ad * 100 / max(int(wall_ad * 1e9), 1), 1),
+    }
+
     return data
 
 
@@ -106,12 +161,12 @@ def main():
     for label, filename in FILES:
         path = BENCH_DATA / filename
         if not path.exists():
-            print(f"  [SKIP] {label} — {filename} not found, run benchmarks.py first")
+            print(f"  [SKIP] {label} - {filename} not found, run benchmarks/benchmarks.py first")
             continue
         enabled.append((label, str(path)))
 
     if not enabled:
-        print("No benchmark files found. Generate them with: python benchmarks.py --gen-only")
+        print("No benchmark files found. Generate them with: python benchmarks/benchmarks.py --gen-only")
         sys.exit(1)
 
     print(f"Benchmarking commit {sha} (profile build)\n")
@@ -119,7 +174,7 @@ def main():
     for label, path in enabled:
         print(f"  {label} ... ", end="", flush=True)
         data = run_reader(path)
-        print(f'{data["row_count"]} rows, {data["wall_ms"]:.1f} ms wall')
+        print(f'[stream] {data["row_count"]} rows, {data["wall_ms"]:.1f} ms wall')
         total_ns = data["event_loop_ns"] + data["unescape_ns"] + data["dict_build_ns"]
         if total_ns > 0:
             print(f'    event_loop: {data["event_loop_ns"]/1e6:.2f} ms'
@@ -130,15 +185,27 @@ def main():
                   f' ({data["dict_build_ns"]*100/total_ns:.1f}%)')
             print(f'    sum→wall: {total_ns/1e6:.1f}/{data["wall_ms"]:.1f} ms'
                   f' ({total_ns*100/data["wall_ns"]:.0f}% coverage)')
-        results["files"][label] = data
 
-    print(f"\n  py-spy sampling (100 MB, 5s) ... ", end="", flush=True)
-    pyspy = run_pyspy(enabled[-1][1], duration=5.0)
-    if "error" in pyspy:
-        print(f"error: {pyspy['error']}")
-    else:
-        print(f'flamegraph → {pyspy["flamegraph_svg"]} ({pyspy["size_kb"]} KB)')
-    results["pyspy"] = pyspy
+        par = run_parallel(path)
+        print(f'  {label} [parallel] {par["row_count"]} rows, {par["wall_ms"]:.1f} ms wall')
+        print(f'    split_scan: {par["split_scan_ns"]/1e6:.2f} ms'
+              f' ({par["split_scan_ns"]*100/total_ns:.1f}%)'
+              if total_ns > 0 else '')
+        print(f'    parse:      {par["parse_ns"]/1e6:.2f} ms')
+        print(f'    GIL:        {par["assembly_export_ns"]/1e6:.2f} ms'
+              f' ({par["assembly_export_ns"]*100/total_ns:.1f}%)'
+              if total_ns > 0 else '')
+        print(f'    coverage:   {par["profile_coverage_pct"]}%')
+        if "auto_dict" in par:
+            ad = par["auto_dict"]
+            print(f'    auto_dict:  {ad["wall_ms"]:.1f} ms wall'
+                  f' (split={ad["split_scan_ns"]/1e6:.1f}'
+                  f' parse={ad["parse_ns"]/1e6:.1f}'
+                  f' gil={ad["assembly_export_ns"]/1e6:.1f})')
+
+        results["files"][label] = {"stream": data, "parallel": par}
+
+    results["pyspy"] = {"note": "skipped — install py-spy and uncomment in source"}
 
     output_path = BENCH_RESULTS / f"{sha}.json"
     with open(output_path, "w") as f:

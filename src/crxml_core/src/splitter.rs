@@ -5,44 +5,43 @@ use std::ops::Range;
 /// Returns sorted, non-overlapping byte ranges to skip during split-point
 /// validation. In practice CR exports rarely contain either construct, so
 /// the returned `has_any` flag lets callers skip range-check logic entirely.
+///
+/// Optimized for the common case (no special regions) by scanning for the
+/// common prefix `b"<!"` once instead of two separate substring searches.
 pub fn find_special_regions(bytes: &[u8]) -> (Vec<Range<usize>>, bool) {
     let mut ranges: Vec<Range<usize>> = Vec::new();
     let mut pos = 0;
 
-    while pos < bytes.len() {
-        let remaining = &bytes[pos..];
+    while let Some(rel) = memchr::memmem::find(&bytes[pos..], b"<!") {
+        let start = pos + rel;
 
-        // Comment: <!-- ... -->
-        if let Some(rel) = memchr::memmem::find(remaining, b"<!--") {
-            let start = pos + rel;
+        // Check for comment <!--
+        if bytes[start..].starts_with(b"<!--") {
             let after_open = start + 4;
-            if let Some(rel_close) = memchr::memmem::find(&bytes[after_open..], b"-->") {
-                let end = after_open + rel_close + 3;
+            if let Some(close_rel) = memchr::memmem::find(&bytes[after_open..], b"-->") {
+                let end = after_open + close_rel + 3;
                 ranges.push(start..end);
                 pos = end;
                 continue;
             }
-            // Unclosed comment — treat rest of file as comment
             ranges.push(start..bytes.len());
             return (ranges, true);
         }
 
-        // CDATA: <![CDATA[ ... ]]>
-        if let Some(rel) = memchr::memmem::find(remaining, b"<![CDATA[") {
-            let start = pos + rel;
+        // Check for CDATA <![CDATA[
+        if bytes[start..].starts_with(b"<![CDATA[") {
             let after_open = start + 9;
-            if let Some(rel_close) = memchr::memmem::find(&bytes[after_open..], b"]]>") {
-                let end = after_open + rel_close + 3;
+            if let Some(close_rel) = memchr::memmem::find(&bytes[after_open..], b"]]>") {
+                let end = after_open + close_rel + 3;
                 ranges.push(start..end);
                 pos = end;
                 continue;
             }
-            // Unclosed CDATA — treat rest of file as CDATA
             ranges.push(start..bytes.len());
             return (ranges, true);
         }
 
-        break;
+        pos = start + 1;
     }
 
     let has_any = !ranges.is_empty();
@@ -64,19 +63,23 @@ pub fn next_row_start(
     if from >= bytes.len() {
         return None;
     }
+    // Search for `<tag` in one SIMD pass (longer needle = far fewer false
+    // positives than searching for `tag` alone and checking `<` after).
+    let mut full_tag = Vec::with_capacity(1 + tag.len());
+    full_tag.push(b'<');
+    full_tag.extend_from_slice(tag);
+
     let mut p = from;
-    while let Some(rel) = memchr::memchr(b'<', &bytes[p..]) {
-        let at = p + rel;
-        if bytes[at + 1..].starts_with(tag) {
-            let after = at + 1 + tag.len();
-            let boundary = matches!(
-                bytes.get(after),
-                Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
-            );
-            let in_skip = skip.iter().any(|r| r.contains(&at));
-            if boundary && !in_skip {
-                return Some(at);
-            }
+    while let Some(rel) = memchr::memmem::find(&bytes[p..], &full_tag) {
+        let at = p + rel; // points to `<`
+        let after = at + 1 + tag.len(); // just past `<tag`
+        let boundary = matches!(
+            bytes.get(after),
+            Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
+        );
+        let in_skip = skip.iter().any(|r| r.contains(&at));
+        if boundary && !in_skip {
+            return Some(at);
         }
         p = at + 1;
     }

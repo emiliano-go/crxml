@@ -18,10 +18,8 @@ except ImportError:
     resource = None
 
 HERE = Path(__file__).parent
-sys.path.insert(0, str(HERE / "src"))
-import importlib
-_core = importlib.import_module("crxml._crxml_core")
-OUT_DIR = HERE / "bench_data"
+from crxml import _crxml_core as _core
+OUT_DIR = HERE / "benchmarks" / "bench_data"
 OUT_DIR.mkdir(exist_ok=True)
 
 random.seed(42)
