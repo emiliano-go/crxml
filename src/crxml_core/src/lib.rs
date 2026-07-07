@@ -198,26 +198,14 @@ fn concat_tables(a: PyObject, b: PyObject) -> PyResult<PyObject> {
     })
 }
 
-fn parse_columnar_bounded(
-    path: &str,
+/// Scan bytes for row density and compute chunk splits for bounded parsing.
+/// Returns (file_len, bytes_per_row, rows_per_batch, chunks).
+fn estimate_batch_params(
+    bytes: &[u8],
     row_tag: &[u8],
-    plan: columnar::BuildPlan,
     budget_bytes: usize,
-    prefault: bool,
-) -> PyResult<PyObject> {
-    let p = std::path::Path::new(path);
-    let mmap_handle = MmapHandle::new(p, prefault)?;
-    let bytes = mmap_handle.as_slice();
+) -> (usize, usize, usize, Vec<std::ops::Range<usize>>) {
     let file_len = bytes.len();
-
-    if file_len == 0 {
-        return Python::with_gil(|py| {
-            let pa = PyModule::import(py, "pyarrow")?;
-            Ok(pa.call_method1("table", (PyDict::new(py),))?.into())
-        });
-    }
-
-    // Estimate bytes per row from the Row tag density in first 64KB
     let sample_end = file_len.min(65536);
     let row_tag_count = memchr::memmem::find_iter(&bytes[..sample_end], row_tag).count();
     let bytes_per_row = if row_tag_count > 0 {
@@ -235,8 +223,42 @@ fn parse_columnar_bounded(
     let num_batches = (total_rows_est / rows_per_batch).max(1);
     let chunks = splitter::compute_splits(bytes, row_tag, num_batches.min(64));
 
-    // Explicitly end the mmap borrow before creating Python objects
-    drop(mmap_handle);
+    (file_len, bytes_per_row, rows_per_batch, chunks)
+}
+
+fn parse_columnar_bounded(
+    path: &str,
+    row_tag: &[u8],
+    plan: columnar::BuildPlan,
+    budget_bytes: usize,
+    prefault: bool,
+) -> PyResult<PyObject> {
+    let p = std::path::Path::new(path);
+
+    let (file_len, bytes_per_row, rows_per_batch, chunks) = {
+        #[cfg(feature = "mmap")]
+        {
+            let handle = MmapHandle::new(p, prefault)?;
+            let r = estimate_batch_params(handle.as_slice(), row_tag, budget_bytes);
+            drop(handle);
+            r
+        }
+        #[cfg(not(feature = "mmap"))]
+        {
+            let _ = prefault;
+            let data = std::fs::read(p)
+                .map_err(|e| PyIOError::new_err(format!("Cannot read {}: {}", path, e)))?;
+            let r = estimate_batch_params(&data, row_tag, budget_bytes);
+            r
+        }
+    };
+
+    if file_len == 0 {
+        return Python::with_gil(|py| {
+            let pa = PyModule::import(py, "pyarrow")?;
+            Ok(pa.call_method1("table", (PyDict::new(py),))?.into())
+        });
+    }
 
     // ---- processing phase (mmap is gone, no Python refs to mmaped memory) ----
     let mut result_table: Option<PyObject> = None;
@@ -514,6 +536,7 @@ pub fn read_to_columnar(
     auto_dict: bool,
     prefault: bool,
 ) -> PyResult<PyObject> {
+    let _ = &prefault;
     let plan = build_plan_from_kwargs(
         field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
     )?;
@@ -563,6 +586,7 @@ pub fn read_to_columnar_multi(
     auto_dict: bool,
     prefault: bool,
 ) -> PyResult<PyObject> {
+    let _ = &prefault;
     let plan = build_plan_from_kwargs(
         field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
     )?;
@@ -612,6 +636,7 @@ pub fn read_to_columnar_par(
     auto_dict: bool,
     prefault: bool,
 ) -> PyResult<PyObject> {
+    let _ = &prefault;
     let plan = build_plan_from_kwargs(
         field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
     )?;

@@ -19,7 +19,7 @@ except ImportError:
 
 HERE = Path(__file__).parent
 from crxml import _crxml_core as _core
-OUT_DIR = HERE / "benchmarks" / "bench_data"
+OUT_DIR = HERE / "bench_data"
 OUT_DIR.mkdir(exist_ok=True)
 
 random.seed(42)
