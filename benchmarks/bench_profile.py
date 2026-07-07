@@ -19,9 +19,9 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-BENCH_DATA = ROOT / "benchmarks" / "bench_data"
-BENCH_RESULTS = ROOT / "benchmarks" / "bench_results"
+ROOT = Path(__file__).resolve().parent.parent
+BENCH_DATA = ROOT / "bench_data"
+BENCH_RESULTS = ROOT / "bench_results"
 
 FILES = [
     ("10 MB", "test_10mb.xml"),
