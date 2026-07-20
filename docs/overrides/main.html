@@ -13,3 +13,20 @@
 {{ super() }}
 {% endif %}
 {% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script>
+(function() {
+  var drawer = document.getElementById('__drawer');
+  if (drawer) {
+    document.addEventListener('click', function(e) {
+      var link = e.target.closest('.md-sidebar--primary .md-nav__link');
+      if (link && drawer.checked) {
+        drawer.checked = false;
+      }
+    });
+  }
+})();
+</script>
+{% endblock %}
