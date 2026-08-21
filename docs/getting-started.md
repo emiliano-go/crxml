@@ -55,7 +55,7 @@ pipe = (
         "{Report.Amount}": "amount",
     })
     | CastTypes({"amount": float})
-    | DropFields("{Report.TaxRate}")
+    | DropFields(["{Report.TaxRate}"])
 )
 
 for row in pipe:

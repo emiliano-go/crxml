@@ -1,9 +1,9 @@
 # crxml Documentation
 
-> Fast streaming parser for Crystal Reports XML exports, with Rust acceleration. Parse large XML exports into structured data with pipeline API, parallel execution, and multiple output sinks.
+> High-performance Crystal Reports XML to Arrow/DataFrame engine for Python. Parse, filter, rename, cast, and project Crystal Reports XML directly into columnar data, with Rust execution, parallel parsing, bounded-memory processing, and automatic query fusion.
 
 ## Overview
-- [crxml](https://crxml.emiliano-go.com/): Fast streaming parser for Crystal Reports XML exports
+- [crxml](https://crxml.emiliano-go.com/): High-performance Crystal Reports XML to Arrow/DataFrame engine for Python
 - [Installation](https://crxml.emiliano-go.com/installation/): Install crxml via pip
 - [Getting Started](https://crxml.emiliano-go.com/getting-started/): Parse your first Crystal Reports XML file
 

@@ -1,7 +1,9 @@
 # crxml
 
-Fast streaming parser for SAP Crystal Reports XML exports.
-Parse 100 MB in 0.42 seconds. RSS stays well below file size.
+High-performance Crystal Reports XML to Arrow/DataFrame engine for Python.
+Parse, filter, rename, cast, and project Crystal Reports XML directly into
+columnar data, with Rust execution, parallel parsing, bounded-memory
+processing, and automatic query fusion.
 
 ## Features
 

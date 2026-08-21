@@ -42,7 +42,7 @@ def main() -> int:
 
     sections = [
         "# crxml Documentation",
-        "> Full documentation for crxml \u2014 Fast streaming parser for Crystal Reports XML exports",
+        "> Full documentation for crxml: high-performance Crystal Reports XML to Arrow/DataFrame engine for Python",
         f"> Source: {SITE_URL}",
         f"> Pages: {len(md_files)}",
         "",

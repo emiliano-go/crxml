@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Feed arbitrary bytes to the splitter — must not panic or UB.
+    // Feed arbitrary bytes to the splitter; must not panic or UB.
     let tag = b"Details";
     let (skip_regions, has_special) = crxml_core::splitter::find_special_regions(data);
     let _ = crxml_core::splitter::next_row_start(data, 0, tag, &skip_regions);
@@ -28,7 +28,7 @@ fuzz_target!(|data: &[u8]| {
     for chunk in &chunks {
         if !chunk.is_empty() {
             let mut engine = crxml_core::columnar::ColumnarEngine::new();
-            // Ignore parse errors — fuzz input is arbitrary.
+            // Ignore parse errors; fuzz input is arbitrary.
             let _ = engine.parse_bytes(&data[chunk.clone()], tag);
         }
     }

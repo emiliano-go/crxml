@@ -80,7 +80,9 @@ class FilterRows:
         return record if self._predicate(record) else None
 
     def __call__(self, stream):
-        return filter(None, map(self.apply, stream))
+        # Identity check, not truthiness: a row that earlier stages reduced
+        # to {} is still a row; filter(None, ...) would drop it.
+        return (r for r in map(self.apply, stream) if r is not None)
 
     def _plan_kwargs(self) -> dict | None:
         if self._filter_spec is not None:

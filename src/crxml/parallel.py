@@ -11,15 +11,19 @@ def validate_stages_picklable(stages):
             raise TypeError(f"Stage {stage!r} is not picklable: {e}")
 
 def _reader_thread(source, q, batch_size):
-    batch = []
-    for rec in source:
-        batch.append(rec)
-        if len(batch) >= batch_size:
+    try:
+        batch = []
+        for rec in source:
+            batch.append(rec)
+            if len(batch) >= batch_size:
+                q.put(batch)
+                batch = []
+        if batch:
             q.put(batch)
-            batch = []
-    if batch:
-        q.put(batch)
-    q.put(_SENTINEL)
+    except BaseException as e:
+        q.put(e)  # propagate to consumer instead of hanging it
+    finally:
+        q.put(_SENTINEL)
 
 def _prefetch_iter(source, batch_size, maxsize=8):
     import queue
@@ -31,21 +35,15 @@ def _prefetch_iter(source, batch_size, maxsize=8):
         item = q.get()
         if item is _SENTINEL:
             break
+        if isinstance(item, BaseException):
+            raise item
         yield from item
     t.join()
 
 def _worker_apply(batch, stages):
-    """Worker function – must be module-level for pickling."""
-    from .fusion import fused_iter  # re‑import inside worker
+    """Worker function; must be module-level for pickling."""
+    from .fusion import fused_iter  # re-import inside worker
     return list(fused_iter(batch, stages))
-
-def _submit_next(raw_stream, batch_size, futures, executor, stages):
-    from itertools import islice
-    batch = list(islice(raw_stream, batch_size))
-    if batch:
-        futures.append(executor.submit(_worker_apply, batch, stages))
-        return True
-    return False
 
 def parallel_iter(
     source: Iterable[dict],
@@ -53,17 +51,28 @@ def parallel_iter(
     workers: int,
     batch_size: int,
 ) -> Iterator[dict]:
+    """Run stages over row batches in worker processes.
+
+    In-flight work is capped at ``workers * 2`` batches, so memory stays
+    bounded regardless of input size.
+    """
+    from collections import deque
     from concurrent.futures import ProcessPoolExecutor
     raw_stream = _prefetch_iter(source, batch_size)
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = []
+        window: deque = deque()
+
+        def submit() -> bool:
+            from itertools import islice
+            batch = list(islice(raw_stream, batch_size))
+            if not batch:
+                return False
+            window.append(executor.submit(_worker_apply, batch, stages))
+            return True
 
         for _ in range(workers * 2):
-            if not _submit_next(raw_stream, batch_size, futures, executor, stages):
+            if not submit():
                 break
-
-        idx = 0
-        while idx < len(futures):
-            yield from futures[idx].result()
-            idx += 1
-            _submit_next(raw_stream, batch_size, futures, executor, stages)
+        while window:
+            yield from window.popleft().result()
+            submit()

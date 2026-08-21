@@ -124,3 +124,56 @@ class TestToCSV:
                 assert "level" in reader.fieldnames
         finally:
             Path(path).unlink(missing_ok=True)
+
+    def test_csv_ragged_rows_warn_and_keep_earlier_rows(self):
+        """Fields appearing after the header must not corrupt earlier rows;
+        they are omitted with a warning naming them."""
+        rows = [{"a": "1", "b": "2"}, {"a": "3", "c": "late"}]
+        with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+            path = f.name
+        try:
+            with pytest.warns(UserWarning, match="'c'"):
+                to_csv(iter(rows), path)
+            with open(path) as f:
+                got = list(csv.DictReader(f))
+            assert got == [
+                {"a": "1", "b": "2"},
+                {"a": "3", "b": ""},
+            ]
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_csv_fieldnames_union_includes_late_fields(self):
+        rows = [{"a": "1", "b": "2"}, {"a": "3", "c": "late"}]
+        with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+            path = f.name
+        try:
+            import warnings
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                to_csv(iter(rows), path, fieldnames=["a", "b", "c"])
+            with open(path) as f:
+                reader = csv.DictReader(f)
+                assert reader.fieldnames == ["a", "b", "c"]
+                assert list(reader) == [
+                    {"a": "1", "b": "2", "c": ""},
+                    {"a": "3", "b": "", "c": "late"},
+                ]
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_csv_ragged_no_warning_when_all_fields_known(self):
+        import warnings
+
+        rows = [{"a": "1"}, {"b": "2"}]
+        with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+            path = f.name
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                to_csv(iter(rows), path, fieldnames=["a", "b"])
+            with open(path) as f:
+                assert len(list(csv.DictReader(f))) == 2
+        finally:
+            Path(path).unlink(missing_ok=True)

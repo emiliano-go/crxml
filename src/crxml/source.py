@@ -38,7 +38,7 @@ def _default_threads() -> int:
 def _arrow_iter(table) -> Iterator[dict]:
     """Yield dicts from a pyarrow Table.
 
-    Compatibility helper — for columnar/parallel engines when row iteration
+    Compatibility helper: for columnar/parallel engines when row iteration
     is requested.  Table-oriented callers should use ``to_arrow()`` or
     ``to_dataframe()`` directly to avoid the dict reconstruction overhead.
     """
@@ -59,7 +59,55 @@ def _batch_iter(reader, batch_size: int = 1024) -> Iterator[dict]:
         yield from batch
 
 
+def _validate_filter(f: dict) -> None:
+    """Eagerly validate a pushdown filter spec (mirrors the Rust planner).
+
+    Raises ``ValueError`` at construction time instead of deep inside a
+    later ``to_arrow()`` call.
+    """
+    if not isinstance(f, dict):
+        raise ValueError(
+            f"filter must be a dict, got {type(f).__name__}: {f!r}"
+        )
+    op = f.get("op")
+    if op is None:
+        raise ValueError("filter must include an 'op' key")
+    compare_ops = {">", "<", ">=", "<=", "==", "!=", "gt", "lt", "ge", "le", "eq", "ne"}
+    constant_ops = {"==", "!=", "eq", "ne"}
+    if "field_a" in f or "field_b" in f:
+        if not ("field_a" in f and "field_b" in f):
+            raise ValueError(
+                "column-to-column filter requires both 'field_a' and 'field_b'"
+            )
+        if op not in compare_ops:
+            raise ValueError(
+                f"unsupported column-compare op {op!r}; valid ops: "
+                f"> < >= <= == != (or gt lt ge le eq ne)"
+            )
+        return
+    if "field" not in f or "value" not in f:
+        raise ValueError(
+            "filter requires either 'field' + 'op' + 'value', or "
+            "'field_a' + 'op' + 'field_b'"
+        )
+    if op not in constant_ops:
+        raise ValueError(
+            f"unsupported constant-filter op {op!r}; valid ops: "
+            f"'=='/'eq', '!='/'ne'"
+        )
+
+
 class CrystalXMLSource:
+    """Streaming/columnar source over one Crystal Reports XML file.
+
+    Table sinks (``to_arrow``/``to_pandas``/...) cache the parsed Arrow
+    table on first call, so repeated sinks on the same source parse only
+    once.  The cache is *not* thread-safe and holds the full table in
+    memory; call :meth:`clear_cache` to release it, or create separate
+    source objects per thread.  Row iteration (``iter(source)``) always
+    re-reads the file and never populates the cache.
+    """
+
     __slots__ = (
         "_row_tag",
         "_filepath",
@@ -110,6 +158,8 @@ class CrystalXMLSource:
         self._field_mapping = field_mapping or {}
         self._drop_fields = drop_fields or []
         self._filter = filter
+        if self._filter is not None:
+            _validate_filter(self._filter)
         self._field_types = field_types or {}
         self._dictionary_columns = dictionary_columns or []
         self._use_mmap = use_mmap
@@ -226,11 +276,13 @@ class CrystalXMLSource:
             )
         elif engine == "columnar":
             table = _core.read_to_columnar(
-                str(self._filepath), self._row_tag, prefault=True, **plan
+                str(self._filepath), self._row_tag,
+                prefault=self._use_mmap, **plan
             )
         elif engine == "parallel":
             table = _core.read_to_columnar_par(
-                str(self._filepath), self._row_tag, self._num_chunks, prefault=True, **plan
+                str(self._filepath), self._row_tag, self._num_chunks,
+                prefault=self._use_mmap, **plan
             )
         else:
             import pyarrow as pa
@@ -285,6 +337,10 @@ class CrystalXMLSource:
 
     def to_arrow(self):
         return self._read_arrow()
+
+    def clear_cache(self):
+        """Drop the cached Arrow table (see class docstring)."""
+        self._cached_arrow = None
 
     def to_polars(self):
         import polars as pl
