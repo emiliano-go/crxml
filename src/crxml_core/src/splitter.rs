@@ -113,7 +113,7 @@ pub fn compute_splits(bytes: &[u8], row_tag: &[u8], num_chunks: usize) -> Vec<Ra
                     if let Some(next) = next_row_start(bytes, at + 1, row_tag, &skip) {
                         split_points.push(next);
                     } else {
-                        // No more row starts — use single chunk
+                        // No more row starts; use single chunk
                         return vec![0..bytes.len()];
                     }
                 } else {
@@ -121,7 +121,7 @@ pub fn compute_splits(bytes: &[u8], row_tag: &[u8], num_chunks: usize) -> Vec<Ra
                 }
             }
             None => {
-                // Fewer rows than chunks — fall back
+                // Fewer rows than chunks; fall back
                 return vec![0..bytes.len()];
             }
         }
@@ -190,9 +190,9 @@ mod tests {
         let xml = b"<Row A=\"1\"/><Row B=\"2\"/>";
         // First <Row> at 0
         assert_eq!(next_row_start(xml, 0, b"Row", &[]), Some(0));
-        // Search after first <Row> — finds second at 12
+        // Search after first <Row>; finds second at 12
         assert_eq!(next_row_start(xml, 1, b"Row", &[]), Some(12));
-        // Search after end — None
+        // Search after end: None
         assert_eq!(next_row_start(xml, 100, b"Row", &[]), None);
     }
 

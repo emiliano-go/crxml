@@ -59,7 +59,7 @@ names across all rows.
 | `Field61` | 1,406 |
 | `Field22` | 4,230 |
 
-## Speed — end-to-end `to_dataframe()` (the user's actual goal)
+## Speed: end-to-end `to_dataframe()` (the user's actual goal)
 
 | Engine | 10 MB | 50 MB | 100 MB | 533 MB |
 |---|---|---|---|---|
@@ -84,7 +84,7 @@ Key observations:
 | Split-scan (serial) | 257 ms | 23% | Two SIMD scans for `<tag` + special regions |
 | Off-GIL parse (N=8) | 781 ms | 69% | quick-xml event loop, unescape, field copy |
 | On-GIL assembly | 25 ms | 2% | Arrow table construction, GIL-held |
-| Profile coverage | — | 94% | Remaining 6% = Python overhead, GC, import |
+| Profile coverage | - | 94% | Remaining 6% = Python overhead, GC, import |
 
 This breakdown is the honest map of optimization headroom:
 
@@ -106,7 +106,7 @@ This breakdown is the honest map of optimization headroom:
 
 ## Memory
 
-### Parallel (mmap) — 533 MB file
+### Parallel (mmap): 533 MB file
 
 | Metric | Value |
 |---|---|
@@ -120,7 +120,7 @@ The mmap path maps the file into virtual address space and pages it in on demand
 The columnar engine's output buffers are the only additional allocation of consequence.
 7,725 allocations for 465k rows (~60 allocations/row) is extremely allocation-efficient.
 
-### Stream (BufReader) — 533 MB file
+### Stream (BufReader): 533 MB file
 
 | Metric | Value |
 |---|---|
@@ -170,7 +170,7 @@ input).  No engine cuts corners.
 ## The ceiling
 
 At 472 MB/s on a machine with ~30 GB/s of memory bandwidth, this parser is
-**CPU-bound**, not bandwidth-bound.  The bottleneck is not moving bytes — it's
+**CPU-bound**, not bandwidth-bound.  The bottleneck is not moving bytes; it's
 tokenizing XML elements, unescaping entities, and copying field values.
 
 The breakdown says parse is 69% of wall time and the biggest sub-cost is the

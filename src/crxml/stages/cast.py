@@ -28,7 +28,7 @@ class CastTypes:
                 val = record[field]
                 raise ValueError(
                     f"CastTypes: cannot cast field '{field}' "
-                    f"value {val!r} — {e}"
+                    f"value {val!r}: {e}"
                 ) from e
         return record
 

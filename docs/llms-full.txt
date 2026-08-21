@@ -1,5 +1,5 @@
 # crxml Documentation
-> Full documentation for crxml — Fast streaming parser for Crystal Reports XML exports
+> Full documentation for crxml: high-performance Crystal Reports XML to Arrow/DataFrame engine for Python
 > Source: https://crxml.emiliano-go.com
 > Pages: 22
 
@@ -121,14 +121,42 @@ to_dataframe(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
 ## to_csv
 
 ```python
-to_csv(pipeline: Pipeline, path: str | Path, **csv_writer_kwargs) -> None
+to_csv(pipeline: Pipeline, path: str | Path, encoding: str = "utf-8",
+       delimiter: str = ",", fieldnames: list[str] | None = None) -> None
 ```
 
-| Param               | Type               | Default | Description                  |
-|---------------------|--------------------|---------|------------------------------|
-| `pipeline`          | `Pipeline`         |,       | Pipeline to consume          |
-| `path`              | `str \| Path`      |,       | Output CSV path              |
-| `**csv_writer_kwargs`| `Any`             |,       | Forwarded to `csv.writer`    |
+| Param        | Type               | Default | Description                                     |
+|--------------|--------------------|---------|------------------------------------------------|
+| `pipeline`   | `Pipeline`         |,       | Pipeline to consume                             |
+| `path`       | `str \| Path`      |,       | Output CSV path                                 |
+| `encoding`   | `str`              | `"utf-8"` | Output file encoding                          |
+| `delimiter`  | `str`              | `","`   | Field separator                                 |
+| `fieldnames` | `list[str] \| None`| `None`  | Explicit header; defaults to first record's keys |
+
+The header comes from the first record unless `fieldnames` is given. CR
+exports are ragged: fields that appear later but are missing from the
+header are omitted, and a `UserWarning` names them (once per field). Pass
+a `fieldnames` union to include them. Fields missing from a record are
+written as empty strings.
+
+## Exceptions
+
+Typed exceptions from the Rust core, importable from `crxml`:
+
+| Exception    | Raised when                                                        |
+|--------------|--------------------------------------------------------------------|
+| `XmlError`   | Input cannot be parsed (malformed XML, failed UTF-8 validation)     |
+| `PlanError`  | Invalid pushdown plan kwargs (unknown op, unknown field type)       |
+| `MergeError` | Chunk merge conflict during multi-chunk/parallel/bounded parsing    |
+
+```python
+from crxml import CrystalXMLSource, XmlError
+
+try:
+    CrystalXMLSource("export.xml").to_pandas()
+except XmlError as e:
+    print(f"bad input: {e}")
+```
 
 ## collect
 
@@ -154,9 +182,9 @@ crxml is a fast XML-to-DataFrame pipeline that uses a Rust core for parsing and 
 
 The three fusion levels are tried in priority order:
 
-1. **Columnar fusion** (Layer A) — compile stages into the Rust `BuildPlan`, eliminating row iteration entirely. Stages with `_plan_kwargs()` produce a merged kwargs dict passed to `read_to_columnar*`. Remaining stages run through the batchpipe chain over Arrow `RecordBatch` objects.
-2. **Vectorized batch fusion** — arrow-fusable stages (rename, drop, declarative filter) compile to `Callable[[Batch], Batch]` functions clustered into a single-pass `FusedTransforms` operator. Row-local `.apply` stages cluster into `LambdaOp`. Trailing stateful generators wrap the dict stream.
-3. **Dict fusion** (Layer B) — a contiguous run of `.apply` stages is fused into one tight `for r in src: for fn in bound: ...` loop.
+1. **Columnar fusion** (Layer A): compile stages into the Rust `BuildPlan`, eliminating row iteration entirely. Stages with `_plan_kwargs()` produce a merged kwargs dict passed to `read_to_columnar*`. Remaining stages run through the batchpipe chain over Arrow `RecordBatch` objects.
+2. **Vectorized batch fusion**: arrow-fusable stages (rename, drop, declarative filter) compile to `Callable[[Batch], Batch]` functions clustered into a single-pass `FusedTransforms` operator. Row-local `.apply` stages cluster into `LambdaOp`. Trailing stateful generators wrap the dict stream.
+3. **Dict fusion** (Layer B): a contiguous run of `.apply` stages is fused into one tight `for r in src: for fn in bound: ...` loop.
 
 These stack: columnar pushdown is tried first; if it succeeds, the remaining stages run through the batchpipe; any trailing stateful stages wrap the dict stream. If columnar fusion isn't possible (source lacks `_read_arrow`, or no stage produces `_plan_kwargs`), the system falls back to dict fusion only.
 
@@ -164,9 +192,9 @@ These stack: columnar pushdown is tried first; if it succeeds, the remaining sta
 XML bytes ──► Rust engine ──► Arrow Table ──► batchpipe chain ──► sink
 
 The Rust engine has three modes:
-  stream     — row-by-row via CrxmlReader (GIL-released batching)
-  columnar   — single-threaded columnar parse with BuildPlan pushdown
-  parallel   — chunked + rayon parallel columnar parse
+  stream:    row-by-row via CrxmlReader (GIL-released batching)
+  columnar:  single-threaded columnar parse with BuildPlan pushdown
+  parallel:  chunked + rayon parallel columnar parse
 ```
 
 ## Data flow
@@ -181,8 +209,7 @@ XML file
   ├─► columnar engine: ColumnarEngine.parse_bytes()
   │     │
   │     ├─► simdutf8 validation (one SIMD pass)
-  │     ├─► fast scanner (memchr-based)
-  │     │     └─► quick-xml fallback (non-standard XML)
+  │     ├─► borrowed-slice quick-xml reader (zero-copy events)
   │     │
   │     ├─► ColumnBuilder columns ──► finish_row (null-fill, filter)
   │     │     └─► extend (merge across chunks for multi/parallel)
@@ -213,7 +240,7 @@ XML file
 
 The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator (profiling showed ~27% of CPU time in malloc/free during XML parsing) and has three modules:
 
-### `lib.rs` — FFI boundary and stream engine
+### `lib.rs`: FFI boundary and stream engine
 
 #### Global allocator
 
@@ -222,7 +249,7 @@ The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 ```
 
-#### `CrxmlReader` (`#[pyclass]`) — streaming XML parser
+#### `CrxmlReader` (`#[pyclass]`): streaming XML parser
 
 **`RowParser`** is a pure-Rust struct that holds **no Python objects**. This is a load-bearing invariant: it allows `next_batch(n)` to release the GIL via `py.allow_threads()` (the `Ungil` bound on the closure requires no `Py<...>` references inside). Python-object state (the interned-key cache) lives on `CrxmlReader` beside this struct.
 
@@ -249,8 +276,8 @@ struct RowParser {
 **`read_batch_into(n)`**: calls `read_one_row` up to `n` times, extending `batch_vals` and `batch_lens`. Runs with the GIL released.
 
 **Dict construction** (GIL held, `#[pymethods]`):
-- `new_dict(py)`: creates a plain `PyDict`. The private CPython API `_PyDict_NewPresized` was benchmarked and removed — it delivered only 3.5% overall gain and used an `unsafe` call to a private, unstable symbol.
-- `cached_key(key)`: `FxHashMap<String, Py<PyString>>` — field names repeat every row; interned `PyString` objects are reused instead of allocating fresh `PyUnicode` per field per row.
+- `new_dict(py)`: creates a plain `PyDict`. The private CPython API `_PyDict_NewPresized` was benchmarked and removed; it delivered only 3.5% overall gain and used an `unsafe` call to a private, unstable symbol.
+- `cached_key(key)`: `FxHashMap<String, Py<PyString>>`: field names repeat every row; interned `PyString` objects are reused instead of allocating fresh `PyUnicode` per field per row.
 
 **`next_batch(n)`**: releases GIL → parses `n` rows into flat buffers → re-acquires GIL → walks `batch_vals`+`batch_lens` → builds `PyList[PyDict]`.
 
@@ -269,17 +296,17 @@ All accept `BuildPlan` kwargs: `field_mapping`, `drop_fields`, `filter`, `field_
 
 **`build_plan_from_kwargs`**: translates Python dicts into `columnar::BuildPlan`. Handles field_mapping → `field_map`, filter op validation (==/!= vs >/</>=/<=), field type name resolution ("int64" → `FieldType::Int64`), auto-dict flag.
 
-**`mmap_and_parse`**: memory-maps the file via `memmap2::Mmap::map` with `MADV_SEQUENTIAL | MADV_WILLNEED`. After parsing, spawns `std::thread::spawn(move || drop(mmap))` — unmap costs ~20 ms for 100 MB and runs off the caller's critical path.
+**`mmap_and_parse`**: memory-maps the file via `memmap2::Mmap::map`, advising `MADV_WILLNEED` when `prefault` is set and `MADV_SEQUENTIAL` otherwise (unix only). After parsing, the mapping is dropped synchronously (`unmap_now`); every value is copied into owned storage before export, so no borrowed reference outlives the parse.
 
 **`parse_columnar_par_from_slice`** (the parallel workhorse):
 1. `splitter::compute_splits` divides the file into `num_chunks` whole-row byte ranges.
-2. `chunks.par_iter()` via rayon — each chunk gets its own `ColumnarEngine`, parsed independently.
-3. If `plan.auto_dict` is false: calls `columnar::engines_to_pyarrow_table()` — each engine exports as a `RecordBatch` directly (no merge), tables are concatenated via `pyarrow.concat_tables`. This is the **fast path**.
+2. `chunks.par_iter()` via rayon: each chunk gets its own `ColumnarEngine`, parsed independently.
+3. If `plan.auto_dict` is false: calls `columnar::engines_to_pyarrow_table()`: each engine exports as a `RecordBatch` directly (no merge), tables are concatenated via `pyarrow.concat_tables`. This is the **fast path**.
 4. If `plan.auto_dict` is true: engines must be merged first (per-chunk dictionary codes won't agree), then `auto_dict_upgrade` runs on the merged engine, then `to_pyarrow_table`.
 
 **`parse_columnar_bounded`**: estimates `bytes_per_row` from a 64 KB sample (counts row-tag occurrences), computes `rows_per_batch` from the memory budget, splits the file into memory-sized batches. Each batch is parsed into an engine, exported to a `pyarrow.Table`, and dropped. Batch tables are concatenated. If only one batch, returns it directly.
 
-### `columnar.rs` — Columnar engine (~1980 lines)
+### `columnar.rs`: Columnar engine (~1980 lines)
 
 #### `BuildPlan`
 
@@ -295,7 +322,7 @@ pub struct BuildPlan {
 }
 ```
 
-**`resolve_field(raw)`**: applies rename first, then checks drop — matching left-to-right pipeline semantics (a rename changes the name before the drop check, so drop targets the renamed name, not the original). Returns `None` if the field should be dropped.
+**`resolve_field(raw)`**: applies rename first, then checks drop, matching left-to-right pipeline semantics (a rename changes the name before the drop check, so drop targets the renamed name, not the original). Returns `None` if the field should be dropped.
 
 **`column_type(name)`**: returns the storage type. Explicit `field_types` take priority, then `dictionary_columns`, defaulting to `FieldType::String`.
 
@@ -327,7 +354,7 @@ pub enum CompareOp { Gt, Lt, Ge, Le, Eq, Ne }
 
 Each maps to a `pyarrow.compute` function name via `compute_fn()` (e.g. `Gt → "greater"`).
 
-#### `StrColumn` — zero-alloc string storage
+#### `StrColumn`: zero-alloc string storage
 
 ```rust
 pub(crate) struct StrColumn {
@@ -339,9 +366,9 @@ pub(crate) struct StrColumn {
 
 Key properties:
 - **No per-cell heap allocation**: `push(v)` extends `data` with the string bytes and appends a `i32` offset.
-- **`pop()`**: truncates `data` and `offsets` — enables row filtering without compaction.
+- **`pop()`**: truncates `data` and `offsets`; enables row filtering without compaction.
 - **`append(other)`**: moves all values from another `StrColumn` (base-shifts offsets).
-- **`to_arrow()`**: builds `StringArray` via buffer copies — `Buffer::from_slice_ref(&self.data)`, `OffsetBuffer::new(...)`. No per-value iteration.
+- **`to_arrow()`**: builds `StringArray` via buffer copies: `Buffer::from_slice_ref(&self.data)`, `OffsetBuffer::new(...)`. No per-value iteration.
 - **`get(i)`**: reconstructs `&str` from the arena range, bypassing per-call UTF-8 validation (the chunk was validated once at entry).
 
 #### `ColumnBuilder`
@@ -357,16 +384,16 @@ pub(crate) enum ColumnBuilder {
 ```
 
 Methods:
-- **`push(value: Option<String>)`**: for typed columns, parse failures become `None` (null) — not an error. Dictionary `push` looks up or inserts into the value→code index.
+- **`push(value: Option<String>)`**: for typed columns, parse failures become `None` (null), not an error. Dictionary `push` looks up or inserts into the value→code index.
 - **`push_str(value: Option<&str>)`**: avoids the `into_owned()` allocation for typed columns that parse and discard the string.
 - **`pop()`**: removes the last value from any variant.
 - **`len()`**: returns the number of rows.
 - **`get_filter_value(index)`**: formats the value as `String` for filter comparison.
 - **`extend_owned(other)`**: move-merges another builder's values. Dictionary variant remaps `other`'s codes through its dictionary (one pass per value). Returns `Err` on type mismatch.
 - **`try_upgrade_to_dict(min_rows)`**: auto-dict heuristic. Counts distinct values in a `String` column. If distinct ratio ≤ 5% (clamped to [16, 256]), upgrades to `Dictionary`. No-op for non-String or too-few-rows.
-- **`to_arrow_array()`**: builds native Arrow arrays — `Int64Array`, `Float64Array`, `BooleanArray`, `StringArray`, `DictionaryArray<Int32Type>`. No per-cell Python objects.
+- **`to_arrow_array()`**: builds native Arrow arrays: `Int64Array`, `Float64Array`, `BooleanArray`, `StringArray`, `DictionaryArray<Int32Type>`. No per-cell Python objects.
 
-#### `ColumnarEngine` — per-chunk state machine
+#### `ColumnarEngine`: per-chunk state machine
 
 ```rust
 pub(crate) struct ColumnarEngine {
@@ -374,17 +401,16 @@ pub(crate) struct ColumnarEngine {
     column_order: Vec<String>,
     row_count: usize,
     plan: BuildPlan,
-    current_row: Vec<(String, Option<String>)>,  // temp state for current row
 }
 ```
 
 **Parse entry** (`parse_bytes(bytes, row_tag)`):
 1. Validates the entire chunk as UTF-8 via `simdutf8` (one SIMD-accelerated pass).
-2. Calls `parse_bytes_quickxml` — a borrowed-slice quick-xml reader that handles all standard and non-standard XML constructs (comments, PIs, CDATA, entity references, self-closing tags, etc.).
+2. Calls `parse_bytes_quickxml`: a borrowed-slice quick-xml reader that handles all standard and non-standard XML constructs (comments, PIs, CDATA, entity references, self-closing tags, etc.).
 
 **Per-field logic**: for `<Field FieldName="...">`, extracts the name attribute, reads `<FormattedValue>`/`<Value>` text, calls `resolve_field` for rename/drop, then `ColumnBuilder::push_str` with the storage type from `column_type`. Same pattern for `<Text>` (reads `<TextValue>`) and `<Section>` (captures section number).
 
-**`finish_row()`**: null-fills `ColumnBuilder`s for fields not present in this row (CR XML field sets vary per row). Calls `FilterPredicate::check` — if the row doesn't pass, calls `pop()` on all builders. Returns whether the row survived.
+**`finish_row()`**: null-fills `ColumnBuilder`s for fields not present in this row (CR XML field sets vary per row). Calls `FilterPredicate::check`; if the row doesn't pass, calls `pop()` on all builders. Returns whether the row survived.
 
 **`extend(other)`**: merges another engine's column builders. Null-pads columns missing in either engine. Returns `Err` on type mismatch (shouldn't happen if chunks share the same plan).
 
@@ -404,21 +430,21 @@ pub(crate) struct ColumnarEngine {
 - `attr_value(attr)`: unescapes a quick-xml attribute, with an optimization: probes for `&` via `memchr` and skips unescape if none present (CR values almost never contain entities).
 - `text_value(txt)`: same `&` probe optimization for text content.
 - `raw_value(b)`: borrowed-slice value with same `&` probe.
-- `utf8_unchecked(b)`: `std::str::from_utf8_unchecked` — safe because the chunk was validated once at `parse_bytes` entry.
+- `utf8_unchecked(b)`: `std::str::from_utf8_unchecked`: safe because the chunk was validated once at `parse_bytes` entry.
 
-### `splitter.rs` — Chunk-split logic for parallel mode
+### `splitter.rs`: Chunk-split logic for parallel mode
 
 **Phase A (`find_special_regions`):** scans for `<!-- ... -->` and `<![CDATA[ ... ]]>` regions that could contain false-positive `<Row` markers. Returns sorted, non-overlapping `Range<usize>` ranges and a `has_any` flag (lets callers skip range-check logic entirely).
 
 **Phase B (`next_row_start`):** `memchr`-based search for `<Tag`, with two validations:
-- **Boundary condition**: the byte after the tag must be space, tab, newline, `>`, or `/` — rejects `<RowItem` when tag is `Row`.
+- **Boundary condition**: the byte after the tag must be space, tab, newline, `>`, or `/`; rejects `<RowItem` when tag is `Row`.
 - **Skip region check**: the candidate position must not fall inside a comment/CDATA range.
 
 **Phase C (`compute_splits`):** walks from the first `<Row` to find evenly-spaced split points. Returns `num_chunks` whole-row `Range<usize>` values. Handles: small files (one chunk), prefix collisions, and missing split points.
 
 ## Python source layer
 
-### `__init__.py` — Lazy public API
+### `__init__.py`: Lazy public API
 
 ```python
 __all__ = ["CrystalXMLSource", "Pipeline", "RenameFields", "CastTypes",
@@ -433,7 +459,7 @@ def __getattr__(name):
     raise AttributeError(...)
 ```
 
-All public symbols are lazily imported via `__getattr__`. `import crxml` is instant — modules load only when their symbols are first accessed.
+All public symbols are lazily imported via `__getattr__`. `import crxml` is instant; modules load only when their symbols are first accessed.
 
 ### `CrystalXMLSource` (in `source.py`)
 
@@ -441,7 +467,7 @@ Wraps the Rust engines. Constructor parameters map one-to-one to `BuildPlan` fie
 
 - `engine`: `"auto"` (default), `"stream"`, `"columnar"`, `"parallel"`
 - `threads`: multiplied by **4** to get `num_chunks`. The 4x multiplier exists because finer chunks give better load balancing; VTune showed 3-4x optimal on 24 cores (beyond 4x, rayon join/spin overhead dominates).
-- `memory`: optional string (`"8GB"`) or int bytes — enables bounded mode.
+- `memory`: optional string (`"8GB"`) or int bytes; enables bounded mode.
 - `use_mmap`: memory-map the file (Unix only, requires `mmap` Cargo feature).
 - `batch_size`: rows per Rust→Python batch call (default 1024).
 - `field_mapping`, `drop_fields`, `filter`, `field_types`, `dictionary_columns`, `schema`, `auto_dict`: map directly to `BuildPlan`.
@@ -497,11 +523,11 @@ source | rename | cast  →  Pipeline(source, [rename, cast])
 **`_to_arrow()` shortcut**:
 - Returns a single `pyarrow.Table` if the whole pipeline can be executed as columnar fusion + batchpipe chain without trailing stages.
 - Returns `None` if: workers are set, source lacks `_read_arrow`, or trailing stateful stages remain.
-- This is the key fast path used by `to_dataframe()` and `collect()` — they check `_to_arrow()` first and skip the dict stream entirely.
+- This is the key fast path used by `to_dataframe()` and `collect()`; they check `_to_arrow()` first and skip the dict stream entirely.
 
 **`parallel(workers=None, batch_size=1000)`**: returns a new `Pipeline` with worker count set. Also carries forward the `_prefetch` flag (though prefetch is not toggled by the current public API).
 
-### `fusion.py` — Fusion orchestrator
+### `fusion.py`: Fusion orchestrator
 
 **`plan_split(stages)`**: iterates stages calling `_plan_kwargs()` on each. Stages returning a dict contribute to `plan_overrides` (consumed); stages returning `None` or lacking the method go to `remaining`.
 
@@ -520,7 +546,7 @@ Output: plan_overrides = {field_mapping: ..., field_types: ..., drop_fields: ...
 6. Returns `iter_dicts(op)` stream; trailing stages wrap the stream.
 
 **`fused_iter(source, stages)`**: the main execution entry point:
-1. Tries `_try_columnar_fusion` — if it returns a non-None stream, done.
+1. Tries `_try_columnar_fusion`: if it returns a non-None stream, done.
 2. Falls back to dict fusion:
    - Scans from front for a contiguous run of fusable stages (has `callable(stage.apply)`).
    - Fused inner loop: `for r in src: for fn in bound: r = fn(r); if None: break; else: yield r`.
@@ -529,7 +555,7 @@ Output: plan_overrides = {field_mapping: ..., field_types: ..., drop_fields: ...
 
 **`is_fusable(stage)`**: `callable(stage.apply)`.
 
-### `batchpipe.py` — Vectorized batch pipeline
+### `batchpipe.py`: Vectorized batch pipeline
 
 A pull-based (Volcano-style) operator chain over Arrow `RecordBatch` objects.
 
@@ -583,7 +609,7 @@ Operator (abstract)
 - `iter_dicts(op)`: compact each batch, yield via `RecordBatch.to_pylist()`.
 - `collect_table(op)`: collect all compacted batches, return `pa.Table.from_batches(batches)`.
 
-### `stages/` — The four built-in stages
+### `stages/`: The four built-in stages
 
 All four implement the same protocol:
 
@@ -602,16 +628,16 @@ class Stage:
 | `FilterRows(...)` | `record if predicate(record) else None` | `{"filter": spec}` for declarative; `None` for callable |
 
 **`FilterRows`** has three construction paths:
-1. **Callable predicate**: `FilterRows(predicate=lambda r: ...)` — not columnar-pushdownable.
-2. **Declarative constant**: `FilterRows(field="city", op="==", value="NYC")` — pushdownable as `FilterPredicate::Equal`/`NotEqual`. Uses `_ConstantPredicate` inner class.
-3. **Declarative compare**: `FilterRows(field_a="age", op=">", field_b="threshold")` — pushdownable as `FilterPredicate::Compare` (post-reduce via pyarrow.compute). Uses `_ComparePredicate` inner class.
+1. **Callable predicate**: `FilterRows(predicate=lambda r: ...)`: not columnar-pushdownable.
+2. **Declarative constant**: `FilterRows(field="city", op="==", value="NYC")`: pushdownable as `FilterPredicate::Equal`/`NotEqual`. Uses `_ConstantPredicate` inner class.
+3. **Declarative compare**: `FilterRows(field_a="age", op=">", field_b="threshold")`: pushdownable as `FilterPredicate::Compare` (post-reduce via pyarrow.compute). Uses `_ComparePredicate` inner class.
 
 **Filter semantics**:
 - Constant `==`: missing field returns unequal (dict `.get()` returns `None`).
-- Constant `!=`: missing field returns equal (`None != value` is true — the row is kept).
+- Constant `!=`: missing field returns equal (`None != value` is true; the row is kept).
 - Compare: both columns must exist. Evaluated post-reduce via `pyarrow.compute`.
 
-### `parallel.py` — Multi-process parallelism
+### `parallel.py`: Multi-process parallelism
 
 ```
 Source ──► _prefetch_iter (bounded queue, maxsize=8) ──► ProcessPoolExecutor ──► ordered results
@@ -629,7 +655,7 @@ Source ──► _prefetch_iter (bounded queue, maxsize=8) ──► ProcessPool
 3. **Double-buffered submission**: submits `workers * 2` futures initially. For each completed future, submits one new future. This keeps the executor saturated while bounding in-flight memory.
 4. Yields results in submission order: `for idx in range(len(futures)): yield from futures[idx].result()`.
 
-### `sinks.py` — Terminal operations
+### `sinks.py`: Terminal operations
 
 **Shortcut hierarchy**:
 
@@ -637,7 +663,7 @@ Source ──► _prefetch_iter (bounded queue, maxsize=8) ──► ProcessPool
 |------|-----------|----------|
 | `to_dataframe` | `pipeline._to_arrow()` → single `pyarrow.Table` → `table.to_pandas()` (ArrowDtype, zero dicts) | `_iter_batches()` → chunked DataFrame → `pd.concat`; or `pd.DataFrame.from_records(iter(pipeline))` |
 | `collect` | `pipeline._to_arrow()` → `table.to_pylist()` | `_iter_batches()` → dicts; or `list(pipeline)` |
-| `to_csv` | Always streams row-by-row via `csv.DictWriter` (no intermediate list) | — |
+| `to_csv` | Always streams row-by-row via `csv.DictWriter` (no intermediate list) | - |
 
 `to_dataframe(chunksize=N)` always uses batch-then-concat for memory control. `chunksize=None` triggers the single-table fast path.
 
@@ -704,9 +730,9 @@ to_dataframe(pipeline):
 
 - **Stream engine**: `RowParser` reuses `Vec<u8>` buffers across rows. Dicts are built in Python heap via `PyDict::new()`. The `FxHashMap` key cache lives for the reader's lifetime.
 
-- **Columnar engine**: `StrColumn` uses a flat byte arena + `i32` offsets — no per-cell `String` allocation. Numeric columns use `Vec<Option<i64>>` (8 bytes + 1 validity per cell). Arrow arrays are built natively and exported via C Data Interface.
+- **Columnar engine**: `StrColumn` uses a flat byte arena + `i32` offsets; no per-cell `String` allocation. Numeric columns use `Vec<Option<i64>>` (8 bytes + 1 validity per cell). Arrow arrays are built natively and exported via C Data Interface.
 
-- **mmap**: files are memory-mapped with `MADV_SEQUENTIAL | MADV_WILLNEED`. A background thread unmaps after parse (~20 ms serial cost offloaded). Result survives because `to_pyarrow_table` copies all data into Arrow arrays.
+- **mmap**: files are memory-mapped; advice is `MADV_WILLNEED` when `prefault` is set (parse-speed goal) and `MADV_SEQUENTIAL` otherwise (RSS-sensitive paths). The mapping is dropped synchronously after export; all data lives in owned Arrow buffers by then.
 
 - **Bounded mode**: `read_to_columnar_bounded` samples 64 KB → estimates `bytes_per_row` → splits into memory-sized chunks → parses/exports each chunk independently → chunk engine dropped → tables concatenated.
 
@@ -742,7 +768,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | Columnar fusion (Layer A) | `fusion.py:23-44` | Entire pipeline compiled into Rust `BuildPlan` |
 | `_to_arrow()` shortcut | `pipeline.py:45-67` | Skips dict construction entirely for fast-path pipelines |
 | Arrow C Data Interface | `columnar.rs:496-520` | Zero-copy export from Rust Arrow to pyarrow |
-| Background unmap thread | `lib.rs:246` | Offloads ~20ms serial `Mmap::drop` cost |
+| Synchronous unmap after export | `lib.rs` (`MmapHandle::unmap_now`) | Releases file-backed pages before pandas conversion begins |
 | 4x chunk multiplier | `source.py:109` | Finer grains for rayon load balancing (VTune-optimized) |
 | Bounded memory batches | `lib.rs:128-221` | Streams large files within configurable memory budget |
 | Fast parallel export (no merge) | `columnar.rs:engines_to_pyarrow_table` | Avoids per-chunk merge for non-auto-dict parallel parse |
@@ -753,7 +779,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 |---------|------|------|
 | Python stream | `dict[str, str]` | Single row (raw string values) |
 | Python columnar | `pyarrow.Table` | Full parsed dataset in Arrow format |
-| Python batchpipe | `Batch = namedtuple("Batch", "data, selection")` | Unit of flow: `RecordBatch` + optional boolean mask |
+| Python batchpipe | `Batch` (class with `__slots__`) | Unit of flow: `data` (`RecordBatch`) + optional boolean `selection` mask |
 | Python pipeline | `Pipeline` | Immutable composition of `source + stages` |
 | Python stage | `Callable[[Iterable[dict]], Iterable[dict]]` | Row transformation function |
 | Rust stream | `CrxmlReader` (PyClass) | Streaming XML parser |
@@ -762,7 +788,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | Rust columnar | `StrColumn` | Flat byte arena + `i32` offsets (Arrow layout) |
 | Rust columnar | `BuildPlan` | Compilation target for stage pushdown |
 | Rust columnar | `FilterPredicate` | Equal / NotEqual / Compare variants |
-| Rust splitter | — | `compute_splits` divides file into whole-row chunks |
+| Rust splitter | - | `compute_splits` divides file into whole-row chunks |
 
 ========================================================================
 PAGE: https://crxml.emiliano-go.com/changelog/
@@ -770,18 +796,45 @@ PAGE: https://crxml.emiliano-go.com/changelog/
 
 # Changelog
 
+## 1.0.0 (2026-07-06)
+
+### Bug Fixes
+
+- **auto_dict plan lost in parallel merge**: `ColumnarEngine::new()` defaulted to `auto_dict: false`, making `auto_dict_upgrade()` a no-op. Fixed by using `ColumnarEngine::with_plan(est, plan)` to carry the build plan forward.
+
+- **Text field parsing in bounded path**: The parser was capturing whitespace-only text nodes as field values instead of looking for `<TextValue>` children. Fixed to correctly consume `TextValue` inner text.
+
+- **Stream engine column discovery**: Engine used first-row columns as schema; sparse columns appearing only in later rows caused crashes. Schema is now discovered across all rows.
+
+- **Publishing workflow missing `columnar` feature**: `maturin build --features mmap` risked overriding pyproject.toml's feature list and silently dropping `columnar` from the published wheel. CI now builds from pyproject.toml defaults.
+
+### Features
+
+- **`prefault` parameter**: All engines accept `prefault: bool`. `True` = `MADV_WILLNEED` (speed), `False` = `MADV_SEQUENTIAL` (lower RSS). Defaults: True for columnar/parallel, False for bounded.
+
+- **Parallel engine profiling**: `get_par_profile()` returns nanosecond timing for split-scan, off-GIL parse, and on-GIL assembly phases (gated behind `profile` Cargo feature).
+
+- **Bounded mode RSS rewrite**: Mmap used only for initial split scan, then dropped. Chunks read via `File::seek`/`read_exact`. Peak RSS tracks the `memory=` budget, not the file size.
+
+- **`sort_columns()` on engine**: Ensures all batch engines produce identical column order for schema-match fast path in `concat_tables()`.
+
+### Performance
+
+- **Splitter SIMD optimization**: `next_row_start()` searches for `<tag` in one `memmem::find` pass instead of `memchr(b'<')` (24M iterations to 465k matches). Split phase 40% faster. Total parallel throughput improved 22% (327 to 472 MB/s on 533 MB real file).
+
+- **`find_special_regions()` single-pass**: Scans once for `b"<!"` prefix instead of two separate scans for `<!--` and `<![CDATA[`.
+
+- **`concat_tables()` schema fast path**: Skips `promote_options='default'` when schemas already match.
+
+### Chores
+
+- Build features (`columnar`, `mmap`) now enabled by default in pyproject.toml. `profile` remains opt-in.
+- Removed `--features mmap` from CI publishing workflow.
+- Added `docs/performance.md` with environment block, per-engine speed tables, memory decomposition, and throughput ceiling.
+- Correctness harness validates all engines against stream oracle across 29 test cases plus 465k-row real-file cross-check.
+- README restyled to match seoslug format: quick start first, narrative "why" section, comparison table, features table, framework support, `---` section rulers.
+
 ## 0.1.0 (2026-06-01)
-
-Initial release.
-
-- Rust parser via PyO3 (quick-xml streaming reader)
-- Pipeline API with `|` composition
-- Four built-in stages: RenameFields, CastTypes, DropFields, FilterRows
-- Parallel execution mode (ProcessPoolExecutor)
-
-- Sinks: to_dataframe, to_csv, collect
-- Schema inspection via `.schema()`
-- CR XML auto-detection (attribute vs element style)
 
 ========================================================================
 PAGE: https://crxml.emiliano-go.com/django/
@@ -1470,7 +1523,7 @@ pipe = (
         "{Report.Amount}": "amount",
     })
     | CastTypes({"amount": float})
-    | DropFields("{Report.TaxRate}")
+    | DropFields(["{Report.TaxRate}"])
 )
 
 for row in pipe:
@@ -1501,8 +1554,10 @@ PAGE: https://crxml.emiliano-go.com/
 
 # crxml
 
-Fast streaming parser for SAP Crystal Reports XML exports.
-Parse 100 MB in 0.42 seconds. RSS stays well below file size.
+High-performance Crystal Reports XML to Arrow/DataFrame engine for Python.
+Parse, filter, rename, cast, and project Crystal Reports XML directly into
+columnar data, with Rust execution, parallel parsing, bounded-memory
+processing, and automatic query fusion.
 
 ## Features
 
@@ -1590,106 +1645,196 @@ PAGE: https://crxml.emiliano-go.com/performance/
 
 # Performance
 
-Benchmarked on a 100 MB synthetic Crystal Reports XML file (90,384 rows,
-~10 fields/row) using a release build (`opt-level=3, lto=true`).
+## Environment
 
-All throughput numbers are averaged over 5 runs in fresh subprocesses (one
-Python process per measurement) to isolate page cache effects. Row count
-(90,384) is asserted inside each timed block so no measurement can silently
-return from cache.
+All measurements recorded on a single development machine:
 
-**Test machine:** 13th Gen Intel i5-1335U (12 cores), 15 GB RAM, Linux.
+| Component | Detail |
+|---|---|
+| **CPU** | 13th Gen Intel Core i5-1335U (10 cores: 2 P + 8 E, 12 threads) |
+| **L1d** | 352 KiB (10 instances) |
+| **L2** | 6.5 MiB (4 instances) |
+| **L3** | 12 MiB (1 instance) |
+| **RAM** | 15 GiB LPDDR5 (system-unknown speed) |
+| **OS** | Arch Linux, kernel 7.0.9-arch2-1 |
+| **Python** | 3.14.5 |
+| **pyarrow** | 24.0.0 |
+| **crxml** | 0.3.0 |
+| **Git SHA** | `bbc8a172` |
+| **Build** | release, LTO enabled, mimalloc allocator, features `columnar` + `mmap` + `profile` |
 
-## Native export (Rust-only, no Python dicts)
+All runs are **warm-cache** (one warmup parse, collection, then measured).  Each number is the best of 3 runs after variance stabilized.  Parallel-path variance was ~8% on the 533 MB file, stream-path variance ~15%.
 
-These call the columnar engine directly via Rust FFI and produce a
-`pyarrow.Table`. This is the fastest path when the goal is an Arrow table
-or DataFrame — no Python dicts are ever created.
+## Input files
 
-| Function | Time | Rows/s | MB/s |
-|----------|------|--------|------|
-| `read_to_columnar` (single-threaded) | 0.42s | 217 K | 252 |
-| `read_to_columnar_multi` (2 chunks) | 0.18s | 504 K | 585 |
-| `read_to_columnar_par` (12 threads) | **0.07s** | **1.26 M** | **1.46 G** |
+| File | Size | Rows | Fields/row | Origin |
+|---|---|---|---|---|
+| `test_10mb.xml` | 10 MB | 9,010 | 10 | Synthetic (`benchmarks/benchmarks.py`) |
+| `test_50mb.xml` | 50 MB | 45,328 | 10 | Synthetic |
+| `test_100mb.xml` | 100 MB | 90,384 | 10 | Synthetic |
+| `test_533mb.xml` | 533 MB | 465,136 | 11 | Real Crystal Reports export |
 
-## Source row iteration
+Synthetic files use uniform rows, every field present on every row, and low cardinality
+(most fields repeat).  These properties flatter parallel load balance and dictionary
+encoding, so synthetic numbers are **directional only**.  The 533 MB real export is the
+ground truth for all reported conclusions.
 
-`for row in source` yields `dict[str, str]`. The stream path uses a batched
-Rust reader with GIL release. Columnar/parallel iteration reconstructs dicts
-from Arrow tables and is slower — those engines exist for table output.
+Synthetic files have 10 columns (including `FieldG`, absent from the real export) with
+cardinalities ranging from 1 (`Level`, `Section`, `Text20`) through 15 (`Field38`,
+`Field39`) to near-unique (`Field22`: 8,965 / 9,010).
 
-| Engine | Time | Rows/s | MB/s |
-|--------|------|--------|------|
-| Stream | **0.50s** | **181 K** | 209 |
-| Columnar | 0.62s | 145 K | 160 |
-| Parallel | 0.46s | 196 K | 216 |
+### Field cardinality (real 533 MB file, 465,136 rows)
 
-## Arrow export
+Only 5 of 11 columns have high cardinality (≥1,000 distinct values);
+the other 6 are dictionary-encoding candidates.  Not every column appears in every row
+(`Field72` and `Text21` are sparse); the columnar engine discovers all distinct column
+names across all rows.
 
-`source.to_arrow()` returns a `pyarrow.Table`.
+| Column | Distinct values |
+|---|---|
+| `Level` | 1 |
+| `Section` | 1 |
+| `Text20` | 1 |
+| `Text21` | 1 |
+| `Field73` | 36 |
+| `Field72` | 8 |
+| `Field23` | 145 |
+| `Field38` | 1,528 |
+| `Field39` | 1,485 |
+| `Field61` | 1,406 |
+| `Field22` | 4,230 |
 
-| Engine | Time | Rows/s | MB/s |
-|--------|------|--------|------|
-| Stream | 0.50s | 180 K | 209 |
-| Columnar | 0.16s | 558 K | 647 |
-| Parallel | **0.05s** | **1.80 M** | **2.09 G** |
+## Speed: end-to-end `to_dataframe()` (the user's actual goal)
 
-## DataFrame export
+| Engine | 10 MB | 50 MB | 100 MB | 533 MB |
+|---|---|---|---|---|
+| **Stream** | 248 ms / 40 MB/s / 36k r/s | 1.35 s / 36 MB/s / 34k r/s | 2.27 s / 44 MB/s / 40k r/s | **12.8 s / 42 MB/s / 36k r/s** |
+| **Parallel** (8 workers) | 30 ms / 335 MB/s / 300k r/s | 124 ms / 402 MB/s / 365k r/s | 213 ms / 469 MB/s / 424k r/s | **1.13 s / 472 MB/s / 412k r/s** |
+| **Parallel + auto-dict** | 38 ms | 172 ms | 312 ms | **2.0 s / 267 MB/s** |
 
-`source.to_dataframe()` returns a `pd.DataFrame` with `pd.ArrowDtype`
-(zero-copy string columns).
+Key observations:
 
-| Engine | Time | Rows/s | MB/s |
-|--------|------|--------|------|
-| Stream | 0.55s | 163 K | 189 |
-| Columnar | 0.15s | 590 K | 684 |
-| Parallel | **0.04s** | **2.29 M** | **2.66 G** |
+- **Parallel throughput improves with file size** (335 → 472 MB/s) because split-scan and
+  worker startup are fixed costs that amortize.  The 533 MB number (472 MB/s) is the
+  asymptotic rate.
+- **Parallel is ~11× faster than stream** on the 533 MB real file.
+- **Auto-dict adds ~0.9 s of on-GIL overhead** at 533 MB (dictionary encoding happens
+  after the GIL is reacquired).  Use it only when downstream readers benefit from
+  dictionary-encoded Arrow columns.
 
-## Auto routing (recommended)
+## Parallel-path breakdown (533 MB real file)
 
-With `engine="auto"` (the default) the engine selection is **goal-aware**:
+| Phase | Time | % of wall | Notes |
+|---|---|---|---|
+| Split-scan (serial) | 257 ms | 23% | Two SIMD scans for `<tag` + special regions |
+| Off-GIL parse (N=8) | 781 ms | 69% | quick-xml event loop, unescape, field copy |
+| On-GIL assembly | 25 ms | 2% | Arrow table construction, GIL-held |
+| Profile coverage | - | 94% | Remaining 6% = Python overhead, GC, import |
 
-- **Row iteration** → always uses the stream (dict) path
-- **Arrow / DataFrame / collect** → routes to parallel (when available and
-  file >= 8 MB) or single-threaded columnar, bypassing the dict loop
-  entirely.
+This breakdown is the honest map of optimization headroom:
 
-This means `source.to_dataframe()` with auto routing runs at **~0.04s**
-(2.3 M rows/s) for files >= 8 MB, over **50x faster** than the original
-stream-based dict path. DataFrames use `pd.ArrowDtype` for zero-copy string
-columns by default.
+- **Parse (69%) is the ceiling.**  The parser tokenizes every XML element even when
+  the `BuildPlan` drops the field.  Skipping unwanted-field bytes is the remaining
+  high-leverage improvement.
+- **Split-scan (23%) is nearly free** after the `<tag` SIMD change.  Further wins here
+  are single-digit percentages.
+- **GIL assembly (2%) is a dead lever.**  Collapsing it further yields nothing.
 
-## Pipeline fusion
+## Engine selection guide (per goal)
 
-Fusable stages (`RenameFields`, `DropFields`, `CastTypes` with standard
-types) are compiled into the columnar `BuildPlan` and run in Rust during
-parsing. Non-fusable stages (lambdas, custom predicates) apply to dicts
-after Arrow conversion, or run through the vectorized batch chain.
-
-| Pipeline (4 stages) | Time vs dict-only | Speedup |
-|---------------------|-------------------|---------|
-| All fusable | ~same as bare columnar | ~3x vs dict pipeline |
-| Mixed (fusable + lambda) | columnar parse + lambda on dicts | ~2x vs dict pipeline |
+| If your goal is... | Use this engine | Because... |
+|---|---|---|
+| Fastest `to_dataframe()` | `engine="parallel"` | ~11× faster than stream; mmap + off-GIL parse |
+| Minimize peak memory | `engine="bounded"` | RSS tracks the `memory=` budget, not file size |
+| Stream rows one-by-one | Stream (default `CrxmlReader`) | Lowest latency to first row; no columnar overhead |
+| Dictionary-encoded columns | `engine="parallel"` with `auto_dict=True` | Encodes low-cardinality columns; ~0.9 s GIL tax |
 
 ## Memory
 
-| Scenario | RSS | Py objects |
-|----------|-----|------------|
-| Row iteration (stream) | ~430 MB | < 2 MB |
-| Native export (parallel) | ~420 MB | 0 MB |
-| DataFrame (parallel) | ~434 MB | < 3 MB |
+### Parallel (mmap): 533 MB file
 
-RSS is dominated by the 105 MB XML file buffered in page cache and the
-columnar engine's intermediate builders. Python heap usage is minimal.
+| Metric | Value |
+|---|---|
+| Peak RSS | 534 MB |
+| File in page cache | ~533 MB (mmap) |
+| Workload buffers | ~21 MB (columnar scratch + Arrow) |
+| Total allocations | 7,725 across 465,136 rows |
+| Largest single allocation | 533 MB (mmap) |
 
-## Recommendations
+The mmap path maps the file into virtual address space and pages it in on demand.
+The columnar engine's output buffers are the only additional allocation of consequence.
+7,725 allocations for 465k rows (~60 allocations/row) is extremely allocation-efficient.
 
-| Goal | Engine | Notes |
-|------|--------|-------|
-| Row iteration (`for row in source`) | `"auto"` -> stream | |
-| Arrow / DataFrame | `"auto"` -> parallel (>= 8 MB) or columnar | Fastest path |
-| Pipeline with fusable stages | `"auto"` -> columnar/parallel | Stages fused into BuildPlan |
-| Pipeline with lambdas | `"auto"` -> columnar + dict tail | Lambda overhead only |
+### Stream (BufReader): 533 MB file
+
+| Metric | Value |
+|---|---|
+| Peak RSS | ~1.07 GB |
+| Explanation | BufReader (128 KiB) + accumulating Python dicts (one per row) |
+
+The stream reader holds every parsed row as a Python dict until the consumer drains the
+iterator.  At 465k rows × ~11 columns, the dict overhead dominates.  Use the stream reader
+only when processing rows incrementally (e.g., writing to a file) rather than collecting
+them all.
+
+## Bounded-engine memory curve
+
+The bounded engine (`engine="bounded"`, `memory=`) controls peak RSS by splitting the
+file into chunks that fit within the budget.  Each chunk is parsed, converted to Arrow,
+and concatenated.  Concatenation cost grows as the number of chunks increases.
+
+*[TODO: insert table of wall time vs RSS vs memory= budget]*
+
+The bounded engine's key property: **peak RSS is independent of file size** once the
+file exceeds the budget.  A 10 GB file with `memory="500MB"` peaks at ~500 MB + fixed
+overhead, not 10 GB.
+
+## mmap vs fs::read
+
+| Aspect | mmap | fs::read |
+|---|---|---|
+| Time (warm cache) | Identical | Identical |
+| RSS (file ≤ RAM) | File appears in page cache | File copied into heap |
+| RSS (file > RAM) | Pages evicted under pressure | Heap holds the full copy |
+| Cold-cache startup | Page-fault-driven (first touch) | Sequential read-ahead |
+
+On warm cache the RSS delta is near zero because the kernel's page cache already holds
+the file.  The case for mmap is files near or exceeding physical RAM, where the OS can
+evict pages under memory pressure.  The case for `fs::read` is cold-cache streaming,
+where the kernel's read-ahead is more predictable than page faults.
+
+## Correctness
+
+Every performance measurement in this document is backed by a correctness cross-check:
+all three engines (stream, columnar, parallel) produce byte-identical field values
+against both the stream-oracle and against `xml.etree.ElementTree` on the synthetic
+corpus.  The parallel engine's row-split boundaries are validated by the splitter test
+suite (18 tests covering prefix collision, CDATA/comment skipping, fallback, and random
+input).  No engine cuts corners.
+
+## The ceiling
+
+At 472 MB/s on a machine with ~30 GB/s of memory bandwidth, this parser is
+**CPU-bound**, not bandwidth-bound.  The bottleneck is not moving bytes; it's
+tokenizing XML elements, unescaping entities, and copying field values.
+
+The breakdown says parse is 69% of wall time and the biggest sub-cost is the
+quick-xml event loop (tokenizing every `<Field>`, `<Text>`, `<FormattedValue>`,
+`<Value>`, `<TextValue>` child even when the field is dropped by the `BuildPlan`).
+The remaining high-leverage improvement is **skip-bytes-for-unwanted-fields**:
+detecting a dropped column name and memmem-skipping to `</Field>` or `</Text>`
+without tokenizing children.
+
+**Honest throughput ceiling for this codebase:**
+
+| CPU | Estimated ceiling (parallel) |
+|---|---|
+| i5-1335U (this machine) | ~500–550 MB/s |
+| Ryzen 7 5800X (desktop) | ~800 MB/s – 1.1 GB/s |
+
+2 GB/s would require a genuinely different parse strategy (a hand-rolled scanner
+for the fixed Crystal Reports XML structure that skips quick-xml's generality),
+which is a separate project, not a tuning pass.
 
 ========================================================================
 PAGE: https://crxml.emiliano-go.com/pipeline-fusion/

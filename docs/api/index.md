@@ -112,14 +112,42 @@ to_dataframe(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
 ## to_csv
 
 ```python
-to_csv(pipeline: Pipeline, path: str | Path, **csv_writer_kwargs) -> None
+to_csv(pipeline: Pipeline, path: str | Path, encoding: str = "utf-8",
+       delimiter: str = ",", fieldnames: list[str] | None = None) -> None
 ```
 
-| Param               | Type               | Default | Description                  |
-|---------------------|--------------------|---------|------------------------------|
-| `pipeline`          | `Pipeline`         |,       | Pipeline to consume          |
-| `path`              | `str \| Path`      |,       | Output CSV path              |
-| `**csv_writer_kwargs`| `Any`             |,       | Forwarded to `csv.writer`    |
+| Param        | Type               | Default | Description                                     |
+|--------------|--------------------|---------|------------------------------------------------|
+| `pipeline`   | `Pipeline`         |,       | Pipeline to consume                             |
+| `path`       | `str \| Path`      |,       | Output CSV path                                 |
+| `encoding`   | `str`              | `"utf-8"` | Output file encoding                          |
+| `delimiter`  | `str`              | `","`   | Field separator                                 |
+| `fieldnames` | `list[str] \| None`| `None`  | Explicit header; defaults to first record's keys |
+
+The header comes from the first record unless `fieldnames` is given. CR
+exports are ragged: fields that appear later but are missing from the
+header are omitted, and a `UserWarning` names them (once per field). Pass
+a `fieldnames` union to include them. Fields missing from a record are
+written as empty strings.
+
+## Exceptions
+
+Typed exceptions from the Rust core, importable from `crxml`:
+
+| Exception    | Raised when                                                        |
+|--------------|--------------------------------------------------------------------|
+| `XmlError`   | Input cannot be parsed (malformed XML, failed UTF-8 validation)     |
+| `PlanError`  | Invalid pushdown plan kwargs (unknown op, unknown field type)       |
+| `MergeError` | Chunk merge conflict during multi-chunk/parallel/bounded parsing    |
+
+```python
+from crxml import CrystalXMLSource, XmlError
+
+try:
+    CrystalXMLSource("export.xml").to_pandas()
+except XmlError as e:
+    print(f"bad input: {e}")
+```
 
 ## collect
 

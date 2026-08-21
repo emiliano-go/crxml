@@ -3,7 +3,7 @@ from typing import Iterable, Iterator, Callable
 Stage = Callable[[Iterable[dict]], Iterable[dict]]
 
 class Pipeline:
-    __slots__ = ("_source", "_stages", "_batch_size", "_prefetch", "_workers")
+    __slots__ = ("_source", "_stages", "_batch_size", "_workers")
 
     def __init__(
         self,
@@ -11,13 +11,11 @@ class Pipeline:
         stages: list[Stage] | None = None,
         *,
         batch_size: int = 1000,
-        prefetch: bool = False,
         workers: int | None = None,
     ):
         self._source = source
         self._stages = stages or []
         self._batch_size = batch_size
-        self._prefetch = prefetch
         self._workers = workers
 
     def __or__(self, stage: Stage) -> "Pipeline":
@@ -25,7 +23,6 @@ class Pipeline:
             self._source,
             [*self._stages, stage],
             batch_size=self._batch_size,
-            prefetch=self._prefetch,
             workers=self._workers,
         )
 
@@ -46,7 +43,7 @@ class Pipeline:
         """Run the whole pipeline as a batch chain to one pyarrow Table.
 
         Returns None when this pipeline cannot short-circuit to a table
-        (worker mode, non-columnar source, or trailing stateful stages) —
+        (worker mode, non-columnar source, or trailing stateful stages);
         callers then fall back to the dict stream.
         """
         if self._workers:
@@ -71,6 +68,5 @@ class Pipeline:
             self._source,
             self._stages,
             batch_size=batch_size,
-            prefetch=self._prefetch,
             workers=workers,
         )

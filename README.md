@@ -9,7 +9,12 @@
 </p>
 
 <p align="center">
-  <strong>Fast streaming parser for Crystal Reports XML exports.</strong>
+  <strong>High-performance Crystal Reports XML → Arrow/DataFrame engine for Python.</strong>
+</p>
+<p align="center">
+  Parse, filter, rename, cast, and project Crystal Reports XML directly into<br/>
+  columnar data, with Rust execution, parallel parsing, bounded-memory<br/>
+  processing, and automatic query fusion.
 </p>
 
 <p align="center">
@@ -89,6 +94,10 @@ crxml skips the nesting:
 | Peak RSS | ~1.07 GB | ~534 MB (file size, mmap) |
 | Pipeline fusion | No (dict path) | Yes (Rust BuildPlan) |
 
+The stream engine materializes one dict per row: fully consuming a large
+file costs roughly 10x its size in memory (~1 GB RSS for a 100 MB file).
+Use it for incremental processing; use table sinks for collection.
+
 For files larger than RAM, add `memory="500MB"` to any engine for bounded mode:
 peak RSS tracks the budget, not the file.
 
@@ -148,6 +157,16 @@ Pass `engine=` explicitly, or let `auto` select the best engine per call.
 | **Pandas / Polars** | `source.to_dataframe()` / `source.to_polars()` for zero-copy analysis |
 | **Airflow / Prefect** | Parse in task, write to parquet with `source.to_parquet()` |
 | **CLI / ETL scripts** | Use `to_csv()` sink or iterate rows for line-by-line processing |
+
+---
+
+## Limitations
+
+- **UTF-8 input only.** UTF-16 exports (which Crystal Reports can produce) fail validation; convert first.
+- **No compressed input.** `.gz`/`.zst` files must be decompressed before parsing.
+- **Crystal Reports grammar, not general XML.** The flat-row model fits CR exports; arbitrary XML documents are out of scope.
+- **Linux-tuned performance.** madvise hints and thread-count ratios were measured on Linux; other platforms work but are untested territory.
+- **No async API.** Row iteration is synchronous.
 
 ---
 

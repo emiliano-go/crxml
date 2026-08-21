@@ -152,7 +152,7 @@ def test_parser_matches_oracle(name, data):
     oracle = _oracle_parse(data)
     oracle_filled = _null_fill(oracle)
 
-    _, tbl = _core._test_parse_both(list(data), row_tag="Row")
+    tbl = _core._test_parse_both(list(data), row_tag="Row")
     assert tbl is not None, f"parser returned None for {name}"
     rows = [dict(r) for r in tbl.to_pylist()]
     assert rows == oracle_filled, f"parser mismatch for {name}"

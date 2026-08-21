@@ -1,7 +1,7 @@
 """Vectorized batch pipeline: a pull-based chain of operators over Arrow
 RecordBatches (Volcano structure, X100 granularity).
 
-The unit that flows is a :class:`Batch` — a dense ``pyarrow.RecordBatch``
+The unit that flows is a :class:`Batch`, a dense ``pyarrow.RecordBatch``
 plus an optional boolean selection mask. Filters only AND into the mask;
 rows are physically dropped (the batch is compacted) at a pipeline breaker
 or a sink, never in between.
@@ -9,7 +9,7 @@ or a sink, never in between.
 Parallelism lives at the parse stage only (rayon inside the Rust core, GIL
 released). This chain runs on the consumer thread, pull-based.
 
-Selection representation: boolean mask, not an index vector — pyarrow
+Selection representation: boolean mask, not an index vector; pyarrow
 compute produces masks natively and ``RecordBatch.filter`` consumes them
 without conversion.
 """
@@ -194,17 +194,47 @@ class LambdaOp(Operator):
 
     Skips upstream batches that filter down to nothing rather than emitting
     empty batches.
+
+    The output schema is pinned from the first emitted batch; later batches
+    must keep the same key set (missing keys become null, extra keys raise).
     """
 
-    __slots__ = ("_upstream", "_applies")
+    __slots__ = ("_upstream", "_applies", "_schema", "_names")
 
     def __init__(self, upstream: Operator, applies):
         self._upstream = upstream
         self._applies = applies
+        self._schema = None
+        self._names = None
 
-    def next_batch(self) -> Optional[Batch]:
+    def _build(self, rows):
         import pyarrow as pa
 
+        if self._schema is None:
+            rb = pa.RecordBatch.from_pylist(rows)
+            self._schema = rb.schema
+            self._names = frozenset(rb.schema.names)
+            return rb
+        unknown = sorted({k for r in rows for k in r} - self._names)
+        if unknown:
+            raise ValueError(
+                f".apply stage produced field(s) {unknown} not present in "
+                f"earlier batches; outputs must keep a stable key set "
+                f"(expected {sorted(self._names)})"
+            )
+        try:
+            columns = [
+                pa.array([r.get(name) for r in rows], type=field.type)
+                for name, field in zip(self._schema.names, self._schema)
+            ]
+        except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
+            raise ValueError(
+                f".apply stage output no longer matches its earlier schema "
+                f"{self._schema.names}: {e}"
+            ) from e
+        return pa.RecordBatch.from_arrays(columns, schema=self._schema)
+
+    def next_batch(self) -> Optional[Batch]:
         while True:
             b = self._upstream.next_batch()
             if b is None:
@@ -219,7 +249,7 @@ class LambdaOp(Operator):
                 else:
                     out.append(r)
             if out:
-                return Batch(pa.RecordBatch.from_pylist(out))
+                return Batch(self._build(out))
 
 
 def build_chain(table, stages, batch_size: int = 1024):

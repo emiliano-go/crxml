@@ -169,7 +169,7 @@ def generate_file(target_mb: int, path: Path):
         f.write(tail_bytes)
 
     actual = os.path.getsize(path) / 1024 / 1024
-    print(f"\n  Done: {path.name} — {actual:.1f} MB, {count} invoice groups")
+    print(f"\n  Done: {path.name} | {actual:.1f} MB, {count} invoice groups")
     return actual
 
 

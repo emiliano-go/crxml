@@ -1,8 +1,9 @@
 [package]
 name = "crxml-core"
-version = "0.2.0"
+# Keep in sync with the crxml Python package version (pyproject.toml)
+version = "1.1.0"
 edition = "2021"
-description = "Fast streaming Crystal Reports XML parser for Python"
+description = "High-performance Crystal Reports XML to Arrow/DataFrame engine for Python"
 license = "MIT"
 repository = "https://github.com/emiliano-go/crxml"
 authors = ["Emiliano Gandini <emiliano.gandini@protonmail.com>"]
@@ -33,6 +34,8 @@ lexical = "7"
 rustc-hash = "2"
 rayon = { version = "1", optional = true }
 memmap2 = { version = "0.9", optional = true }
+# Pinned exactly: the Arrow C Data Interface (FFI_ArrowSchema) is not
+# stable across minor versions; bump only after testing both directions.
 arrow = { version = "=55.2.0", default-features = false, features = ["pyarrow"], optional = true }
 
 # Fast allocator: replaces the Windows system heap for all Rust-side

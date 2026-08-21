@@ -66,6 +66,31 @@ class TestOracleEquivalence:
             [CastTypes({"age": int}), FilterRows(lambda r: r["age"] > 28)]
         )
 
+    def test_lambda_schema_pinned_across_batches(self):
+        """A .apply stage that drops keys on later rows must keep the
+        pinned schema (missing keys become null), not shrink columns."""
+
+        class DropCityOnBob:
+            def apply(self, r):
+                if r["name"] == "Bob":
+                    return {k: v for k, v in r.items() if k != "city"}
+                return r
+
+        got = run_chain([DropCityOnBob()], batch_size=1)
+        assert all("city" in r for r in got)
+        assert got[0]["city"] == "NYC"
+        assert got[1]["city"] is None
+
+    def test_lambda_new_key_raises_clear_error(self):
+        class AddExtraOnDan:
+            def apply(self, r):
+                if r["name"] == "Dan":
+                    return {**r, "extra": "x"}
+                return r
+
+        with pytest.raises(ValueError, match="stable key set"):
+            run_chain([AddExtraOnDan()], batch_size=1)
+
     def test_mixed_fused_and_fallback(self):
         stages = [
             RenameFields({"age": "years"}),

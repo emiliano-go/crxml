@@ -93,7 +93,7 @@ impl BuildPlan {
     /// Resolve a raw field name to its output column name.
     /// Returns `None` if the field should be dropped.
     ///
-    /// Application order: rename first, then drop — matching left-to-right
+    /// Application order: rename first, then drop, matching left-to-right
     /// pipeline semantics (a rename changes the field name before the drop
     /// check, so a drop targets the renamed name, not the original).
     pub fn resolve_field<'a>(&'a self, raw: &'a str) -> Option<&'a str> {
@@ -350,7 +350,7 @@ impl ColumnBuilder {
         }
     }
 
-    /// Push a borrowed str — avoids `into_owned()` allocation for
+    /// Push a borrowed str: avoids `into_owned()` allocation for
     /// typed columns that parse and discard the string.
     fn push_str(&mut self, value: Option<&str>) {
         match self {
@@ -407,7 +407,7 @@ impl ColumnBuilder {
         }
     }
 
-    /// Merge all values from `other` into `self`, consuming `other` — values
+    /// Merge all values from `other` into `self`, consuming `other`; values
     /// are moved (Vec::append), never cloned. Both must be the same variant.
     /// Returns `Err` if the two builders are different variants.
     fn extend_owned(&mut self, other: ColumnBuilder) -> Result<(), String> {
@@ -528,7 +528,7 @@ impl ColumnBuilder {
     }
 }
 
-/// Bytes are chunk-validated UTF-8 (see `parse_bytes` entry) — skip
+/// Bytes are chunk-validated UTF-8 (see `parse_bytes` entry); skip
 /// std's per-call revalidation.
 #[allow(unsafe_code)]
 #[inline]
@@ -537,7 +537,7 @@ fn utf8_unchecked(b: &[u8]) -> &str {
 }
 
 /// Attribute value without revalidation; unescapes only when an entity is
-/// actually present (memchr probe — CR values almost never contain `&`).
+/// actually present (memchr probe: CR values almost never contain `&`).
 fn attr_value<'v>(
     attr: &quick_xml::events::attributes::Attribute<'v>,
 ) -> Result<std::borrow::Cow<'v, str>, String> {
@@ -727,11 +727,11 @@ impl ColumnarEngine {
         }
     }
 
-    /// Push a borrowed str — the builder owns the value only when its
+    /// Push a borrowed str: the builder owns the value only when its
     /// storage requires it (String copies; Dictionary allocs only for new
     /// dictionary entries; typed columns parse and never allocate).
     fn push_field_str(&mut self, name: &str, value: Option<&str>) {
-        // Fast path: no rename/drop configured — skip the plan lookup and
+        // Fast path: no rename/drop configured; skip the plan lookup and
         // the owned copy it needs to break the borrow on self.plan.
         let owned;
         let resolved: &str = if self.plan.field_map.is_empty() && self.plan.drop_fields.is_empty() {
@@ -1229,9 +1229,10 @@ impl ColumnarEngine {
                                                 _ => {}
                                             }
                                         }
-                                        if !text.is_empty() {
-                                            self.push_field(&name, Some(text));
-                                        }
+                                        // Push even when empty: an empty element
+                                        // still means "field present" (empty
+                                        // string), matching the stream engine.
+                                        self.push_field(&name, Some(text));
                                     }
                                 } else if tag == b"Section" {
                                     let sn = c
@@ -1277,8 +1278,9 @@ impl ColumnarEngine {
         //    (null-padded for self's existing rows, no values copied yet)
         //    Use other's plan for type information (self may have BuildPlan::new()).
         //    Respect schema_order for insertion position.
+        let have: HashSet<String> = self.column_order.iter().cloned().collect();
         for name in &other.column_order {
-            if !self.column_order.contains(name) {
+            if !have.contains(name) {
                 let est = self_rows + other.estimated_rows.max(64);
                 let col_type = other.plan.column_type(name);
                 let mut builder = ColumnBuilder::with_capacity(est, &col_type);
@@ -1408,7 +1410,7 @@ impl ColumnarEngine {
 /// merge-then-re-copy of every value that `extend` + `to_pyarrow_table` does.
 ///
 /// Not valid with `auto_dict` (per-chunk upgrades could disagree on the
-/// column datatype) — callers must fall back to the merge path there.
+/// column datatype); callers must fall back to the merge path there.
 pub fn engines_to_pyarrow_table(
     mut engines: Vec<ColumnarEngine>,
     plan: &BuildPlan,
@@ -1543,7 +1545,7 @@ mod tests {
 
     #[test]
     fn test_multi_chunk_with_parent_elements() {
-        // File has <Group> wrapping some rows — chunk 2 starts mid-Group
+        // File has <Group> wrapping some rows; chunk 2 starts mid-Group
         let xml = b"<Root><Group><Details Level=\"3\"><A>1</A></Details><Details Level=\"3\"><A>2</A></Details></Group><Details Level=\"3\"><A>3</A></Details></Root>";
         let mut single = ColumnarEngine::new();
         single.parse_bytes(xml, b"Details").unwrap();
@@ -1787,7 +1789,7 @@ mod tests {
     // ── Ground-truth oracle (independent of columnar storage) ──────────────
 
     /// Walk raw XML bytes and extract row-major key-value pairs.
-    /// Shares no code with `ColumnarEngine` — used as an independent reference
+    /// Shares no code with `ColumnarEngine`; used as an independent reference
     /// for multi-chunk / parallel test assertions.
     fn row_values_reference(bytes: &[u8], row_tag: &[u8]) -> Vec<std::collections::HashMap<String, String>> {
         use quick_xml::events::{BytesStart, Event};

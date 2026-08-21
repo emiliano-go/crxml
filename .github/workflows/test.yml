@@ -8,10 +8,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -21,41 +26,51 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libxml2-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and install (testing feature, includes columnar)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
+        run: |
+          pip install maturin pytest pyarrow pandas polars
+          maturin build --features testing,mmap --out /tmp/wheels -i python
+          pip install /tmp/wheels/crxml-*.whl
+
+      - name: Run full suite (including hardening harness)
+        run: |
+          python -m pytest tests/ -v --tb=short -x
+
+      - name: Run benchmarks
+        if: github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
+        run: |
+          python -m pytest tests/ --run-bench -v --tb=short
+
+  default-features:
+    # Feature-gating check: the plain build (no columnar/testing) must
+    # still compile and pass the stream-engine tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build and install with default features
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         run: |
-          pip install maturin
+          pip install maturin pytest pyarrow pandas polars
           maturin build --features mmap --out /tmp/wheels -i python
           pip install /tmp/wheels/crxml-*.whl
-          pip install pytest pyarrow pandas polars
 
       - name: Run test suite (default features)
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         run: |
           python -m pytest tests/ -v --tb=short -x -k "not hardening and not columnar_export"
-
-      - name: Build and install with testing feature
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
-        run: |
-          maturin build --features testing,mmap --out /tmp/wheels -i python
-          pip install /tmp/wheels/crxml-*.whl
-          pip install pytest pyarrow pandas polars
-
-      - name: Run full suite (including hardening harness)
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
-        run: |
-          python -m pytest tests/ -v --tb=short -x
-
-      - name: Run benchmarks
-        if: github.ref == 'refs/heads/main'
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
-        run: |
-          python -m pytest tests/ --run-bench -v --tb=short

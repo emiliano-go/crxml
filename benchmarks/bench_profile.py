@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase 0 profiling — emit bench_results/<sha>.json with measured breakdown.
+Phase 0 profiling: emit bench_results/<sha>.json with measured breakdown.
 
 Usage (profile build required):
     pip install -e . --config-settings=--features=profile
     python bench_profile.py
 
 Output:
-    bench_results/<git-sha>.json   — per-file profile data
-    bench_results/latest.json      — symlink to most recent run
+    bench_results/<git-sha>.json:   per-file profile data
+    bench_results/latest.json:      symlink to most recent run
 """
 
 import json
@@ -205,7 +205,7 @@ def main():
 
         results["files"][label] = {"stream": data, "parallel": par}
 
-    results["pyspy"] = {"note": "skipped — install py-spy and uncomment in source"}
+    results["pyspy"] = {"note": "skipped; install py-spy and uncomment in source"}
 
     output_path = BENCH_RESULTS / f"{sha}.json"
     with open(output_path, "w") as f:

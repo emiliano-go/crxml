@@ -1,4 +1,5 @@
 import csv
+import warnings
 from pathlib import Path
 from typing import Iterable
 
@@ -34,7 +35,17 @@ def to_csv(
     path: str | Path,
     encoding: str = "utf-8",
     delimiter: str = ",",
+    fieldnames: list[str] | None = None,
 ) -> None:
+    """Stream records to CSV.
+
+    The header comes from ``fieldnames`` if given, else from the first
+    record.  CR exports are ragged: rows may carry fields the header does
+    not know about.  Such fields are omitted from the output and a
+    ``UserWarning`` names them (once per field) instead of dropping them
+    silently; pass an explicit ``fieldnames`` union to include them.
+    Fields missing from a record are written as empty strings.
+    """
     path = Path(path)
     stream = iter(pipeline)
     try:
@@ -43,14 +54,29 @@ def to_csv(
         with open(path, "w", encoding=encoding) as f:
             pass
         return
+    if fieldnames is None:
+        fieldnames = [*first]
+    known = set(fieldnames)
+    warned: set[str] = set()
     with open(path, "w", encoding=encoding, newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=[*first], delimiter=delimiter,
+            f, fieldnames=fieldnames, delimiter=delimiter,
             extrasaction='ignore'
         )
         writer.writeheader()
         writer.writerow(first)
-        writer.writerows(stream)
+        for record in stream:
+            fresh = {k for k in record if k not in known} - warned
+            if fresh:
+                warned |= fresh
+                warnings.warn(
+                    f"to_csv: field(s) {sorted(fresh)!r} are not in the CSV "
+                    f"header and will be omitted; pass fieldnames= to "
+                    f"include them",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            writer.writerow(record)
 
 def collect(pipeline: Iterable[dict]) -> list[dict]:
     if hasattr(pipeline, "_to_arrow"):
