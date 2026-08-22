@@ -14,29 +14,19 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
-# Columnar engine: build typed arrays in Rust, export via PyArrow
-columnar = ["dep:rayon", "dep:arrow"]
-# Memory-map input files (carries the only unsafe in the crate)
-mmap = ["dep:memmap2"]
 profile = []
-# Testing helpers (implies columnar)
-testing = ["columnar"]
+testing = []
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 quick-xml = "0.36"
-memchr = "2"
-
-# SIMD UTF-8 validation: chunks are validated once up front so the parse
-# path can use from_utf8_unchecked instead of revalidating per value
-simdutf8 = "0.1"
-lexical = "7"
 rustc-hash = "2"
-rayon = { version = "1", optional = true }
-memmap2 = { version = "0.9", optional = true }
 # Pinned exactly: the Arrow C Data Interface (FFI_ArrowSchema) is not
 # stable across minor versions; bump only after testing both directions.
-arrow = { version = "=55.2.0", default-features = false, features = ["pyarrow"], optional = true }
+arrow = { version = "=55.2.0", default-features = false, features = ["pyarrow"] }
+
+rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
+rypipe-xml = { path = "../../../rypipe/crates/rypipe-xml" }
 
 # Fast allocator: replaces the Windows system heap for all Rust-side
 # allocations (profiling showed ~27% of CPU in RtlAllocateHeap/malloc)
