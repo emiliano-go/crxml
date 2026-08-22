@@ -79,8 +79,8 @@ crxml validates picklability at pipeline construction time and raises
 ## Columnar plan fusion
 
 For maximum performance, a stage can implement `_plan_kwargs(self) -> dict | None`.
-When this method returns a dict, the stage is compiled into the Rust columnar
-engine's `BuildPlan` and runs during XML parsing, before any Python dict is
+When this method returns a dict, the stage is compiled into the engine's
+`ExecutionPlan` and runs during XML parsing, before any Python dict is
 created. This bypasses Python entirely for that stage.
 
 Built-in stages that support columnar plan fusion:
@@ -115,7 +115,7 @@ class DropFieldsIfEmpty:
 Notes:
 
 - `_plan_kwargs` is only called by `CrystalXMLSource` objects that support the
-  columnar engine (requires the `columnar` feature).
+  columnar engine.
 - If `_plan_kwargs` returns `None`, the stage is treated as a regular fusable
   stage (dict-level fusion).
 - Non-fusable stages in the pipeline are always applied as Python generators

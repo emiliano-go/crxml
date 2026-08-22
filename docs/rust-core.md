@@ -8,10 +8,20 @@ The native accelerator is a PyO3 crate at `src/crxml_core/`.
 src/crxml_core/
 ├── Cargo.toml
 └── src/
-    └── lib.rs          # CrxmlReader class
+    └── lib.rs          # CrxmlReader class + thin columnar FFI wrappers
 ```
 
-### `CrxmlReader`
+### `lib.rs`: streaming engine and columnar wrappers
+
+`lib.rs` now contains two parts:
+
+1. **`CrxmlReader`**: the streaming XML parser (remains in crxml).
+2. **Thin columnar FFI wrappers**: `#[pyfunction]` entry points (`read_to_columnar`,
+   `read_to_columnar_multi`, `read_to_columnar_par`, `read_to_columnar_bounded`) that
+   build an `rypipe_core::ExecutionPlan` and delegate parsing to `rypipe-core` /
+   `rypipe-xml`.
+
+#### `CrxmlReader`
 
 A single Python-exposed class:
 
@@ -33,13 +43,14 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 
 ## Dependencies
 
-| Crate       | Purpose                        |
-|-------------|--------------------------------|
-| `pyo3`      | Python bindings                |
-| `quick-xml` | Streaming XML reader           |
-| `simdutf8`  | SIMD-accelerated UTF-8 validation for parse chunks |
-| `memchr`    | Fast byte searching (direct dependency, also used by quick-xml) |
-| `mimalloc`  | Fast allocator (replaces system malloc, ~27% CPU savings) |
+| Crate        | Purpose                        |
+|--------------|--------------------------------|
+| `pyo3`       | Python bindings                |
+| `quick-xml`  | Streaming XML reader           |
+| `arrow`      | Arrow C Data Interface export  |
+| `mimalloc`   | Fast allocator (replaces system malloc, ~27% CPU savings) |
+| `rypipe-core`| Generic columnar/parallel/bounded engine (path dependency) |
+| `rypipe-xml` | Crystal Reports XML decoder/splitter (path dependency) |
 
 ## Building
 
@@ -69,20 +80,19 @@ manifest-path = "src/crxml_core/Cargo.toml"
 ## Testing
 
 ```bash
-# Rust unit tests
+# Rust unit tests (streaming engine)
 cargo test --manifest-path src/crxml_core/Cargo.toml
 
-# Integration via Python
-python -c "from crxml._crxml_core import CrxmlReader; r = CrxmlReader('test.xml', 'Details'); print(next(r))"
+# Columnar / parallel / bounded paths are exercised through Python/pytest
+pytest
 ```
 
 ## Security
 
-- **Unsafe denied by default** (`#![deny(unsafe_code)]`). Two `unsafe`
-  blocks guarded by `#[allow(unsafe_code)]` handle `Mmap::map` (mmap I/O)
-  and `from_utf8_unchecked` (SIMD-validated UTF-8). The
-  `_PyDict_NewPresized` private-CAPI call was removed after benchmarking
-  showed only a 3.5% overall gain.
+- **Unsafe denied by default** (`#![deny(unsafe_code)]`) in crxml itself.
+  The remaining `unsafe` blocks for mmap I/O and SIMD-validated UTF-8 live in
+  the `rypipe` workspace. The `_PyDict_NewPresized` private-CAPI call was
+  removed after benchmarking showed only a 3.5% overall gain.
 - **Input validation**, XML is assumed trusted (users control their source
   files). Buffer sizes are managed by quick-xml.
 - **Buffer limits**, individual field values are bounded by the XML entity

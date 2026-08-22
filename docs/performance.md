@@ -16,7 +16,7 @@ All measurements recorded on a single development machine:
 | **pyarrow** | 24.0.0 |
 | **crxml** | 0.3.0 |
 | **Git SHA** | `bbc8a172` |
-| **Build** | release, LTO enabled, mimalloc allocator, features `columnar` + `mmap` + `profile` |
+| **Build** | release, LTO enabled, mimalloc allocator, feature `profile` |
 
 All runs are **warm-cache** (one warmup parse, collection, then measured).  Each number is the best of 3 runs after variance stabilized.  Parallel-path variance was ~8% on the 533 MB file, stream-path variance ~15%.
 
@@ -42,7 +42,7 @@ cardinalities ranging from 1 (`Level`, `Section`, `Text20`) through 15 (`Field38
 
 Only 5 of 11 columns have high cardinality (≥1,000 distinct values);
 the other 6 are dictionary-encoding candidates.  Not every column appears in every row
-(`Field72` and `Text21` are sparse); the columnar engine discovers all distinct column
+(`Field72` and `Text21` are sparse); the rypipe engine discovers all distinct column
 names across all rows.
 
 | Column | Distinct values |
@@ -89,7 +89,7 @@ Key observations:
 This breakdown is the honest map of optimization headroom:
 
 - **Parse (69%) is the ceiling.**  The parser tokenizes every XML element even when
-  the `BuildPlan` drops the field.  Skipping unwanted-field bytes is the remaining
+  the `ExecutionPlan` drops the field.  Skipping unwanted-field bytes is the remaining
   high-leverage improvement.
 - **Split-scan (23%) is nearly free** after the `<tag` SIMD change.  Further wins here
   are single-digit percentages.
@@ -117,7 +117,7 @@ This breakdown is the honest map of optimization headroom:
 | Largest single allocation | 533 MB (mmap) |
 
 The mmap path maps the file into virtual address space and pages it in on demand.
-The columnar engine's output buffers are the only additional allocation of consequence.
+The rypipe engine's output buffers are the only additional allocation of consequence.
 7,725 allocations for 465k rows (~60 allocations/row) is extremely allocation-efficient.
 
 ### Stream (BufReader): 533 MB file
@@ -175,7 +175,7 @@ tokenizing XML elements, unescaping entities, and copying field values.
 
 The breakdown says parse is 69% of wall time and the biggest sub-cost is the
 quick-xml event loop (tokenizing every `<Field>`, `<Text>`, `<FormattedValue>`,
-`<Value>`, `<TextValue>` child even when the field is dropped by the `BuildPlan`).
+`<Value>`, `<TextValue>` child even when the field is dropped by the `ExecutionPlan`).
 The remaining high-leverage improvement is **skip-bytes-for-unwanted-fields**:
 detecting a dropped column name and memmem-skipping to `</Field>` or `</Text>`
 without tokenizing children.

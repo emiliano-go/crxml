@@ -2,24 +2,24 @@
 
 ## Overview
 
-crxml is a fast XML-to-DataFrame pipeline that uses a Rust core for parsing and a Python layer for pipeline composition. The key architectural insight is **fusion**: each stage of a pipeline can be compiled down into the Rust columnar engine, executed as a vectorized batch operation on Arrow arrays, or fused into a tight dict loop, depending on what the stages support.
+crxml is a fast XML-to-DataFrame pipeline that uses a Rust core for parsing and a Python layer for pipeline composition. The key architectural insight is **fusion**: each stage of a pipeline can be compiled down into the Rust rypipe engine, executed as a vectorized batch operation on Arrow arrays, or fused into a tight dict loop, depending on what the stages support.
 
 ### Fusion levels
 
 The three fusion levels are tried in priority order:
 
-1. **Columnar fusion** (Layer A): compile stages into the Rust `BuildPlan`, eliminating row iteration entirely. Stages with `_plan_kwargs()` produce a merged kwargs dict passed to `read_to_columnar*`. Remaining stages run through the batchpipe chain over Arrow `RecordBatch` objects.
+1. **Columnar fusion** (Layer A): compile stages into the Rust `ExecutionPlan`, eliminating row iteration entirely. Stages with `_plan_kwargs()` produce a merged kwargs dict passed to `read_to_columnar*`. Remaining stages run through the batchpipe chain over Arrow `RecordBatch` objects.
 2. **Vectorized batch fusion**: arrow-fusable stages (rename, drop, declarative filter) compile to `Callable[[Batch], Batch]` functions clustered into a single-pass `FusedTransforms` operator. Row-local `.apply` stages cluster into `LambdaOp`. Trailing stateful generators wrap the dict stream.
 3. **Dict fusion** (Layer B): a contiguous run of `.apply` stages is fused into one tight `for r in src: for fn in bound: ...` loop.
 
 These stack: columnar pushdown is tried first; if it succeeds, the remaining stages run through the batchpipe; any trailing stateful stages wrap the dict stream. If columnar fusion isn't possible (source lacks `_read_arrow`, or no stage produces `_plan_kwargs`), the system falls back to dict fusion only.
 
 ```
-XML bytes ──► Rust engine ──► Arrow Table ──► batchpipe chain ──► sink
+XML bytes ──► rypipe engine (via crxml wrapper) ──► Arrow Table ──► batchpipe chain ──► sink
 
-The Rust engine has three modes:
+The engine has three modes:
   stream:    row-by-row via CrxmlReader (GIL-released batching)
-  columnar:  single-threaded columnar parse with BuildPlan pushdown
+  columnar:  single-threaded columnar parse with ExecutionPlan pushdown
   parallel:  chunked + rayon parallel columnar parse
 ```
 
@@ -32,15 +32,15 @@ XML file
   │     │
   │     └─► list[dict[str,str]] ──► Pipeline stages ──► sink
   │
-  ├─► columnar engine: ColumnarEngine.parse_bytes()
+  ├─► columnar engine: rypipe_core::TableBuilder via crxml wrapper
   │     │
-  │     ├─► simdutf8 validation (one SIMD pass)
+  │     ├─► simdutf8 validation (one SIMD pass) in rypipe_xml::CrystalXmlDecoder
   │     ├─► borrowed-slice quick-xml reader (zero-copy events)
   │     │
   │     ├─► ColumnBuilder columns ──► finish_row (null-fill, filter)
-  │     │     └─► extend (merge across chunks for multi/parallel)
+  │     │     └─► TableBuilder::extend (merge across chunks for multi/parallel)
   │     │
-  │     └─► to_pyarrow_table / engines_to_pyarrow_table
+  │     └─► RecordBatch export / engines_to_record_batches
   │           │
   │           └─► Arrow C Data Interface ──► pyarrow.Table
   │                 │
@@ -49,24 +49,32 @@ XML file
   │                 │     ├─► iter_dicts() or collect_table()
   │                 │     └─► trailing stateful stages wrap stream
   │                 │
-  │                 ├─► Compare filter: apply_pyarrow() via pyarrow.compute
+  │                 ├─► Compare filter: arrow::compute kernels (pure Rust)
   │                 │
   │                 └─► sinks: to_dataframe / to_csv / collect / to_polars / to_parquet
   │
-  └─► parallel engine: splitter.compute_splits() + rayon::par_iter()
+  └─► parallel engine: rypipe_xml::CrystalXmlSplitter + rypipe_core::ParallelExecutor
         │
-        ├─► fast path (no auto_dict): per-chunk engines exported independently
-        │     └─► engines_to_pyarrow_table() → per-chunk RecordBatch → concat
+        ├─► fast path (no auto_dict): per-chunk TableBuilders exported independently
+        │     └─► engines_to_record_batches() → per-chunk RecordBatch → concat
         │
-        └─► merge path (auto_dict): engines merged → auto_dict_upgrade → export
-              └─► ColumnarEngine.extend() → to_pyarrow_table()
+        └─► merge path (auto_dict): TableBuilders merged → auto_dict_upgrade → export
+              └─► TableBuilder::extend() → RecordBatch
 ```
 
 ## Rust core (`crxml_core`)
 
-The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator (profiling showed ~27% of CPU time in malloc/free during XML parsing) and has three modules:
+The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator (profiling showed ~27% of CPU time in malloc/free during XML parsing). It now contains two layers:
 
-### `lib.rs`: FFI boundary and stream engine
+1. **Streaming engine** (`CrxmlReader` / `RowParser`): Crystal Reports XML specific and stays in `crxml_core`.
+2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine in the sibling workspace (`../../rypipe/`).
+
+The format-agnostic pieces (`ExecutionPlan`, `ColumnBuilder`, parallel/ bounded drivers, Arrow export, and the Crystal XML decoder/splitter) live in the `rypipe` workspace:
+- `rypipe-core`: generic engine
+- `rypipe-xml`: Crystal Reports XML adapter
+- `rypipe-python`: standalone PyO3 bindings (used here only for helper fns where convenient)
+
+### `lib.rs`: FFI boundary, stream engine, and columnar wrappers
 
 #### Global allocator
 
@@ -109,164 +117,41 @@ struct RowParser {
 
 #### Columnar FFI functions
 
-Four `#[pyfunction]` entry points behind `#[cfg(feature = "columnar")]`:
+Four `#[pyfunction]` entry points are thin wrappers over `rypipe-core` / `rypipe-xml`:
 
 | Function | Parsing | Output |
 |----------|---------|--------|
-| `read_to_columnar` | Single-threaded, whole-file read | One `pyarrow.Table` |
-| `read_to_columnar_multi` | Chunked via `splitter`, sequential parse + merge | One `pyarrow.Table` |
-| `read_to_columnar_par` | Chunked + `rayon::par_iter()` parallel | Per-chunk batch concat (fast path) or merged engine (auto_dict) |
-| `read_to_columnar_bounded` | Memory-bounded batches, independent export + concat | Concatenated `pyarrow.Table` |
+| `read_to_columnar` | Single-threaded via `rypipe_xml::CrystalXmlDecoder` + `rypipe_core::TableBuilder` | One `pyarrow.Table` |
+| `read_to_columnar_multi` | Chunked via `rypipe_xml::CrystalXmlSplitter`, sequential parse + `TableBuilder::extend` | One `pyarrow.Table` |
+| `read_to_columnar_par` | Chunked + `rayon` via `rypipe_core::ParallelExecutor` | Per-chunk batch concat (fast path) or merged table (auto_dict) |
+| `read_to_columnar_bounded` | Memory-bounded batches via `rypipe_core::BoundedExecutor` | Concatenated `pyarrow.Table` |
 
-All accept `BuildPlan` kwargs: `field_mapping`, `drop_fields`, `filter`, `field_types`, `dictionary_columns`, `use_mmap`, `schema`, `auto_dict`.
+All accept the same `ExecutionPlan` kwargs as before: `field_mapping`, `drop_fields`, `filter`, `field_types`, `dictionary_columns`, `use_mmap`, `schema`, `auto_dict`.
 
-**`build_plan_from_kwargs`**: translates Python dicts into `columnar::BuildPlan`. Handles field_mapping → `field_map`, filter op validation (==/!= vs >/</>=/<=), field type name resolution ("int64" → `FieldType::Int64`), auto-dict flag.
+The wrappers:
+1. Build an `rypipe_core::ExecutionPlan` from Python kwargs (same semantics as the old `BuildPlan`).
+2. Open the input via `rypipe_core::InputBuffer` (mmap when requested).
+3. Drive `CrystalXmlDecoder` / `CrystalXmlSplitter` / `ParallelExecutor` / `BoundedExecutor`.
+4. Finish the `TableBuilder` to an Arrow `RecordBatch`, apply any column-to-column `Compare` filter with `rypipe_core::arrow_export::apply_compare_filter`, and export via the Arrow C Data Interface.
 
-**`mmap_and_parse`**: memory-maps the file via `memmap2::Mmap::map`, advising `MADV_WILLNEED` when `prefault` is set and `MADV_SEQUENTIAL` otherwise (unix only). After parsing, the mapping is dropped synchronously (`unmap_now`); every value is copied into owned storage before export, so no borrowed reference outlives the parse.
+Compare filters are now evaluated in pure Rust with `arrow::compute` kernels; the previous `pyarrow.compute` call from inside Rust has been removed.
 
-**`parse_columnar_par_from_slice`** (the parallel workhorse):
-1. `splitter::compute_splits` divides the file into `num_chunks` whole-row byte ranges.
-2. `chunks.par_iter()` via rayon: each chunk gets its own `ColumnarEngine`, parsed independently.
-3. If `plan.auto_dict` is false: calls `columnar::engines_to_pyarrow_table()`: each engine exports as a `RecordBatch` directly (no merge), tables are concatenated via `pyarrow.concat_tables`. This is the **fast path**.
-4. If `plan.auto_dict` is true: engines must be merged first (per-chunk dictionary codes won't agree), then `auto_dict_upgrade` runs on the merged engine, then `to_pyarrow_table`.
+### Where the columnar engine lives now
 
-**`parse_columnar_bounded`**: estimates `bytes_per_row` from a 64 KB sample (counts row-tag occurrences), computes `rows_per_batch` from the memory budget, splits the file into memory-sized batches. Each batch is parsed into an engine, exported to a `pyarrow.Table`, and dropped. Batch tables are concatenated. If only one batch, returns it directly.
+The files `src/crxml_core/src/columnar.rs` and `src/crxml_core/src/splitter.rs` have been removed. Their contents were extracted into the sibling `rypipe` workspace:
 
-### `columnar.rs`: Columnar engine (~1980 lines)
+- `rypipe-core::plan::ExecutionPlan`: the format-agnostic plan (renamed from `BuildPlan`).
+- `rypipe-core::columnar`: `StrColumn`, `ColumnBuilder`, and dictionary encoding.
+- `rypipe-core::engine::TableBuilder`: the per-chunk state machine (renamed from `ColumnarEngine`).
+- `rypipe-core::merge`: engine merging and fast parallel export.
+- `rypipe-core::arrow_export`: Arrow `RecordBatch` building and `Compare` filter evaluation via `arrow::compute` kernels.
+- `rypipe-core::decoder`: the `Splitter`, `RecordParser`, and `ColumnarSink` traits.
+- `rypipe-core::parallel` / `rypipe-core::bounded`: parallel and memory-bounded drivers.
+- `rypipe-core::input`: `InputBuffer` with optional mmap support.
+- `rypipe-xml::decoder::CrystalXmlDecoder`: Crystal Reports XML row parser.
+- `rypipe-xml::splitter::CrystalXmlSplitter`: XML row-boundary splitting.
 
-#### `BuildPlan`
-
-```rust
-pub struct BuildPlan {
-    pub field_map: HashMap<String, String>,       // RenameFields
-    pub drop_fields: HashSet<String>,              // DropFields
-    pub field_types: HashMap<String, FieldType>,   // CastTypes (int, float, bool)
-    pub dictionary_columns: HashSet<String>,       // explicit dict encoding
-    pub filter: Option<FilterPredicate>,           // FilterRows (declarative)
-    pub schema_order: Vec<String>,                 // output column order
-    pub auto_dict: bool,                           // auto-dict upgrade
-}
-```
-
-**`resolve_field(raw)`**: applies rename first, then checks drop, matching left-to-right pipeline semantics (a rename changes the name before the drop check, so drop targets the renamed name, not the original). Returns `None` if the field should be dropped.
-
-**`column_type(name)`**: returns the storage type. Explicit `field_types` take priority, then `dictionary_columns`, defaulting to `FieldType::String`.
-
-#### `FieldType`
-
-```rust
-pub enum FieldType { String, Int64, Float64, Boolean, Dictionary }
-```
-
-#### `FilterPredicate`
-
-```rust
-pub enum FilterPredicate {
-    Equal { field: String, value: String },         // per-row string comparison
-    NotEqual { field: String, value: String },       // per-row string comparison
-    Compare { field_a: String, op: CompareOp, field_b: String },  // post-reduce via pyarrow.compute
-}
-```
-
-**`check(columns, row_index, plan)`**: for `Equal`/`NotEqual`, resolves the filter field through `plan.field_map`, retrieves the string value from the `ColumnBuilder` at `row_index` via `get_filter_value()`, and compares. Missing/null values are unequal (matching dict-path semantics). `Compare` always returns true (deferred).
-
-**`apply_pyarrow(table, py)`**: for `Compare`, calls `pyarrow.compute.greater/less/equal/not_equal` on the two columns and filters the table. For `Equal`/`NotEqual`, returns the table unchanged.
-
-#### `CompareOp`
-
-```rust
-pub enum CompareOp { Gt, Lt, Ge, Le, Eq, Ne }
-```
-
-Each maps to a `pyarrow.compute` function name via `compute_fn()` (e.g. `Gt → "greater"`).
-
-#### `StrColumn`: zero-alloc string storage
-
-```rust
-pub(crate) struct StrColumn {
-    data: Vec<u8>,          // contiguous byte arena
-    offsets: Vec<i32>,      // offsets[i]..offsets[i+1] = value i (len+1 entries)
-    validity: Vec<bool>,    // null bitmap
-}
-```
-
-Key properties:
-- **No per-cell heap allocation**: `push(v)` extends `data` with the string bytes and appends a `i32` offset.
-- **`pop()`**: truncates `data` and `offsets`; enables row filtering without compaction.
-- **`append(other)`**: moves all values from another `StrColumn` (base-shifts offsets).
-- **`to_arrow()`**: builds `StringArray` via buffer copies: `Buffer::from_slice_ref(&self.data)`, `OffsetBuffer::new(...)`. No per-value iteration.
-- **`get(i)`**: reconstructs `&str` from the arena range, bypassing per-call UTF-8 validation (the chunk was validated once at entry).
-
-#### `ColumnBuilder`
-
-```rust
-pub(crate) enum ColumnBuilder {
-    String(StrColumn),
-    Int64(Vec<Option<i64>>),
-    Float64(Vec<Option<f64>>),
-    Boolean(Vec<Option<bool>>),
-    Dictionary { codes: Vec<Option<i32>>, dict: Vec<String>, index: HashMap<String, i32> },
-}
-```
-
-Methods:
-- **`push(value: Option<String>)`**: for typed columns, parse failures become `None` (null), not an error. Dictionary `push` looks up or inserts into the value→code index.
-- **`push_str(value: Option<&str>)`**: avoids the `into_owned()` allocation for typed columns that parse and discard the string.
-- **`pop()`**: removes the last value from any variant.
-- **`len()`**: returns the number of rows.
-- **`get_filter_value(index)`**: formats the value as `String` for filter comparison.
-- **`extend_owned(other)`**: move-merges another builder's values. Dictionary variant remaps `other`'s codes through its dictionary (one pass per value). Returns `Err` on type mismatch.
-- **`try_upgrade_to_dict(min_rows)`**: auto-dict heuristic. Counts distinct values in a `String` column. If distinct ratio ≤ 5% (clamped to [16, 256]), upgrades to `Dictionary`. No-op for non-String or too-few-rows.
-- **`to_arrow_array()`**: builds native Arrow arrays: `Int64Array`, `Float64Array`, `BooleanArray`, `StringArray`, `DictionaryArray<Int32Type>`. No per-cell Python objects.
-
-#### `ColumnarEngine`: per-chunk state machine
-
-```rust
-pub(crate) struct ColumnarEngine {
-    columns: HashMap<String, ColumnBuilder>,
-    column_order: Vec<String>,
-    row_count: usize,
-    plan: BuildPlan,
-}
-```
-
-**Parse entry** (`parse_bytes(bytes, row_tag)`):
-1. Validates the entire chunk as UTF-8 via `simdutf8` (one SIMD-accelerated pass).
-2. Calls `parse_bytes_quickxml`: a borrowed-slice quick-xml reader that handles all standard and non-standard XML constructs (comments, PIs, CDATA, entity references, self-closing tags, etc.).
-
-**Per-field logic**: for `<Field FieldName="...">`, extracts the name attribute, reads `<FormattedValue>`/`<Value>` text, calls `resolve_field` for rename/drop, then `ColumnBuilder::push_str` with the storage type from `column_type`. Same pattern for `<Text>` (reads `<TextValue>`) and `<Section>` (captures section number).
-
-**`finish_row()`**: null-fills `ColumnBuilder`s for fields not present in this row (CR XML field sets vary per row). Calls `FilterPredicate::check`; if the row doesn't pass, calls `pop()` on all builders. Returns whether the row survived.
-
-**`extend(other)`**: merges another engine's column builders. Null-pads columns missing in either engine. Returns `Err` on type mismatch (shouldn't happen if chunks share the same plan).
-
-**Export** (`to_pyarrow_table(py)`):
-1. Builds Arrow `Schema` from `column_order` + each builder's `arrow_datatype()`.
-2. Builds arrays via `to_arrow_array()`.
-3. Creates `RecordBatch`, exports via `ToPyArrow`.
-4. Applies `FilterPredicate::Compare::apply_pyarrow()` if present.
-
-**Fast parallel export** (`engines_to_pyarrow_table(engines, plan, py)`):
-- Each engine exports as its own `RecordBatch` (no merge).
-- Tables concatenated via `pyarrow.concat_tables`.
-- Only used when `auto_dict` is off (avoids the merge step entirely).
-
-#### Attribute and text utilities
-
-- `attr_value(attr)`: unescapes a quick-xml attribute, with an optimization: probes for `&` via `memchr` and skips unescape if none present (CR values almost never contain entities).
-- `text_value(txt)`: same `&` probe optimization for text content.
-- `raw_value(b)`: borrowed-slice value with same `&` probe.
-- `utf8_unchecked(b)`: `std::str::from_utf8_unchecked`: safe because the chunk was validated once at `parse_bytes` entry.
-
-### `splitter.rs`: Chunk-split logic for parallel mode
-
-**Phase A (`find_special_regions`):** scans for `<!-- ... -->` and `<![CDATA[ ... ]]>` regions that could contain false-positive `<Row` markers. Returns sorted, non-overlapping `Range<usize>` ranges and a `has_any` flag (lets callers skip range-check logic entirely).
-
-**Phase B (`next_row_start`):** `memchr`-based search for `<Tag`, with two validations:
-- **Boundary condition**: the byte after the tag must be space, tab, newline, `>`, or `/`; rejects `<RowItem` when tag is `Row`.
-- **Skip region check**: the candidate position must not fall inside a comment/CDATA range.
-
-**Phase C (`compute_splits`):** walks from the first `<Row` to find evenly-spaced split points. Returns `num_chunks` whole-row `Range<usize>` values. Handles: small files (one chunk), prefix collisions, and missing split points.
+crxml still owns the Crystal-specific grammar, but as a `rypipe` format adapter rather than inline engine code. Future formats (CSV, NDJSON, generic XML, HTML) can be added as additional `rypipe` adapters without touching crxml.
 
 ## Python source layer
 
@@ -289,14 +174,14 @@ All public symbols are lazily imported via `__getattr__`. `import crxml` is inst
 
 ### `CrystalXMLSource` (in `source.py`)
 
-Wraps the Rust engines. Constructor parameters map one-to-one to `BuildPlan` fields plus engine selection:
+Wraps the Rust engines. Constructor parameters map one-to-one to `ExecutionPlan` fields plus engine selection:
 
 - `engine`: `"auto"` (default), `"stream"`, `"columnar"`, `"parallel"`
 - `threads`: multiplied by **4** to get `num_chunks`. The 4x multiplier exists because finer chunks give better load balancing; VTune showed 3-4x optimal on 24 cores (beyond 4x, rayon join/spin overhead dominates).
 - `memory`: optional string (`"8GB"`) or int bytes; enables bounded mode.
-- `use_mmap`: memory-map the file (Unix only, requires `mmap` Cargo feature).
+- `use_mmap`: memory-map the file (Unix only).
 - `batch_size`: rows per Rust→Python batch call (default 1024).
-- `field_mapping`, `drop_fields`, `filter`, `field_types`, `dictionary_columns`, `schema`, `auto_dict`: map directly to `BuildPlan`.
+- `field_mapping`, `drop_fields`, `filter`, `field_types`, `dictionary_columns`, `schema`, `auto_dict`: map directly to `ExecutionPlan`.
 
 **Goal-aware engine dispatch** (`_resolve_engine(goal)`):
 
@@ -563,7 +448,7 @@ to_dataframe(pipeline):
 - **Bounded mode**: `read_to_columnar_bounded` samples 64 KB → estimates `bytes_per_row` → splits into memory-sized chunks → parses/exports each chunk independently → chunk engine dropped → tables concatenated.
 
 - **Parallel mode RSS**:
-  - Without auto_dict: each chunk's `ColumnarEngine` is exported and dropped before next is processed → peak RSS ≈ file size + overhead.
+  - Without auto_dict: each chunk's `TableBuilder` is exported and dropped before next is processed → peak RSS ≈ file size + overhead.
   - With auto_dict: all chunk engines held in memory before merge + dict upgrade → peak RSS can reach ~5x file size.
 
 ## Concurrency model
@@ -585,19 +470,19 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | Optimization | Location | Impact |
 |-------------|----------|--------|
 | `mimalloc` global allocator | `lib.rs:22` | ~27% CPU reduction in malloc/free |
-| `PyDict::new` (no presize) | `lib.rs:645` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
-| Key interning (`FxHashMap`) | `lib.rs:589-602` | Reuses `PyString` objects across rows |
-| SIMD UTF-8 validation | `columnar.rs:37-39` | One SIMD pass per chunk (via `simdutf8`) |
-| Fast scanner (memchr-based) | `columnar.rs:603-718+` | Avoids quick-xml event loop overhead for standard CR XML |
-| `StrColumn` arena allocation | `columnar.rs:212-283` | No per-cell `String` allocation |
+| `PyDict::new` (no presize) | `src/crxml_core/src/lib.rs` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
+| Key interning (`FxHashMap`) | `src/crxml_core/src/lib.rs` | Reuses `PyString` objects across rows |
+| SIMD UTF-8 validation | `rypipe_xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
+| Fast scanner (memchr-based) | `rypipe_xml::decoder` | Avoids quick-xml event loop overhead for standard CR XML |
+| `StrColumn` arena allocation | `rypipe_core::columnar` | No per-cell `String` allocation |
 | Deferred filter compaction | `batchpipe.py:31-48` | Only materializes alive rows at sinks/LambdaOp |
-| Columnar fusion (Layer A) | `fusion.py:23-44` | Entire pipeline compiled into Rust `BuildPlan` |
+| Columnar fusion (Layer A) | `fusion.py:23-44` | Entire pipeline compiled into Rust `ExecutionPlan` |
 | `_to_arrow()` shortcut | `pipeline.py:45-67` | Skips dict construction entirely for fast-path pipelines |
-| Arrow C Data Interface | `columnar.rs:496-520` | Zero-copy export from Rust Arrow to pyarrow |
-| Synchronous unmap after export | `lib.rs` (`MmapHandle::unmap_now`) | Releases file-backed pages before pandas conversion begins |
+| Arrow C Data Interface | `rypipe_core::arrow_export` | Zero-copy export from Rust Arrow to pyarrow |
+| Synchronous unmap after export | `rypipe_core::input` (`MmapInput`) | Releases file-backed pages before pandas conversion begins |
 | 4x chunk multiplier | `source.py:109` | Finer grains for rayon load balancing (VTune-optimized) |
-| Bounded memory batches | `lib.rs:128-221` | Streams large files within configurable memory budget |
-| Fast parallel export (no merge) | `columnar.rs:engines_to_pyarrow_table` | Avoids per-chunk merge for non-auto-dict parallel parse |
+| Bounded memory batches | `rypipe_core::bounded` | Streams large files within configurable memory budget |
+| Fast parallel export (no merge) | `rypipe_core::merge::engines_to_record_batches` | Avoids per-chunk merge for non-auto-dict parallel parse |
 
 ## Key data types
 
@@ -609,9 +494,10 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | Python pipeline | `Pipeline` | Immutable composition of `source + stages` |
 | Python stage | `Callable[[Iterable[dict]], Iterable[dict]]` | Row transformation function |
 | Rust stream | `CrxmlReader` (PyClass) | Streaming XML parser |
-| Rust columnar | `ColumnarEngine` | HashMap of `ColumnBuilder`s + plan + row count |
-| Rust columnar | `ColumnBuilder` | String / Int64 / Float64 / Boolean / Dictionary variants |
-| Rust columnar | `StrColumn` | Flat byte arena + `i32` offsets (Arrow layout) |
-| Rust columnar | `BuildPlan` | Compilation target for stage pushdown |
-| Rust columnar | `FilterPredicate` | Equal / NotEqual / Compare variants |
-| Rust splitter | - | `compute_splits` divides file into whole-row chunks |
+| Rust columnar | `rypipe_core::TableBuilder` | HashMap of `ColumnBuilder`s + plan + row count |
+| Rust columnar | `rypipe_core::ColumnBuilder` | String / Int64 / Float64 / Boolean / Dictionary variants |
+| Rust columnar | `rypipe_core::StrColumn` | Flat byte arena + `i32` offsets (Arrow layout) |
+| Rust columnar | `rypipe_core::ExecutionPlan` | Compilation target for stage pushdown |
+| Rust columnar | `rypipe_core::FilterPredicate` | Equal / NotEqual / Compare variants |
+| Rust splitter | `rypipe_xml::CrystalXmlSplitter` | Finds whole-row split points for parallel parsing |
+| Rust decoder | `rypipe_xml::CrystalXmlDecoder` | Emits field events from Crystal Reports XML |
