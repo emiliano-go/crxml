@@ -60,7 +60,7 @@ module-name = "crxml._crxml_core"
 # Include the Python package from src/crxml/ alongside the compiled extension
 python-source = "src"
 # Build in release mode for maximum performance
-features = ["pyo3/extension-module", "columnar", "mmap"]
+features = ["pyo3/extension-module"]
 profile = "release"
 # To build with profiling symbols:
 #   maturin build --profile profiling
