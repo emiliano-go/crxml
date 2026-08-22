@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.0 (2026-08-22)
+
+### Refactor
+
+- Extracted the columnar engine into the sibling `rypipe` workspace
+  (`rypipe-core`, `rypipe-xml`, `rypipe-python`).
+- crxml now consumes the engine via path dependencies on `rypipe-core` and
+  `rypipe-xml`.
+- Renamed the internal plan type from `BuildPlan` to `rypipe_core::ExecutionPlan`.
+- `Compare` filters now use `arrow::compute` kernels instead of
+  `pyarrow.compute`.
+
+### Removed
+
+- Deleted `src/crxml_core/src/columnar.rs` and `src/crxml_core/src/splitter.rs`;
+  their logic lives in rypipe now.
+
+### Kept
+
+- The streaming `CrxmlReader` remains in `crxml_core`.
+
+### Testing
+
+- All existing tests pass.
+
 ## 1.0.0 (2026-07-06)
 
 ### Bug Fixes

@@ -10,7 +10,7 @@ crxml has three fusion mechanisms:
 | Level | Mechanism | When it applies |
 |-------|-----------|-----------------|
 | Dict-level fusion | `apply` + `__call__` protocol | Any pipeline with fusable stages |
-| Columnar fusion | `_plan_kwargs` into Rust `BuildPlan` | Source supports columnar engine, stages export a plan |
+| Columnar fusion | `_plan_kwargs` into Rust `ExecutionPlan` | Source supports rypipe engine, stages export a plan |
 | Vectorized batch chain | Volcano-style pull on Arrow `RecordBatch` | After columnar fusion, remaining stages implement `_plan_kwargs` |
 
 A stage is **fusable** if it has both `apply(self, record) -> dict | None` and
@@ -20,7 +20,7 @@ avoids Python generator overhead.
 
 A stage supports **columnar fusion** if it implements
 `_plan_kwargs(self) -> dict | None`. When all stages in a pipeline are
-columnar-fusable, the entire pipeline compiles into the Rust columnar engine
+columnar-fusable, the entire pipeline compiles into the rypipe engine
 and no Python dicts are created until the final Arrow table is converted.
 
 ## Decision tree
@@ -66,7 +66,7 @@ pipe = source | custom_filter | CastTypes({"amt": float}) | DropFields(["tmp"])
    kwargs are merged into a single `plan_overrides` dict and the stage is
    skipped in the Python stage list.
 3. `source._read_arrow(plan_overrides=plan_overrides)` is called. This runs
-   the Rust columnar engine with the fused plan, producing a `pyarrow.Table`
+   the rypipe engine with the fused plan, producing a `pyarrow.Table`
    directly from the XML.
 4. The Arrow table is wrapped in a row-by-row dict iterator.
 5. Any remaining stages (those that did not provide `_plan_kwargs`) run on the
@@ -120,7 +120,7 @@ pipe = source | CastTypes({"x": float})
 print(type(pipe._stages[0]))  # <class 'crxml.stages.cast.CastTypes'>
 ```
 
-If the pipeline uses the columnar engine, `source._read_arrow` is called
+If the pipeline uses the rypipe engine, `source._read_arrow` is called
 internally and the Rust-side profile counters show the fused plan.
 
 ## Performance comparison
