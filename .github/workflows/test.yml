@@ -21,6 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check out rypipe sibling dependency
+        uses: actions/checkout@v4
+        with:
+          repository: emiliano-go/rypipe
+          path: ../rypipe
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -54,6 +60,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check out rypipe sibling dependency
+        uses: actions/checkout@v4
+        with:
+          repository: emiliano-go/rypipe
+          path: ../rypipe
 
       - name: Set up Python
         uses: actions/setup-python@v5
