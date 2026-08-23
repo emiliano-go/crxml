@@ -70,24 +70,26 @@ pipe | FilterRows(field="x", op="==", value="y")
 
 ```text
 error: failed to get `rypipe-core` as a dependency of package `crxml-core`
-Caused by: unable to update /path/to/rypipe/crates/rypipe-core
-Caused by: No such file or directory (os error 2)
 ```
 
-Building the Rust extension requires the [rypipe](https://github.com/emiliano-go/rypipe)
-repository at a fixed location relative to this one. The crates are path
-dependencies, so any environment without a sibling checkout fails to build:
-`pip install .` from a source tree, sdist installs, and most CI runners.
+The Rust core consumes the engine as a versioned crate from crates.io, so a
+build failure here almost always means the build environment has no network
+access to crates.io, or an offline mirror is missing the `0.1.x` release.
 
-Fix: clone rypipe next to the crxml repository and retry:
+Fix: allow egress to crates.io (or vendor `rypipe-core` with
+`cargo vendor`) and retry:
 
 ```bash
-git clone https://github.com/emiliano-go/rypipe ../rypipe
+cargo update -p rypipe-core
 pip install .
 ```
 
 This only affects building from source; PyPI wheels bundle the compiled
-extension and need no Rust toolchain or sibling checkout.
+extension and need no Rust toolchain at all.
+
+Historical note: before 1.2.0 this dependency was a path reference into a
+sibling `../rypipe` checkout, which broke every build environment without
+that clone.
 
 ## FAQ
 
