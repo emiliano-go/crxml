@@ -184,8 +184,8 @@ without tokenizing children.
 
 | CPU | Estimated ceiling (parallel) |
 |---|---|
-| i5-1335U (this machine) | ~500–550 MB/s |
-| Ryzen 7 5800X (desktop) | ~800 MB/s – 1.1 GB/s |
+| i5-1335U (this machine) | ~500-550 MB/s |
+| Ryzen 7 5800X (desktop) | ~800 MB/s - 1.1 GB/s |
 
 2 GB/s would require a genuinely different parse strategy (a hand-rolled scanner
 for the fixed Crystal Reports XML structure that skips quick-xml's generality),
