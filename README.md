@@ -78,6 +78,8 @@ crxml skips the nesting:
 - The **stream engine** walks the XML once with quick-xml and yields flat dicts.
 - The **parallel engine** memory-maps the file, splits it at row boundaries,
   and parses each chunk on its own thread into Arrow buffers directly (no dicts).
+  It is powered by the [rypipe](https://github.com/emiliano-go/rypipe) ingestion
+  engine; the Crystal Reports XML adapter lives inside crxml itself.
 - Pipeline stages that rename, cast, drop, or filter fields execute in the Rust
   parse loop, before any Python object is created.
 
