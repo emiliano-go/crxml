@@ -22,10 +22,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check out rypipe sibling dependency
-        uses: actions/checkout@v4
-        with:
-          repository: emiliano-go/rypipe
-          path: ../rypipe
+        run: git clone --depth 1 https://github.com/emiliano-go/rypipe ../rypipe
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -62,10 +59,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check out rypipe sibling dependency
-        uses: actions/checkout@v4
-        with:
-          repository: emiliano-go/rypipe
-          path: ../rypipe
+        run: git clone --depth 1 https://github.com/emiliano-go/rypipe ../rypipe
 
       - name: Set up Python
         uses: actions/setup-python@v5
