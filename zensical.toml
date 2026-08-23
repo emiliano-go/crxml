@@ -72,6 +72,8 @@ name = "crxml on PyPI"
     { "Parallel Execution" = "usage/parallel.md" },
     { "Sinks" = "usage/sinks.md" },
     { "Branching" = "usage/branching.md" },
+    { "Pipeline Fusion" = "pipeline-fusion.md" },
+    { "Troubleshooting" = "troubleshooting.md" },
 ]
 
 [[project.nav]]
