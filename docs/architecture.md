@@ -34,7 +34,7 @@ XML file
   │
   ├─► columnar engine: rypipe_core::TableBuilder via crxml wrapper
   │     │
-  │     ├─► simdutf8 validation (one SIMD pass) in rypipe_xml::CrystalXmlDecoder
+  │     ├─► simdutf8 validation (one SIMD pass) in the embedded CrystalXmlDecoder
   │     ├─► borrowed-slice quick-xml reader (zero-copy events)
   │     │
   │     ├─► ColumnBuilder columns ──► finish_row (null-fill, filter)
@@ -53,7 +53,7 @@ XML file
   │                 │
   │                 └─► sinks: to_dataframe / to_csv / collect / to_polars / to_parquet
   │
-  └─► parallel engine: rypipe_xml::CrystalXmlSplitter + rypipe_core::ParallelExecutor
+  └─► parallel engine: CrystalXmlSplitter + rypipe_core::ParallelExecutor
         │
         ├─► fast path (no auto_dict): per-chunk TableBuilders exported independently
         │     └─► engines_to_record_batches() → per-chunk RecordBatch → concat
@@ -69,10 +69,7 @@ The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator
 1. **Streaming engine** (`CrxmlReader` / `RowParser`): Crystal Reports XML specific and stays in `crxml_core`.
 2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine in the sibling workspace (`../rypipe/`).
 
-The format-agnostic pieces (`ExecutionPlan`, `ColumnBuilder`, parallel/ bounded drivers, Arrow export, and the Crystal XML decoder/splitter) live in the `rypipe` workspace:
-- `rypipe-core`: generic engine
-- `rypipe-xml`: Crystal Reports XML adapter
-- `rypipe-python`: standalone PyO3 bindings (used here only for helper fns where convenient)
+The format-agnostic engine pieces (`ExecutionPlan`, `ColumnBuilder`, parallel/bounded drivers, and Arrow export) live in the `rypipe-core` crate in the sibling `rypipe` workspace. The Crystal Reports XML decoder and splitter now live inside `crxml_core::xml` as a custom `rypipe-core` adapter.
 
 ### `lib.rs`: FFI boundary, stream engine, and columnar wrappers
 
