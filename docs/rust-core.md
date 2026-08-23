@@ -52,6 +52,21 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | `rypipe-core`| Generic columnar/parallel/bounded engine (path dependency) |
 | `rypipe-xml` | Crystal Reports XML decoder/splitter (path dependency) |
 
+The two `rypipe` crates are resolved via path dependencies pointing outside
+this repository (see `src/crxml_core/Cargo.toml`):
+
+```toml
+rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
+rypipe-xml  = { path = "../../../rypipe/crates/rypipe-xml" }
+```
+
+You must therefore clone [rypipe](https://github.com/emiliano-go/rypipe) as a
+sibling of the crxml repository before any cargo or maturin build:
+
+```bash
+git clone https://github.com/emiliano-go/rypipe ../rypipe
+```
+
 ## Building
 
 ```bash

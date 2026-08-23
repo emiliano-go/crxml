@@ -67,7 +67,7 @@ XML file
 The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator (profiling showed ~27% of CPU time in malloc/free during XML parsing). It now contains two layers:
 
 1. **Streaming engine** (`CrxmlReader` / `RowParser`): Crystal Reports XML specific and stays in `crxml_core`.
-2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine in the sibling workspace (`../../rypipe/`).
+2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine in the sibling workspace (`../rypipe/`).
 
 The format-agnostic pieces (`ExecutionPlan`, `ColumnBuilder`, parallel/ bounded drivers, Arrow export, and the Crystal XML decoder/splitter) live in the `rypipe` workspace:
 - `rypipe-core`: generic engine
