@@ -24,21 +24,24 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture
 def bench_10mb() -> Path:
     p = BENCH_DIR / "test_10mb.xml"
-    assert p.exists(), f"Missing benchmark file: {p}"
+    if not p.exists():
+        pytest.skip(f"Missing benchmark file: {p}")
     return p
 
 
 @pytest.fixture
 def bench_50mb() -> Path:
     p = BENCH_DIR / "test_50mb.xml"
-    assert p.exists(), f"Missing benchmark file: {p}"
+    if not p.exists():
+        pytest.skip(f"Missing benchmark file: {p}")
     return p
 
 
 @pytest.fixture
 def bench_100mb() -> Path:
     p = BENCH_DIR / "test_100mb.xml"
-    assert p.exists(), f"Missing benchmark file: {p}"
+    if not p.exists():
+        pytest.skip(f"Missing benchmark file: {p}")
     return p
 
 
