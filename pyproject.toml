@@ -6,10 +6,11 @@ build-backend = "maturin"
 
 [project]
 name = "crxml"
-version = "1.1.0"
+version = "1.2.0"
 description = "High-performance Crystal Reports XML to Arrow/DataFrame engine for Python"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     {name = "Emiliano Gandini", email = "emiliano.gandini@protonmail.com"}
 ]
@@ -62,6 +63,9 @@ module-name = "crxml._crxml_core"
 python-source = "src"
 # Build in release mode for maximum performance
 features = ["pyo3/extension-module"]
+# maturin declares License-File in sdist PKG-INFO but does not add the file
+# to the tarball; PyPI rejects the upload unless LICENSE ships explicitly.
+include = [{path = "LICENSE", format = "sdist"}]
 profile = "release"
 # To build with profiling symbols:
 #   maturin build --profile profiling
