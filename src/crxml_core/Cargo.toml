@@ -26,7 +26,11 @@ rustc-hash = "2"
 arrow = { version = "=55.2.0", default-features = false, features = ["pyarrow"] }
 
 rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
-rypipe-xml = { path = "../../../rypipe/crates/rypipe-xml" }
+
+# Crystal Reports XML adapter dependencies (previously in rypipe-xml).
+memchr = "2"
+simdutf8 = "0.1"
+thiserror = "2"
 
 # Fast allocator: replaces the Windows system heap for all Rust-side
 # allocations (profiling showed ~27% of CPU in RtlAllocateHeap/malloc)

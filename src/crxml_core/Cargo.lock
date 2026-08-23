@@ -332,12 +332,14 @@ name = "crxml-core"
 version = "1.1.0"
 dependencies = [
  "arrow",
+ "memchr",
  "mimalloc",
  "pyo3",
  "quick-xml",
  "rustc-hash",
  "rypipe-core",
- "rypipe-xml",
+ "simdutf8",
+ "thiserror",
 ]
 
 [[package]]
@@ -852,18 +854,6 @@ dependencies = [
  "memmap2",
  "rayon",
  "rustc-hash",
- "simdutf8",
- "thiserror",
-]
-
-[[package]]
-name = "rypipe-xml"
-version = "0.1.0"
-dependencies = [
- "memchr",
- "quick-xml",
- "rustc-hash",
- "rypipe-core",
  "simdutf8",
  "thiserror",
 ]
