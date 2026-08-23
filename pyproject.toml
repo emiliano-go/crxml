@@ -32,10 +32,11 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
+rypipe = ["rypipe>=0.1.0"]
 pyarrow = ["pyarrow>=15"]
 pandas = ["pandas>=1.5"]
 polars = ["polars>=0.20"]
-all = ["crxml[pyarrow,pandas,polars]"]
+all = ["crxml[rypipe,pyarrow,pandas,polars]"]
 docs = [
     # seoslug is a docs-site plugin dependency (zensical), not a runtime dep
     "seoslug>=2.0.1",

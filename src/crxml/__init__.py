@@ -1,5 +1,9 @@
 import importlib
 
+# Register the rypipe adapter when rypipe is installed. This is a side-effect
+# import; it must run before user code calls rypipe.read(..., format="crxml").
+from . import rypipe_adapter  # noqa: F401
+
 __version__ = "1.1.0"
 
 __all__ = [
