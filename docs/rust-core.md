@@ -54,24 +54,21 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | `quick-xml`  | Streaming XML reader           |
 | `arrow`      | Arrow C Data Interface export  |
 | `mimalloc`   | Fast allocator (replaces system malloc, ~27% CPU savings) |
-| `rypipe-core`| Generic columnar/parallel/bounded engine (path dependency) |
+| `rypipe-core`| Generic columnar/parallel/bounded engine (from crates.io) |
 | `memchr`     | Fast substring scans for the XML splitter |
 | `simdutf8`   | SIMD UTF-8 validation for the XML decoder |
 | `thiserror`  | Adapter error derives            |
 
-The `rypipe-core` crate is resolved via a path dependency pointing outside
-this repository (see `src/crxml_core/Cargo.toml`):
+The `rypipe-core` crate is a versioned dependency resolved from crates.io
+(see `src/crxml_core/Cargo.toml`):
 
 ```toml
-rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
+rypipe-core = { version = "0.1", features = ["mmap"] }
 ```
 
-You must therefore clone [rypipe](https://github.com/emiliano-go/rypipe) as a
-sibling of the crxml repository before any cargo or maturin build:
-
-```bash
-git clone https://github.com/emiliano-go/rypipe ../rypipe
-```
+No sibling checkout is required to build crxml. To hack on the engine itself,
+clone [rypipe](https://github.com/emiliano-go/rypipe) separately and point the
+dependency at your checkout with a cargo `[patch]` entry.
 
 ## Building
 

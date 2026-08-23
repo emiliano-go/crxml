@@ -1,13 +1,16 @@
 # Changelog
 
-## 1.2.0 (2026-08-22)
+## 1.2.0 (2026-08-23)
 
 ### Refactor
 
 - Extracted the columnar engine into the sibling `rypipe` workspace
   (`rypipe-core`, `rypipe-xml`, `rypipe-python`).
-- crxml now consumes the engine via path dependencies on `rypipe-core` and
-  `rypipe-xml`.
+- `rypipe-core` is now consumed from crates.io as a versioned dependency
+  (`version = "0.1"`, `mmap` feature) instead of a path dependency: building
+  crxml no longer requires a sibling rypipe checkout.
+- Embedded the Crystal Reports XML adapter (previously the separate
+  `rypipe-xml` crate) directly in `crxml_core`.
 - Renamed the internal plan type from `BuildPlan` to `rypipe_core::ExecutionPlan`.
 - `Compare` filters now use `arrow::compute` kernels instead of
   `pyarrow.compute`.
@@ -20,6 +23,13 @@
 ### Kept
 
 - The streaming `CrxmlReader` remains in `crxml_core`.
+
+### Packaging
+
+- sdist now ships `LICENSE` explicitly (PEP 639 license expression) so PyPI
+  accepts the upload.
+- CI installs `rypipe` from PyPI for integration tests instead of cloning a
+  sibling checkout.
 
 ### Testing
 

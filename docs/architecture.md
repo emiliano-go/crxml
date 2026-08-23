@@ -67,7 +67,7 @@ XML file
 The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator (profiling showed ~27% of CPU time in malloc/free during XML parsing). It now contains two layers:
 
 1. **Streaming engine** (`CrxmlReader` / `RowParser`): Crystal Reports XML specific and stays in `crxml_core`.
-2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine in the sibling workspace (`../rypipe/`).
+2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine, consumed as a versioned crate from crates.io (`rypipe-core = "0.1"`).
 
 The format-agnostic engine pieces (`ExecutionPlan`, `ColumnBuilder`, parallel/bounded drivers, and Arrow export) live in the `rypipe-core` crate in the sibling `rypipe` workspace. The Crystal Reports XML decoder and splitter now live inside `crxml_core::xml` as a custom `rypipe-core` adapter.
 
@@ -114,12 +114,12 @@ struct RowParser {
 
 #### Columnar FFI functions
 
-Four `#[pyfunction]` entry points are thin wrappers over `rypipe-core` / `rypipe-xml`:
+Four `#[pyfunction]` entry points are thin wrappers over the embedded XML adapter (`crxml_core::xml`) and `rypipe-core`:
 
 | Function | Parsing | Output |
 |----------|---------|--------|
-| `read_to_columnar` | Single-threaded via `rypipe_xml::CrystalXmlDecoder` + `rypipe_core::TableBuilder` | One `pyarrow.Table` |
-| `read_to_columnar_multi` | Chunked via `rypipe_xml::CrystalXmlSplitter`, sequential parse + `TableBuilder::extend` | One `pyarrow.Table` |
+| `read_to_columnar` | Single-threaded via `crxml_core::xml::CrystalXmlDecoder` + `rypipe_core::TableBuilder` | One `pyarrow.Table` |
+| `read_to_columnar_multi` | Chunked via `crxml_core::xml::CrystalXmlSplitter`, sequential parse + `TableBuilder::extend` | One `pyarrow.Table` |
 | `read_to_columnar_par` | Chunked + `rayon` via `rypipe_core::ParallelExecutor` | Per-chunk batch concat (fast path) or merged table (auto_dict) |
 | `read_to_columnar_bounded` | Memory-bounded batches via `rypipe_core::BoundedExecutor` | Concatenated `pyarrow.Table` |
 
@@ -145,10 +145,10 @@ The files `src/crxml_core/src/columnar.rs` and `src/crxml_core/src/splitter.rs` 
 - `rypipe-core::decoder`: the `Splitter`, `RecordParser`, and `ColumnarSink` traits.
 - `rypipe-core::parallel` / `rypipe-core::bounded`: parallel and memory-bounded drivers.
 - `rypipe-core::input`: `InputBuffer` with optional mmap support.
-- `rypipe-xml::decoder::CrystalXmlDecoder`: Crystal Reports XML row parser.
-- `rypipe-xml::splitter::CrystalXmlSplitter`: XML row-boundary splitting.
+- `crxml_core::xml::decoder::CrystalXmlDecoder`: Crystal Reports XML row parser (embedded adapter).
+- `crxml_core::xml::splitter::CrystalXmlSplitter`: XML row-boundary splitting (embedded adapter).
 
-crxml still owns the Crystal-specific grammar, but as a `rypipe` format adapter rather than inline engine code. Future formats (CSV, NDJSON, generic XML, HTML) can be added as additional `rypipe` adapters without touching crxml.
+crxml still owns the Crystal-specific grammar as an embedded `rypipe-core` format adapter rather than inline engine code. Future formats can be added as additional `rypipe-core` adapters without touching crxml.
 
 ## Python source layer
 
