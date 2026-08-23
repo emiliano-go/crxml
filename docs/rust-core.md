@@ -8,7 +8,12 @@ The native accelerator is a PyO3 crate at `src/crxml_core/`.
 src/crxml_core/
 ├── Cargo.toml
 └── src/
-    └── lib.rs          # CrxmlReader class + thin columnar FFI wrappers
+    ├── lib.rs          # CrxmlReader class + thin columnar FFI wrappers
+    └── xml/            # Crystal Reports XML adapter for rypipe-core
+        ├── decoder.rs  # CrystalXmlDecoder implements RecordParser
+        ├── splitter.rs # CrystalXmlSplitter implements Splitter
+        ├── error.rs    # adapter error type
+        └── mod.rs
 ```
 
 ### `lib.rs`: streaming engine and columnar wrappers
@@ -18,8 +23,8 @@ src/crxml_core/
 1. **`CrxmlReader`**: the streaming XML parser (remains in crxml).
 2. **Thin columnar FFI wrappers**: `#[pyfunction]` entry points (`read_to_columnar`,
    `read_to_columnar_multi`, `read_to_columnar_par`, `read_to_columnar_bounded`) that
-   build an `rypipe_core::ExecutionPlan` and delegate parsing to `rypipe-core` /
-   `rypipe-xml`.
+   build an `rypipe_core::ExecutionPlan` and delegate parsing to `rypipe-core` through
+   the embedded Crystal Reports XML adapter in `src/xml/`.
 
 #### `CrxmlReader`
 
@@ -50,14 +55,15 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | `arrow`      | Arrow C Data Interface export  |
 | `mimalloc`   | Fast allocator (replaces system malloc, ~27% CPU savings) |
 | `rypipe-core`| Generic columnar/parallel/bounded engine (path dependency) |
-| `rypipe-xml` | Crystal Reports XML decoder/splitter (path dependency) |
+| `memchr`     | Fast substring scans for the XML splitter |
+| `simdutf8`   | SIMD UTF-8 validation for the XML decoder |
+| `thiserror`  | Adapter error derives            |
 
-The two `rypipe` crates are resolved via path dependencies pointing outside
+The `rypipe-core` crate is resolved via a path dependency pointing outside
 this repository (see `src/crxml_core/Cargo.toml`):
 
 ```toml
 rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
-rypipe-xml  = { path = "../../../rypipe/crates/rypipe-xml" }
 ```
 
 You must therefore clone [rypipe](https://github.com/emiliano-go/rypipe) as a
@@ -95,20 +101,9 @@ manifest-path = "src/crxml_core/Cargo.toml"
 ## Testing
 
 ```bash
-# Rust unit tests (streaming engine)
-cargo test --manifest-path src/crxml_core/Cargo.toml
+# Rust unit tests (streaming engine + XML adapter)
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --manifest-path src/crxml_core/Cargo.toml --all-features
 
-# Columnar / parallel / bounded paths are exercised through Python/pytest
+# Python test suite
 pytest
 ```
-
-## Security
-
-- **Unsafe denied by default** (`#![deny(unsafe_code)]`) in crxml itself.
-  The remaining `unsafe` blocks for mmap I/O and SIMD-validated UTF-8 live in
-  the `rypipe` workspace. The `_PyDict_NewPresized` private-CAPI call was
-  removed after benchmarking showed only a 3.5% overall gain.
-- **Input validation**, XML is assumed trusted (users control their source
-  files). Buffer sizes are managed by quick-xml.
-- **Buffer limits**, individual field values are bounded by the XML entity
-  size. No unbounded allocations.
