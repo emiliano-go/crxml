@@ -18,6 +18,8 @@ use std::path::Path;
 #[cfg(feature = "profile")]
 use std::time::Instant;
 
+mod xml;
+
 // Fast allocator: replaces the system heap for all Rust-side
 // allocations (profiling showed ~27% of CPU in malloc/free).
 #[global_allocator]
@@ -233,7 +235,7 @@ pub fn read_to_columnar(
 
     let input = rypipe_core::InputBuffer::open(p, use_mmap, prefault).map_err(map_rypipe_err)?;
     let bytes = input.as_slice();
-    let decoder = rypipe_xml::CrystalXmlDecoder::with_row_tag(&row_tag);
+    let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let mut table_builder =
         rypipe_core::TableBuilder::with_plan((bytes.len() / 512).max(64), plan.clone());
     decoder.validate(bytes).map_err(map_rypipe_err)?;
@@ -283,8 +285,8 @@ pub fn read_to_columnar_multi(
 
     let input = rypipe_core::InputBuffer::open(p, use_mmap, prefault).map_err(map_rypipe_err)?;
     let bytes = input.as_slice();
-    let splitter = rypipe_xml::CrystalXmlSplitter::with_row_tag(&row_tag);
-    let decoder = rypipe_xml::CrystalXmlDecoder::with_row_tag(&row_tag);
+    let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
+    let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let split_points = splitter.find_split_points(bytes, num_chunks);
     let ranges = split_points_to_ranges(&split_points, bytes.len());
 
@@ -344,8 +346,8 @@ pub fn read_to_columnar_par(
 
     let input = rypipe_core::InputBuffer::open(p, use_mmap, prefault).map_err(map_rypipe_err)?;
     let bytes = input.as_slice();
-    let splitter = rypipe_xml::CrystalXmlSplitter::with_row_tag(&row_tag);
-    let decoder = rypipe_xml::CrystalXmlDecoder::with_row_tag(&row_tag);
+    let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
+    let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let batches =
         rypipe_core::parallel::ParallelExecutor::parse(bytes, &splitter, decoder, plan, num_chunks)
             .map_err(map_rypipe_err)?;
@@ -375,8 +377,8 @@ pub fn read_to_columnar_bounded(
 
     let budget = rypipe_core::bounded::MemoryBudget::new(memory);
     let executor = rypipe_core::bounded::BoundedExecutor::new(budget);
-    let splitter = rypipe_xml::CrystalXmlSplitter::with_row_tag(&row_tag);
-    let decoder = rypipe_xml::CrystalXmlDecoder::with_row_tag(&row_tag);
+    let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
+    let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let batches = executor
         .run(Path::new(&path), &splitter, decoder, plan, prefault)
         .map_err(map_rypipe_err)?;
@@ -399,7 +401,7 @@ fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
     let plan = rypipe_core::ExecutionPlan::new();
     let est = (bytes.len() / 512).max(64);
     let mut sink = rypipe_core::TableBuilder::with_plan(est, plan);
-    let decoder = rypipe_xml::CrystalXmlDecoder::with_row_tag(row_tag);
+    let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(row_tag);
     decoder.validate(bytes).map_err(map_rypipe_err)?;
     decoder.parse_chunk(bytes, &mut sink).map_err(map_rypipe_err)?;
     let batch = sink.finish().map_err(map_rypipe_err)?;
