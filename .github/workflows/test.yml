@@ -37,7 +37,7 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         run: |
           pip install maturin pytest pyarrow pandas polars
-          maturin build --features testing,mmap --out /tmp/wheels -i python
+          maturin build --features testing --out /tmp/wheels -i python
           pip install /tmp/wheels/crxml-*.whl
 
       - name: Run full suite (including hardening harness)
@@ -74,7 +74,7 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         run: |
           pip install maturin pytest pyarrow pandas polars
-          maturin build --features mmap --out /tmp/wheels -i python
+          maturin build --out /tmp/wheels -i python
           pip install /tmp/wheels/crxml-*.whl
 
       - name: Run test suite (default features)
