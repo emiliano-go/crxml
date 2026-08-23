@@ -25,7 +25,7 @@ rustc-hash = "2"
 # stable across minor versions; bump only after testing both directions.
 arrow = { version = "=55.2.0", default-features = false, features = ["pyarrow"] }
 
-rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
+rypipe-core = { version = "0.1", features = ["mmap"] }
 
 # Crystal Reports XML adapter dependencies (previously in rypipe-xml).
 memchr = "2"
