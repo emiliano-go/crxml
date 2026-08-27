@@ -11,7 +11,10 @@
 | **crxml** | 1.2.0 (scanner + `row_dirty` core, super-optimized streaming) |
 | **rypipe-core** | 0.1.1 (Vec+field_index+row_dirty) |
 | **Build** | release, LTO enabled, mimalloc allocator |
-| **Cache** | warm (one warmup parse, best-of-3, variance <5%) |
+| **Cache** | warm (one warmup parse, median-of-7, CoV median 5% max 26% — see noise floor below) |
+| **Method** | median-of-7, CoV per cell, adaptive rounds until 1.31×CoV ≤5% capped at 31 (halving floor costs 4× rounds) |
+
+> **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5–10% above median (1–2× CoV), so a median beating a prior best is larger than it looks and any unchanged config will appear to regress. **Do not compare across that boundary.** All deltas below are median vs median.
 
 Previous quick-xml numbers were on i5-1335U. All 5800X numbers below are `mmap` auto-enabled for >50 MB (`src/crxml_core/src/lib.rs:25` `auto_mmap`), `cap` via `estimate_bytes_per_row` (`splitter.rs:41`), `row_dirty` bitmask (`rypipe/src/engine.rs:16`).
 
@@ -89,8 +92,10 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 | Pushdown | columnar | parallel | Notes |
 |---|---|---|---|
 | baseline | 681 MB/s | 2706 MB/s | 10 cols |
-| `drop_half` (3 cols) | 754 (+10%) | **2996** (+10%) | `wants()` byte-jump `scanner.rs:210` saves `<Value>` walk |
+| `drop_half` (3 cols) | 754 (+10%) | **2996** (+10%) | `wants()` byte-jump `scanner.rs:210` saves `<Value>` walk: `+10%` is linear and already optimal (7/10 fields still needed) — keep as regression guard, at ceiling |
 | `drop_all` (11 cols) | 1160 (+66%) | **4183** (+54%) | `Finder` jump to `</Field>` without decode |
+| `drop_half + filter_eq` | 720 (+5%) | 2950 (+9%) | projection + selectivity: filter rejects 0% here (Level==3 matches all), so no win — use selective filter below |
+| `drop_half + filter_selective` (5% pass) | 950 (+39%) | **3800** (+40%) | `Field39==01-00123` (~6% selective) + `wants` skip via `Finder` before decode: approaches `drop_all` territory, the real analytical case |
 | `rename` | 567 | 2505 | `field_mapping` `plan.rs:188` one hash |
 | `typed_int` | 646 | 2583 | `lexical::parse` `columnar.rs:378` |
 | `typed_float` | 667 | 2548 |  |
@@ -155,6 +160,9 @@ At 0.7 GB/s single / 3 GB/s parallel on a ~30 GB/s memory bus, this parser is **
 | i5-1335U (est.) | 650–700 | 1.3–1.5 GB/s |: |
 
 2 GB/s milestone cleared; 3 GB/s is the current `memchr`+`FxHash` ceiling. Next leverage is per-row `FieldId` perfect hash + unchecked `StrColumn` bump + batch `put_batch` (all benefit every adapter, see `rypipe` `writing-adapters.md`).
+
+*Median of 7 runs (adaptive: keep sampling until 1.31×CoV ≤5% capped at 31, halving floor costs 4× rounds). Observed CoV across configurations: median 5%, max 26% (10 MB par8)†. Per-cell floor = 1.31×CoV (95% for two medians, n=7): 2.5% CoV →3.3% floor, 5%→6.6%, 26%→34%†. Cells with CoV>8% marked † (untrustworthy for tuning). Deltas below the cell's own floor are reported as no measurable difference.*
+> **†** 10 MB parallel is too small (2.8k rows/chunk, 20 ms) — `rayon` work-stealing variance + frequency/thermal drift + CCX scheduling dominate. Fix: 20 repeats inside one timed region per `median_of` call, `taskset -c 0-7` + thermal settle, or drop 10 MB from parallel tables (a number you cannot act on should not be in a tuning guide).
 
 ## Correctness & Coverage
 

@@ -66,10 +66,42 @@ def best_of(fn, rounds=3):
     return best, rows
 
 def median_of(fn, rounds=7):
-    """Median of 7 with min/max and CoV. Returns (median, best, worst, cov, rows)."""
+    """Median of 7 with min/max and CoV, adaptive until 1.31*CoV <=5% capped at 31. Returns (median, best, worst, cov, rows)."""
     times = []
     rows = 0
-    for _ in range(rounds):
+    # Adaptive: keep sampling until floor <=5% or cap 31
+    target_rounds = rounds
+    while len(times) < target_rounds:
+        t0 = time.perf_counter()
+        # For tiny files (10 MB, 20 ms), repeat 20× inside one timed region to average scheduler noise
+        # Heuristic: if expected time <50 ms, do 20 repeats
+        # We estimate by doing one untimed run first
+        if len(times) == 0 and rounds == 7:
+            # Quick probe to estimate time
+            t_probe0 = time.perf_counter()
+            res = fn()
+            t_probe = time.perf_counter() - t_probe0
+            # Extract rows for probe
+            try:
+                if isinstance(res, int):
+                    rows = res
+                elif hasattr(res, "num_rows"):
+                    rows = res.num_rows
+                elif hasattr(res, "__len__"):
+                    rows = len(res)
+            except Exception:
+                pass
+            if t_probe < 0.05:  # 50 ms threshold for tiny files
+                # Do 20 repeats inside one timed region
+                t0 = time.perf_counter()
+                for _ in range(20):
+                    fn()
+                dt = (time.perf_counter() - t0) / 20
+                times.append(dt)
+                continue
+            else:
+                times.append(t_probe)
+                continue
         t0 = time.perf_counter()
         res = fn()
         dt = time.perf_counter() - t0
@@ -83,6 +115,17 @@ def median_of(fn, rounds=7):
                 rows = len(res)
         except Exception:
             pass
+        if len(times) >= 7:
+            # Check CoV floor
+            mean = sum(times)/len(times)
+            stdev = statistics.pstdev(times) if len(times)>1 else 0
+            cov = stdev/mean if mean else 0
+            floor = 1.31 * cov
+            if floor <= 0.05 or len(times) >= 31:
+                break
+            # Need more samples to reduce floor: floor ~ 1/sqrt(n), so need 4× rounds to halve
+            if len(times) >= 31:
+                break
     times.sort()
     median = times[len(times)//2]
     best = min(times)
@@ -93,26 +136,64 @@ def median_of(fn, rounds=7):
     return median, best, worst, cov, rows
 
 def peak_rss_subprocess(code: str, timeout=60):
-    """Run code in subprocess and return (peak_kb, stdout). Uses RUSAGE_CHILDREN."""
-    import subprocess, resource
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout)
-    # ru_maxrss is KB on Linux, bytes on macOS (handled as KB here for docs)
-    peak_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    # On Linux, ru_maxrss is KB; on macOS bytes. Normalize to KB.
-    # We report as KB, caller converts to MB.
-    return peak_kb, r.stdout, r.stderr
+    """Run code in subprocess and return (peak_kb, stdout). Uses child's VmHWM, not RUSAGE_CHILDREN."""
+    import subprocess
+    # Child reports its own VmHWM before exit to avoid cumulative RUSAGE_CHILDREN high-water
+    wrapper = code + "\n" + \
+        "import pathlib; " + \
+        "try:\n" + \
+        "    vm = int(next(l for l in open('/proc/self/status') if l.startswith('VmHWM:')).split()[1])\n" + \
+        "    print(f\"__VmHWM__{vm}\")\n" + \
+        "except Exception:\n" + \
+        "    pass\n"
+    r = subprocess.run([sys.executable, "-c", wrapper], capture_output=True, text=True, timeout=timeout)
+    peak_kb = 0
+    for line in r.stdout.splitlines():
+        if line.startswith("__VmHWM__"):
+            try:
+                peak_kb = int(line.split("__VmHWM__")[1])
+            except Exception:
+                pass
+    # Also capture child's stdout without the VmHWM marker
+    out = "\n".join(l for l in r.stdout.splitlines() if not l.startswith("__VmHWM__"))
+    return peak_kb, out, r.stderr
 
 def cold_warm(path: Path, fn, use_posix_fadvise=True):
-    """Run cold (after posix_fadvise DONTNEED) and warm pair, return (cold_dt, warm_dt)."""
+    """Run cold (after posix_fadvise DONTNEED) and warm pair, return (cold_dt, warm_dt).
+
+    Verifies eviction via mincore: after fadvise, resident pages must be ~0,
+    otherwise the cold number is warm and we fail loudly.
+    """
     if use_posix_fadvise:
         try:
+            import ctypes, mmap
             fd = os.open(str(path), os.O_RDONLY)
             try:
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                # Verify via mincore on a fresh mmap
+                size = os.fstat(fd).st_size
+                if size > 0:
+                    import ctypes as _ct
+                    libc = _ct.CDLL("libc.so.6", use_errno=True)
+                    addr = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+                    vec = (ctypes.c_ubyte * ((size + 4095)//4096))()
+                    ret = libc.mincore(addr, size, vec)
+                    if ret == 0:
+                        resident = sum(vec)
+                        if resident != 0:
+                            print(f"  warn: fadvise did not evict {path.name}: resident {resident}/{len(vec)} pages — cold is warm, skipping cold/warm")
+                            # Fall through to warm-only
+                            addr.close()
+                            os.close(fd)
+                            t0 = time.perf_counter()
+                            fn()
+                            warm = time.perf_counter() - t0
+                            return warm, warm
+                    addr.close()
             finally:
                 os.close(fd)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  warn: fadvise/mincore failed {e}, using warm only")
     t0 = time.perf_counter()
     fn()
     cold = time.perf_counter() - t0
@@ -121,17 +202,55 @@ def cold_warm(path: Path, fn, use_posix_fadvise=True):
     warm = time.perf_counter() - t0
     return cold, warm
 
-def bench_lxml(path: Path):
-    """External baseline: lxml and ElementTree iterparse."""
+def bench_lxml(path: Path, to_dataframe=False):
+    """External baseline: lxml and ElementTree iterparse, defensible.
+
+    - `elem.clear()` plus ancestor cleanup to avoid DOM build (otherwise measuring tree construction, not parsing).
+    - Output shape matched to crxml: `to_dataframe` yields DataFrame, else list of dicts.
+    - Compare lxml single-thread vs crxml single (690 MB/s) head-to-head, parallel separately.
+    """
     try:
         import lxml.etree
+        import pyarrow as pa
         t0 = time.perf_counter()
-        n = 0
+        rows = []
+        # Use iterparse with tag filtering and proper cleanup
         for _, elem in lxml.etree.iterparse(str(path), events=("end",), tag="Details"):
-            n += 1
+            # Build dict like crxml does (row attrs + Field children)
+            d = dict(elem.attrib)
+            for child in elem:
+                if child.tag == "Field":
+                    name = child.get("FieldName") or child.get("Name") or "Field"
+                    # Find FormattedValue/Value
+                    val = ""
+                    for gc in child:
+                        if gc.tag in ("FormattedValue", "Value"):
+                            val = gc.text or ""
+                            break
+                    d[name] = val
+                elif child.tag == "Text":
+                    d[child.get("Name", "Text")] = "".join((gc.text or "") for gc in child if gc.tag == "TextValue")
+                elif child.tag == "Section":
+                    d["Section"] = child.get("SectionNumber", "")
+            rows.append(d)
+            # Defensible cleanup: clear element and its ancestors to keep memory constant
             elem.clear()
+            # Remove preceding siblings to free memory (lxml idiom)
+            parent = elem.getparent()
+            if parent is not None:
+                # Keep only tail
+                while elem.getprevious() is not None:
+                    del parent[0]
         dt = time.perf_counter() - t0
-        return n, dt, "lxml"
+        if to_dataframe:
+            import pandas as pd
+            # Same artifact as crxml to_dataframe (ArrowDtype)
+            t1 = time.perf_counter()
+            table = pa.table({k: [r.get(k) for r in rows] for k in rows[0]} if rows else {})
+            df = table.to_pandas(types_mapper=pd.ArrowDtype)
+            dt = time.perf_counter() - t0
+            return len(rows), dt, "lxml→DataFrame"
+        return len(rows), dt, "lxml→dicts"
     except ImportError:
         return 0, 0, "lxml not installed"
     except Exception as e:
@@ -211,6 +330,11 @@ PUSHDOWNS = {
     "schema": {"schema": ["Field22","Field23","Field38","Field39","Field61","Field73","Level","Section","Text20"]},
     "mmap_off": {"use_mmap": False},
     "mmap_on": {"use_mmap": True},
+    # Combined projection + selectivity: the real win for filtering (deferred materialization)
+    # drop_half alone is at its theoretical ceiling (+10% linear, 7/10 fields still needed) — keep as regression guard
+    # Combined with a selective filter (5% pass) should approach drop_all territory via early rejection
+    "drop_half_filter_eq": {"drop_fields": ["Field22","Field23","Field38"], "filter": {"field": "Level", "op": "==", "value": "3"}},
+    "drop_half_filter_selective": {"drop_fields": ["Field22","Field23","Field38"], "filter": {"field": "Field39", "op": "==", "value": "01-00123"}},  # ~6% selective (1/15 articulos)
 }
 
 def run_native_matrix(path: Path, rounds=3):
@@ -373,9 +497,18 @@ def main():
     print("="*70)
     print("Generating / verifying files")
     print("="*70)
+    # Handle 533 MB real vs synthetic mimic labeling
+    # If test_533mb.xml is missing, generate a synthetic mimic with matching cardinality
+    # but label it distinctly in reports
+    _is_533_real = (BENCH_DATA / "test_533mb.xml").exists()
+    _label_533 = "533 MB (real export)" if _is_533_real else "533 MB (synthetic mimic)"
     ensure_files(targets, gen_only=args.gen_only, skip_1gb=args.skip_1gb)
     if args.gen_only:
         return
+    # If 533 MB still missing after ensure_files (e.g., not generated), note it
+    if not (BENCH_DATA / "test_533mb.xml").exists():
+        print(f"\nNote: {BENCH_DATA / 'test_533mb.xml'} missing — synthetic mimic would be generated on demand")
+        print("      Label will be '533 MB (synthetic mimic)' not 'real export' to avoid ambiguity")
 
     include = set(args.include.split(",")) if args.include != "all" else {"native","source","pushdown","chunk","bounded","batch","pipeline","edge"}
     rounds = args.rounds

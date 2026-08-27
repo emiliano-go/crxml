@@ -1,0 +1,65 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0"  # weekly Sunday 03:00 UTC, on 5800X runner only
+  push:
+    paths:
+      - "benchmarks/**"
+      - "scripts/render_perf_tables.py"
+      - "src/crxml_core/**"
+      - "crates/rypipe-core/**"
+
+jobs:
+  # Job 1: Run benchmarks on the dedicated 5800X self-hosted runner and commit JSON
+  # This is the ONLY job that actually runs the heavy benchmarks and is allowed to
+  # produce different numbers per hardware. It must run on the 5800X runner.
+  benchmark:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'bench')
+    runs-on: [self-hosted, linux, X64, ryzen5800x]  # adjust label to your runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
+        run: |
+          pip install maturin pyarrow
+          maturin build --release --out /tmp/wheels -i python
+          pip install /tmp/wheels/crxml-*.whl
+      - name: Run benchmarks and capture JSON
+        run: |
+          mkdir -p .benchmarks
+          python benchmarks/bench_extended.py --rounds 7 --output .benchmarks/crxml-$(date +%Y%m%d).json
+          # Also run the legacy 533 MB real-file benchmark if present on the runner
+          if [ -f bench_data/test_533mb.xml ]; then
+            python benchmarks/bench_extended.py --rounds 7 --output .benchmarks/crxml-533mb.json --include native
+          fi
+      - name: Render docs
+        run: |
+          python scripts/render_perf_tables.py
+      - name: Commit JSON and docs if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .benchmarks/*.json docs/performance.md
+          git diff --cached --quiet || git commit -m "bench: update .benchmarks/*.json and docs/performance.md [skip ci]"
+          git push || echo "no changes to push"
+
+  # Job 2: Deterministic check — runs on any runner, no hardware variance
+  # This job never runs benchmarks; it only checks that docs match the committed JSON.
+  check-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check docs match committed JSON
+        run: |
+          python scripts/render_perf_tables.py --check
+          git diff --exit-code docs/ --quiet || (echo "docs/performance.md is stale — run benchmarks/bench_extended.py --output .benchmarks/ on the 5800X and commit"; exit 1)
