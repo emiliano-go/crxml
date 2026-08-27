@@ -95,6 +95,12 @@ name = "crxml on PyPI"
 "Flask Integration" = "flask.md"
 
 [[project.nav]]
+"API Reference" = "api/index.md"
+
+[[project.nav]]
+"Prefect Integration" = "prefect.md"
+
+[[project.nav]]
 "Changelog" = "changelog.md"
 
 [project.markdown_extensions]

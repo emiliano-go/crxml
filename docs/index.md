@@ -5,6 +5,8 @@ Parse, filter, rename, cast, and project Crystal Reports XML directly into
 columnar data, with Rust execution, parallel parsing, bounded-memory
 processing, and automatic query fusion.
 
+> **Origin story:** `crxml` was built first as a standalone Crystal Reports XML parser. Its engine: row splitting (`CrystalXmlSplitter`), field extraction (`CrystalXmlDecoder` via `memchr` scanner), typed builders (`TableBuilder` + `ExecutionPlan` pushdown), and parallel/bounded drivers: proved fast enough (`3 GB/s` on 1 GB, `64KB` streaming) to be useful for any format. That engine was then separated and abstracted into [`rypipe`](https://github.com/emiliano-go/rypipe) (`rypipe-core` + `rypipe-python`). `crxml` now lives as a thin adapter (`crxml-core` `src/crxml_core/src/xml/`) on top of `rypipe`.
+
 ## Features
 
 - Streaming: never loads the full file into memory

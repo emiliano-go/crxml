@@ -269,7 +269,7 @@ def main():
     if args.gen_only:
         return
 
-    include = set(args.include.split(",")) if args.include != "all" else {"native","source","pushdown","chunk","bounded","batch","pipeline"}
+    include = set(args.include.split(",")) if args.include != "all" else {"native","source","pushdown","chunk","bounded","batch","pipeline","edge"}
     rounds = args.rounds
 
     for mb, p in targets:
@@ -297,8 +297,112 @@ def main():
             run_batch_size_matrix(p, rounds=rounds)
         if "pipeline" in include:
             run_pipeline_matrix(p, rounds=2 if args.quick else 2)
+    # Edge cases: empty, single row, ragged, late debut, entities, unicode, comments
+    if "edge" in include:
+        # Generate edge files on demand (tiny, not in main targets)
+        edge_dir = BENCH_DATA / "edge"
+        edge_dir.mkdir(exist_ok=True)
+        run_edge_case_matrix(edge_dir, rounds=rounds, quick=args.quick)
 
     print("\nDone.")
+
+
+def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False):
+    """Benchmark edge cases: empty, single row, ragged, sparse, truncated, entities, unicode, different row_tags."""
+    print("\n" + "="*70)
+    print("EDGE CASES")
+    print("="*70)
+
+    # Helper to write tiny XML files for edge cases
+    def write_edge(name: str, content: bytes) -> Path:
+        p = edge_dir / f"{name}.xml"
+        if not p.exists():
+            p.write_bytes(content)
+        return p
+
+    # 1) Empty file (no rows)
+    p_empty = write_edge("empty", b'<?xml version="1.0"?><CrystalReport><Group><GroupHeader><Section SectionNumber="0"></Section></GroupHeader></Group></CrystalReport>')
+    report(p_empty, "edge empty", lambda p=p_empty: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+
+    # 2) Single row
+    single_xml = b'<?xml version="1.0"?><CrystalReport><Group><GroupHeader><Section/></GroupHeader><Group Level="2"><GroupHeader><Section SectionNumber="0"></Section></GroupHeader><Details Level="3"><Section SectionNumber="0"><Field Name="Field22" FieldName="{F}"><FormattedValue>1</FormattedValue><Value>1</Value></Field></Section></Details></Group></Group></CrystalReport>'
+    p_single = write_edge("single_row", single_xml)
+    report(p_single, "edge single row", lambda p=p_single: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+
+    # 3) Ragged: missing fields, late debut (FieldG appears only in last 10% rows)
+    # Use existing 10MB file but test via drop_all vs sparse handling already in pushdown, here test ragged via bounded
+    if not quick:
+        p_10 = BENCH_DATA / "test_10mb.xml"
+        if p_10.exists():
+            report(p_10, "edge ragged via bounded64", lambda: _core.read_to_columnar_bounded(str(p_10), row_tag="Details", memory=64*1024), rounds=rounds)
+
+    # 4) Entities & unicode
+    ent_xml = b'<?xml version="1.0"?><CrystalReport><Group><Group Level="2"><GroupHeader/><Details Level="3"><Section SectionNumber="0"><Field Name="Field38" FieldName="{F}"><FormattedValue>A &amp; B &lt; C</FormattedValue><Value>A &amp; B &lt; C</Value></Field><Field Name="Field39"><FormattedValue>\xe2\x98\x83 unicode \xe2\x98\x85</FormattedValue><Value>\xe2\x98\x83 unicode \xe2\x98\x85</Value></Field></Section></Details></Group></Group></CrystalReport>'
+    p_ent = write_edge("entities_unicode", ent_xml)
+    report(p_ent, "edge entities+unicode", lambda p=p_ent: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+
+    # 5) Comment with fake row tag
+    comment_xml = b'<?xml version="1.0"?><CrystalReport><!-- <Details Level="3"><Field Name="Trap"><Value>nope</Value></Field></Details> --><Group><Group Level="2"><GroupHeader/><Details Level="3"><Section SectionNumber="0"><Field Name="Field22"><Value>42</Value></Field></Section></Details></Group></Group></CrystalReport>'
+    p_comment = write_edge("comment_fake_row", comment_xml)
+    report(p_comment, "edge comment fake row", lambda p=p_comment: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+
+    # 6) Different row_tag: Row vs Details vs custom
+    p_10 = BENCH_DATA / "test_10mb.xml"
+    if p_10.exists():
+        for tag in ["Details", "Row", "NonExistentTag"]:
+            report(p_10, f"edge row_tag={tag}", lambda tag=tag, p=p_10: _core.read_to_columnar(str(p), row_tag=tag), rounds=rounds)
+
+    # 7) Tiny file (1KB, few rows) vs large (already covered)
+    tiny_xml = b'<?xml version="1.0"?><CrystalReport>' + b'<Details Level="3"><Section SectionNumber="0"><Field Name="F"><Value>1</Value></Field></Section></Details>'*5 + b'</CrystalReport>'
+    p_tiny = write_edge("tiny_1kb", tiny_xml)
+    report(p_tiny, "edge tiny 1KB", lambda p=p_tiny: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+
+    # 8) All engines on edge single row (stream vs columnar vs parallel vs bounded)
+    p_single = edge_dir / "single_row.xml"
+    for eng in (["stream","parallel"] if quick else ["stream","columnar","parallel"]):
+        def fn(eng=eng, p=p_single):
+            src = CrystalXMLSource(str(p), row_tag="Details", engine=eng)
+            return src.to_arrow()
+        report(p_single, f"edge single [{eng}]", fn, rounds=rounds)
+
+    # 9) Sinks on edge
+    p_10 = BENCH_DATA / "test_10mb.xml"
+    if p_10.exists() and not quick:
+        for sink in ["to_arrow","to_dataframe","to_polars"]:
+            def fn(sink=sink, p=p_10):
+                src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel")
+                if sink == "to_arrow":
+                    return src.to_arrow()
+                elif sink == "to_dataframe":
+                    return src.to_dataframe()
+                elif sink == "to_polars":
+                    return src.to_polars()
+            report(p_10, f"edge sink {sink}", fn, rounds=rounds)
+
+    # 10) Streaming with 64KB vs 1MB on tiny file (constant memory)
+    p_10 = BENCH_DATA / "test_10mb.xml"
+    if p_10.exists():
+        for mem in (["64KB","1MB"] if not quick else ["64KB"]):
+            def fn(mem=mem, p=p_10):
+                # Use new streaming iterator (true 64KB)
+                it = _core.iter_record_batches(str(p), row_tag="Details", memory=mem)
+                return sum(b.num_rows for b in it)
+            report(p_10, f"edge stream {mem}", fn, rounds=rounds, mem=mem)
+
+    # 11) Truncated / malformed (should not panic, return truncated row discarded)
+    trunc_xml = b'<?xml version="1.0"?><CrystalReport><Group><Group Level="2"><Details Level="3"><Section SectionNumber="0"><Field Name="Field22"><Value>1</Value></Field></Section></Details></Group>'
+    p_trunc = write_edge("truncated", trunc_xml)
+    report(p_trunc, "edge truncated", lambda p=p_trunc: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+
+    # 12) Field types bool/date32/timestamp via typed columns
+    p_10 = BENCH_DATA / "test_10mb.xml"
+    if p_10.exists() and not quick:
+        for ftype in ["bool","date32"]:
+            def fn(ftype=ftype, p=p_10):
+                src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel", field_types={"Field73": ftype})
+                return src.to_arrow()
+            report(p_10, f"edge typed {ftype}", fn, rounds=rounds, field_type=ftype)
+
 
 if __name__ == "__main__":
     main()

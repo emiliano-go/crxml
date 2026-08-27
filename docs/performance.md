@@ -66,14 +66,14 @@ Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, ful
 
 | Engine → Sink | 10 MB iter | 100 MB iter | 100 MB to_arrow | 1 GB to_arrow |
 |---|---|---|---|---|
-| **stream → iter** | 517 MB/s / 468k | 501 / 459k | — (sparse-column fallback) | 515 / 451k |
-| **stream → iter_batches** | 497 / — | 514 / — | — | 536 / — |
-| **columnar → iter** | 392 / — | 400 / — | 667 / 603k | 403 / 628k |
+| **stream → iter** | 517 MB/s / 468k | 501 / 459k |: (sparse-column fallback) | 515 / 451k |
+| **stream → iter_batches** | 497 /: | 514 /: |: | 536 /: |
+| **columnar → iter** | 392 /: | 400 /: | 667 / 603k | 403 / 628k |
 | **columnar → to_arrow** | 637 / 576k | 667 / 603k | 667 / 603k | 694 / 628k |
 | **parallel → to_arrow** | 1888 / 1.70M | 2620 / 2.36M | 2620 / 2.36M | **3072 / 2.78M** |
 | **auto → to_arrow** | 1857 / 1.68M | 2691 / 2.43M | 2691 / 2.43M | 2874 / 2.60M |
 
-`stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:542` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:546` (`auto_mmap`) + `RowSink` `lib.rs:564` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:81` (`next_row_start` `splitter.rs:107` + `parse_row` `scanner.rs:73`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234) — within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1–2% self, not Rust — GIL floor.
+`stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:542` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:546` (`auto_mmap`) + `RowSink` `lib.rs:564` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:81` (`next_row_start` `splitter.rs:107` + `parse_row` `scanner.rs:73`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234): within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1–2% self, not Rust: GIL floor.
 
 `columnar → iter` is slower than `stream → iter` (400 vs 501) because it builds `TableBuilder` then iterates via `_arrow_iter` `source.py:38` (`to_batches().to_pylist()`), while `stream` yields `Cow::Borrowed` directly via `RowSink`.
 
@@ -107,17 +107,17 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 | 100 MB | 1146 | 1801 | 2409 | 2522 | 2624 | 2775 |
 | 1 GB | 1117 | 1774 | 2464 | 2489 | 2715 | 2868 |
 
-`n ≈ min(threads=16, rows/2000)` is optimal. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB) — peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
+`n ≈ min(threads=16, rows/2000)` is optimal. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB): peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
 
-Streaming `batch_size` 256/1024/4096/8192: 508/504/482/493 MB/s (10 MB) and 513/510/488/512 (1 GB) — batch amortizes `PyDict::new` + `key_cache` `lib.rs:599` double hash, but `next_batch(1024)` already `allow_threads` `lib.rs:919`.
+Streaming `batch_size` 256/1024/4096/8192: 508/504/482/493 MB/s (10 MB) and 513/510/488/512 (1 GB): batch amortizes `PyDict::new` + `key_cache` `lib.rs:599` double hash, but `next_batch(1024)` already `allow_threads` `lib.rs:919`.
 
 Pipeline `DropFields|FilterRows` `bench_extended.py:130`: `pipe base` 1796 MB/s 10 MB, `pipe filter` 2687 100 MB, `Pipeline Drop+Filter` 2172 10 MB / 2630 1 GB via `Pipeline::_to_arrow` `pipeline.py:42` → `plan_split` `fusion.py:130` + `collect_table` `batchpipe.py:57`.
 
 ## How to confirm I/O vs CPU bound
 
-*Single* `read_to_columnar` 690 MB/s both `use_mmap` true/false — parser-bound. `perf` single self `field_element` 8.6%, `scan_open_tag` 8.3%, `find_raw` 8.4%, `push_field_resolved` 2.76% + `field_index.get` 1.64% — `scan_open_tag` + `memchr` dominate, not `get`. `par` self `Finder` 6.6%, `validate` 4.1%.
+*Single* `read_to_columnar` 690 MB/s both `use_mmap` true/false: parser-bound. `perf` single self `field_element` 8.6%, `scan_open_tag` 8.3%, `find_raw` 8.4%, `push_field_resolved` 2.76% + `field_index.get` 1.64%: `scan_open_tag` + `memchr` dominate, not `get`. `par` self `Finder` 6.6%, `validate` 4.1%.
 
-*Page-cache test* `tmp/test_io_bound.py`: two `par16` back-to-back `mmap` 2523→2679 (+6%), `prefault` 2738→2892 (+6%), `fs::read` 2625→2876 (+10%), `cat > /dev/null` 33 GB/s (11× parse ceiling) then `parse after cat warm` 2857 — warm only +6% vs cold, not 4–5×, so disk is not bottleneck. `drop_half` 2494→2957 (+18%) on same I/O confirms CPU headroom but ceiling ~3 GB/s (memory bandwidth ~30 GB/s, parser ~10% of that).
+*Page-cache test* `tmp/test_io_bound.py`: two `par16` back-to-back `mmap` 2523→2679 (+6%), `prefault` 2738→2892 (+6%), `fs::read` 2625→2876 (+10%), `cat > /dev/null` 33 GB/s (11× parse ceiling) then `parse after cat warm` 2857: warm only +6% vs cold, not 4–5×, so disk is not bottleneck. `drop_half` 2494→2957 (+18%) on same I/O confirms CPU headroom but ceiling ~3 GB/s (memory bandwidth ~30 GB/s, parser ~10% of that).
 
 Run yourself:
 
@@ -147,7 +147,7 @@ At 0.7 GB/s single / 3 GB/s parallel on a ~30 GB/s memory bus, this parser is **
 | CPU | Single | Parallel (16) | Parallel (32) |
 |---|---|---|---|
 | 5800X | **714** MB/s (1 GB) / 698 (100 MB) | 2641 (1 GB) / 2720 (100 MB) | **2994** (1 GB) / 2619 (100 MB) |
-| i5-1335U (est.) | 650–700 | 1.3–1.5 GB/s | — |
+| i5-1335U (est.) | 650–700 | 1.3–1.5 GB/s |: |
 
 2 GB/s milestone cleared; 3 GB/s is the current `memchr`+`FxHash` ceiling. Next leverage is per-row `FieldId` perfect hash + unchecked `StrColumn` bump + batch `put_batch` (all benefit every adapter, see `rypipe` `writing-adapters.md`).
 

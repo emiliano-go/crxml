@@ -75,11 +75,9 @@ wraps `<Section>` wraps `<Details>` wraps `<Field>`/`<Text>`/`<FormattedValue>`/
 spend most of their CPU time descending into children you do not need.
 
 crxml skips the nesting:
-- The **stream engine** walks the XML once with quick-xml and yields flat dicts.
-- The **parallel engine** memory-maps the file, splits it at row boundaries,
-  and parses each chunk on its own thread into Arrow buffers directly (no dicts).
-  It is powered by the [rypipe](https://github.com/emiliano-go/rypipe) ingestion
-  engine; the Crystal Reports XML adapter lives inside crxml itself.
+- The **stream engine** walks the XML once with a hand-rolled `memchr` scanner (`src/crxml_core/src/xml/scanner.rs`, `scan_one_row` `scanner.rs:81` via `RowSink` `src/crxml_core/src/lib.rs:564`) and yields flat dicts: **508 MB/s** 100 MB (was 251 `quick-xml`).
+- The **parallel engine** memory-maps the file, splits it at row boundaries (`splitter.rs:27` `find_split_points`), and parses each chunk on its own thread into Arrow buffers directly (no dicts): **3 GB/s** on 1 GB (`par32` 2994) via `rypipe` (`rypipe-core` `Vec<ColumnBuilder>`+`field_index` `engine.rs:16`, `row_dirty` `engine.rs:26`).
+  It is powered by the [rypipe](https://github.com/emiliano-go/rypipe) ingestion engine: `rypipe` itself was **extracted from `crxml`**: the original `crxml` engine was the prototype, then separated and abstracted so any format (CSV, JSON, HTML…) could reuse it. `crxml` now lives as a thin adapter (`crxml-core`) on top of `rypipe-core`.
 - Pipeline stages that rename, cast, drop, or filter fields execute in the Rust
   parse loop, before any Python object is created.
 
