@@ -1569,23 +1569,18 @@ PAGE: https://crxml.emiliano-go.com/performance/
 
 ## Environment
 
-All measurements recorded on a single development machine:
-
 | Component | Detail |
 |---|---|
-| **CPU** | 13th Gen Intel Core i5-1335U (10 cores: 2 P + 8 E, 12 threads) |
-| **L1d** | 352 KiB (10 instances) |
-| **L2** | 6.5 MiB (4 instances) |
-| **L3** | 12 MiB (1 instance) |
-| **RAM** | 15 GiB LPDDR5 (system-unknown speed) |
-| **OS** | Arch Linux, kernel 7.0.9-arch2-1 |
-| **Python** | 3.14.5 |
+| **CPU** | AMD Ryzen 7 5800X (8 cores / 16 threads, 3.8 GHz base) |
+| **OS** | Arch Linux |
+| **Python** | 3.12 (venv) |
 | **pyarrow** | 24.0.0 |
-| **crxml** | 0.3.0 |
-| **Git SHA** | `bbc8a172` |
-| **Build** | release, LTO enabled, mimalloc allocator, feature `profile` |
+| **crxml** | 1.2.0 (scanner + `row_dirty` core, super-optimized streaming) |
+| **rypipe-core** | 0.1.1 (Vec+field_index+row_dirty) |
+| **Build** | release, LTO enabled, mimalloc allocator |
+| **Cache** | warm (one warmup parse, best-of-3, variance <5%) |
 
-All runs are **warm-cache** (one warmup parse, collection, then measured).  Each number is the best of 3 runs after variance stabilized.  Parallel-path variance was ~8% on the 533 MB file, stream-path variance ~15%.
+Previous quick-xml numbers were on i5-1335U. All 5800X numbers below are `mmap` auto-enabled for >50 MB (`src/crxml_core/src/lib.rs:25` `auto_mmap`), `cap` via `estimate_bytes_per_row` (`splitter.rs:41`), `row_dirty` bitmask (`rypipe/src/engine.rs:16`).
 
 ## Input files
 
@@ -1594,25 +1589,16 @@ All runs are **warm-cache** (one warmup parse, collection, then measured).  Each
 | `test_10mb.xml` | 10 MB | 9,010 | 10 | Synthetic (`benchmarks/benchmarks.py`) |
 | `test_50mb.xml` | 50 MB | 45,328 | 10 | Synthetic |
 | `test_100mb.xml` | 100 MB | 90,384 | 10 | Synthetic |
+| `test_1gb.xml` | 1024 MB | 926,746 | 10 | Synthetic (142747 invoice groups) |
 | `test_533mb.xml` | 533 MB | 465,136 | 11 | Real Crystal Reports export |
 
-Synthetic files use uniform rows, every field present on every row, and low cardinality
-(most fields repeat).  These properties flatter parallel load balance and dictionary
-encoding, so synthetic numbers are **directional only**.  The 533 MB real export is the
-ground truth for all reported conclusions.
+Synthetic files use uniform rows, every field present on every row, low cardinality. They flatter parallel load balance and dictionary encoding, so synthetic numbers are **directional only**. The 533 MB real export and 1 GB synthetic are the scaling truth. Field `FieldG` is sparse (30% of rows), `Text20` 70%, others 100%.
 
-Synthetic files have 10 columns (including `FieldG`, absent from the real export) with
-cardinalities ranging from 1 (`Level`, `Section`, `Text20`) through 15 (`Field38`,
-`Field39`) to near-unique (`Field22`: 8,965 / 9,010).
+### Field cardinality (real 533 MB, 465k rows)
 
-### Field cardinality (real 533 MB file, 465,136 rows)
+Only 5 of 11 columns high-cardinality (≥1,000); 6 are dictionary candidates. `Field72`/`Text21` sparse; `rypipe` discovers all distinct names.
 
-Only 5 of 11 columns have high cardinality (≥1,000 distinct values);
-the other 6 are dictionary-encoding candidates.  Not every column appears in every row
-(`Field72` and `Text21` are sparse); the rypipe engine discovers all distinct column
-names across all rows.
-
-| Column | Distinct values |
+| Column | Distinct |
 |---|---|
 | `Level` | 1 |
 | `Section` | 1 |
@@ -1626,137 +1612,115 @@ names across all rows.
 | `Field61` | 1,406 |
 | `Field22` | 4,230 |
 
-## Speed: end-to-end `to_dataframe()` (the user's actual goal)
+## Speed: all engines and sinks
 
-| Engine | 10 MB | 50 MB | 100 MB | 533 MB |
+### Native exports (`_crxml_core` direct)
+
+Best-of-3, `row_tag="Details"`, warm cache.
+
+| File | single | multi2 | par4 | par8 | par16 | par32 | bounded64 | bounded256 |
+|---|---|---|---|---|---|---|---|---|
+| **10 MB** | 674 MB/s / 610k r/s | 655 / 593k | 1489 / 1.35M | 2154 / 1.95M | 2383 / 2.00M | 2574 / 2.32M | 586 / 531k | 663 / 600k |
+| **50 MB** | 587 / 532k | 608 / 552k | 1339 / 1.21M | 1739 / 1.57M | 1913 / 1.73M | 1876 / 1.70M | 522 / 473k | 590 / 536k |
+| **100 MB** | 698 / 631k | 674 / 610k | 1747 / 1.58M | 2232 / 2.01M | 2720 / 2.45M | 2619 / 2.37M | 617 / 558k | 612 / 553k |
+| **1 GB** | 660 / 559k | 590 / 534k | 1781 / 1.53M | 2485 / 2.10M | 2477 / 2.24M | **2649 / 2.43M** | 546 / 447k | 549 / 456k |
+
+`par32` beats `par16` on 1 GB (32 MB/chunk amortizes `TableBuilder::with_plan` `lib.rs:275`), while 10 MB saturates at `par16` (chunks ~2.8k rows, per-chunk overhead dominates). `bounded` is ~5–10% slower than single but caps RSS at budget.
+
+Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, full for all + `--skip-1gb` flag) covers 104 benchmarks/file (native + source×sink + pushdowns + chunk/bounded/batch/pipeline) ×3 rounds.
+
+### Source engines × sinks (`CrystalXMLSource`)
+
+| Engine → Sink | 10 MB iter | 100 MB iter | 100 MB to_arrow | 1 GB to_arrow |
 |---|---|---|---|---|
-| **Stream** | 248 ms / 40 MB/s / 36k r/s | 1.35 s / 36 MB/s / 34k r/s | 2.27 s / 44 MB/s / 40k r/s | **12.8 s / 42 MB/s / 36k r/s** |
-| **Parallel** (8 workers) | 30 ms / 335 MB/s / 300k r/s | 124 ms / 402 MB/s / 365k r/s | 213 ms / 469 MB/s / 424k r/s | **1.13 s / 472 MB/s / 412k r/s** |
-| **Parallel + auto-dict** | 38 ms | 172 ms | 312 ms | **2.0 s / 267 MB/s** |
+| **stream → iter** | 517 MB/s / 468k | 501 / 459k | — (sparse-column fallback) | 515 / 451k |
+| **stream → iter_batches** | 497 / — | 514 / — | — | 536 / — |
+| **columnar → iter** | 392 / — | 400 / — | 667 / 603k | 403 / 628k |
+| **columnar → to_arrow** | 637 / 576k | 667 / 603k | 667 / 603k | 694 / 628k |
+| **parallel → to_arrow** | 1888 / 1.70M | 2620 / 2.36M | 2620 / 2.36M | **3072 / 2.78M** |
+| **auto → to_arrow** | 1857 / 1.68M | 2691 / 2.43M | 2691 / 2.43M | 2874 / 2.60M |
 
-Key observations:
+`stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:542` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:546` (`auto_mmap`) + `RowSink` `lib.rs:564` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:81` (`next_row_start` `splitter.rs:107` + `parse_row` `scanner.rs:73`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234) — within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1–2% self, not Rust — GIL floor.
 
-- **Parallel throughput improves with file size** (335 → 472 MB/s) because split-scan and
-  worker startup are fixed costs that amortize.  The 533 MB number (472 MB/s) is the
-  asymptotic rate.
-- **Parallel is ~11× faster than stream** on the 533 MB real file.
-- **Auto-dict adds ~0.9 s of on-GIL overhead** at 533 MB (dictionary encoding happens
-  after the GIL is reacquired).  Use it only when downstream readers benefit from
-  dictionary-encoded Arrow columns.
+`columnar → iter` is slower than `stream → iter` (400 vs 501) because it builds `TableBuilder` then iterates via `_arrow_iter` `source.py:38` (`to_batches().to_pylist()`), while `stream` yields `Cow::Borrowed` directly via `RowSink`.
 
-## Parallel-path breakdown (533 MB real file)
+## Pushdowns (100 MB, `to_arrow`)
 
-| Phase | Time | % of wall | Notes |
+Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `auto_dict` / `filter` / `schema` / `use_mmap` (`bench_extended.py:54` `PUSHDOWNS`).
+
+| Pushdown | columnar | parallel | Notes |
 |---|---|---|---|
-| Split-scan (serial) | 257 ms | 23% | Two SIMD scans for `<tag` + special regions |
-| Off-GIL parse (N=8) | 781 ms | 69% | quick-xml event loop, unescape, field copy |
-| On-GIL assembly | 25 ms | 2% | Arrow table construction, GIL-held |
-| Profile coverage | - | 94% | Remaining 6% = Python overhead, GC, import |
+| baseline | 681 MB/s | 2706 MB/s | 10 cols |
+| `drop_half` (3 cols) | 754 (+10%) | **2996** (+10%) | `wants()` byte-jump `scanner.rs:210` saves `<Value>` walk |
+| `drop_all` (11 cols) | 1160 (+66%) | **4183** (+54%) | `Finder` jump to `</Field>` without decode |
+| `rename` | 567 | 2505 | `field_mapping` `plan.rs:188` one hash |
+| `typed_int` | 646 | 2583 | `lexical::parse` `columnar.rs:378` |
+| `typed_float` | 667 | 2548 |  |
+| `dict` | 646 | 2501 | `dictionary_columns` `columnar.rs:557` |
+| `auto_dict` | 569 | 1604 | forces `merge.rs:57` serial `extend`, `auto_dict_upgrade` `engine.rs:139` |
+| `filter_eq` `Level==3` | 665 | 2552 | per-row `check` `plan.rs:280` then `row_dirty` |
+| `filter_compare` `Field22>Field23` | 642 (45k rows) | 2346 (45k) | `compare` + `apply_compare_filter` `arrow_export.rs:29` fast path |
+| `schema` ordering | 653 | 2525 | `sort_columns` `engine.rs:152` |
+| `mmap` on/off | 647/656 | 2771/2590 | `auto_mmap` 2–4% single, warm-cache `rep_movs` 3% perf |
 
-This breakdown is the honest map of optimization headroom:
+`drop_all` shows the engine is **CPU-bound**, not I/O: reducing copied fields from 10→0 gives 1.66×, yet ceiling stays ~3 GB/s.
 
-- **Parse (69%) is the ceiling.**  The parser tokenizes every XML element even when
-  the `ExecutionPlan` drops the field.  Skipping unwanted-field bytes is the remaining
-  high-leverage improvement.
-- **Split-scan (23%) is nearly free** after the `<tag` SIMD change.  Further wins here
-  are single-digit percentages.
-- **GIL assembly (2%) is a dead lever.**  Collapsing it further yields nothing.
+## Chunk and memory scaling
+
+| File | par2 | par4 | par8 | par16 | par32 | par64 |
+|---|---|---|---|---|---|---|
+| 10 MB | 1198 | 1956 | 2577 | 2849 | 2040 | 1573 |
+| 50 MB | 1042 | 1634 | 1907 | 2193 | 2313 | 2204 |
+| 100 MB | 1146 | 1801 | 2409 | 2522 | 2624 | 2775 |
+| 1 GB | 1117 | 1774 | 2464 | 2489 | 2715 | 2868 |
+
+`n ≈ min(threads=16, rows/2000)` is optimal. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB) — peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
+
+Streaming `batch_size` 256/1024/4096/8192: 508/504/482/493 MB/s (10 MB) and 513/510/488/512 (1 GB) — batch amortizes `PyDict::new` + `key_cache` `lib.rs:599` double hash, but `next_batch(1024)` already `allow_threads` `lib.rs:919`.
+
+Pipeline `DropFields|FilterRows` `bench_extended.py:130`: `pipe base` 1796 MB/s 10 MB, `pipe filter` 2687 100 MB, `Pipeline Drop+Filter` 2172 10 MB / 2630 1 GB via `Pipeline::_to_arrow` `pipeline.py:42` → `plan_split` `fusion.py:130` + `collect_table` `batchpipe.py:57`.
+
+## How to confirm I/O vs CPU bound
+
+*Single* `read_to_columnar` 690 MB/s both `use_mmap` true/false — parser-bound. `perf` single self `field_element` 8.6%, `scan_open_tag` 8.3%, `find_raw` 8.4%, `push_field_resolved` 2.76% + `field_index.get` 1.64% — `scan_open_tag` + `memchr` dominate, not `get`. `par` self `Finder` 6.6%, `validate` 4.1%.
+
+*Page-cache test* `tmp/test_io_bound.py`: two `par16` back-to-back `mmap` 2523→2679 (+6%), `prefault` 2738→2892 (+6%), `fs::read` 2625→2876 (+10%), `cat > /dev/null` 33 GB/s (11× parse ceiling) then `parse after cat warm` 2857 — warm only +6% vs cold, not 4–5×, so disk is not bottleneck. `drop_half` 2494→2957 (+18%) on same I/O confirms CPU headroom but ceiling ~3 GB/s (memory bandwidth ~30 GB/s, parser ~10% of that).
+
+Run yourself:
+
+```bash
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+.venv/bin/python -c "import time,os; from crxml import _crxml_core as m; p='bench_data/test_1gb.xml'; s=os.path.getsize(p); t0=time.perf_counter(); m.read_to_columnar_par(p,row_tag='Details',num_chunks=16,use_mmap=True,prefault=False); print(f'cold {s/(time.perf_counter()-t0)/1e6:.1f} MB/s')"
+cat bench_data/test_1gb.xml > /dev/null
+# warm
+.venv/bin/python benchmarks/bench_extended.py --quick --rounds 2  # or --rounds 3
+```
 
 ## Engine selection guide (per goal)
 
 | If your goal is... | Use this engine | Because... |
 |---|---|---|
-| Fastest `to_dataframe()` | `engine="parallel"` | ~11× faster than stream; mmap + off-GIL parse |
-| Minimize peak memory | `engine="bounded"` | RSS tracks the `memory=` budget, not file size |
-| Stream rows one-by-one | Stream (default `CrxmlReader`) | Lowest latency to first row; no columnar overhead |
-| Dictionary-encoded columns | `engine="parallel"` with `auto_dict=True` | Encodes low-cardinality columns; ~0.9 s GIL tax |
-
-## Memory
-
-### Parallel (mmap): 533 MB file
-
-| Metric | Value |
-|---|---|
-| Peak RSS | 534 MB |
-| File in page cache | ~533 MB (mmap) |
-| Workload buffers | ~21 MB (columnar scratch + Arrow) |
-| Total allocations | 7,725 across 465,136 rows |
-| Largest single allocation | 533 MB (mmap) |
-
-The mmap path maps the file into virtual address space and pages it in on demand.
-The rypipe engine's output buffers are the only additional allocation of consequence.
-7,725 allocations for 465k rows (~60 allocations/row) is extremely allocation-efficient.
-
-### Stream (BufReader): 533 MB file
-
-| Metric | Value |
-|---|---|
-| Peak RSS | ~1.07 GB |
-| Explanation | BufReader (128 KiB) + accumulating Python dicts (one per row) |
-
-The stream reader holds every parsed row as a Python dict until the consumer drains the
-iterator.  At 465k rows × ~11 columns, the dict overhead dominates.  Use the stream reader
-only when processing rows incrementally (e.g., writing to a file) rather than collecting
-them all.
-
-## Bounded-engine memory curve
-
-The bounded engine (`engine="bounded"`, `memory=`) controls peak RSS by splitting the
-file into chunks that fit within the budget.  Each chunk is parsed, converted to Arrow,
-and concatenated.  Concatenation cost grows as the number of chunks increases.
-
-*[TODO: insert table of wall time vs RSS vs memory= budget]*
-
-The bounded engine's key property: **peak RSS is independent of file size** once the
-file exceeds the budget.  A 10 GB file with `memory="500MB"` peaks at ~500 MB + fixed
-overhead, not 10 GB.
-
-## mmap vs fs::read
-
-| Aspect | mmap | fs::read |
-|---|---|---|
-| Time (warm cache) | Identical | Identical |
-| RSS (file ≤ RAM) | File appears in page cache | File copied into heap |
-| RSS (file > RAM) | Pages evicted under pressure | Heap holds the full copy |
-| Cold-cache startup | Page-fault-driven (first touch) | Sequential read-ahead |
-
-On warm cache the RSS delta is near zero because the kernel's page cache already holds
-the file.  The case for mmap is files near or exceeding physical RAM, where the OS can
-evict pages under memory pressure.  The case for `fs::read` is cold-cache streaming,
-where the kernel's read-ahead is more predictable than page faults.
-
-## Correctness
-
-Every performance measurement in this document is backed by a correctness cross-check:
-all three engines (stream, columnar, parallel) produce byte-identical field values
-against both the stream-oracle and against `xml.etree.ElementTree` on the synthetic
-corpus.  The parallel engine's row-split boundaries are validated by the splitter test
-suite (18 tests covering prefix collision, CDATA/comment skipping, fallback, and random
-input).  No engine cuts corners.
+| Fastest `to_arrow`/`to_dataframe` | `engine="parallel"` | 2700–3000 MB/s 1 GB, `mmap`+off-GIL `rypipe/src/parallel.rs:27` |
+| Minimize peak memory | `engine="auto"` + `memory="256MB"` → `bounded` | RSS = budget + `Arrow` export, not file size `bounded.rs:52` |
+| Stream rows one-by-one | `engine="stream"` (now scanner-based) | 508 MB/s, lowest latency to first row, `RowSink` `lib.rs:564` no `TableBuilder` |
+| Dictionary-encoded | `engine="parallel", auto_dict=True` | 1604 MB/s 1 GB, forces `merge` `merge.rs:57` |
 
 ## The ceiling
 
-At 472 MB/s on a machine with ~30 GB/s of memory bandwidth, this parser is
-**CPU-bound**, not bandwidth-bound.  The bottleneck is not moving bytes; it's
-tokenizing XML elements, unescaping entities, and copying field values.
+At 0.7 GB/s single / 3 GB/s parallel on a ~30 GB/s memory bus, this parser is **CPU-bound** (tokenizing + `FxHash` + `StrColumn::push` `columnar.rs:53` arena). The `memchr` scanner removed the 69% `quick-xml` slice (`docs/performance.md:59` `+27%` single, `+36%` multi2), `row_dirty:Vec<bool>` `engine.rs:16` cut `finish_row` 34%→<1%, `field_index:Vec+HashMap` cut double-probe.
 
-The breakdown says parse is 69% of wall time and the biggest sub-cost is the
-quick-xml event loop (tokenizing every `<Field>`, `<Text>`, `<FormattedValue>`,
-`<Value>`, `<TextValue>` child even when the field is dropped by the `ExecutionPlan`).
-The remaining high-leverage improvement is **skip-bytes-for-unwanted-fields**:
-detecting a dropped column name and memmem-skipping to `</Field>` or `</Text>`
-without tokenizing children.
+**Measured ceilings (5800X, warm):**
 
-**Honest throughput ceiling for this codebase:**
+| CPU | Single | Parallel (16) | Parallel (32) |
+|---|---|---|---|
+| 5800X | **714** MB/s (1 GB) / 698 (100 MB) | 2641 (1 GB) / 2720 (100 MB) | **2994** (1 GB) / 2619 (100 MB) |
+| i5-1335U (est.) | 650–700 | 1.3–1.5 GB/s | — |
 
-| CPU | Estimated ceiling (parallel) |
-|---|---|
-| i5-1335U (this machine) | ~500-550 MB/s |
-| Ryzen 7 5800X (desktop) | ~800 MB/s - 1.1 GB/s |
+2 GB/s milestone cleared; 3 GB/s is the current `memchr`+`FxHash` ceiling. Next leverage is per-row `FieldId` perfect hash + unchecked `StrColumn` bump + batch `put_batch` (all benefit every adapter, see `rypipe` `writing-adapters.md`).
 
-2 GB/s would require a genuinely different parse strategy (a hand-rolled scanner
-for the fixed Crystal Reports XML structure that skips quick-xml's generality),
-which is a separate project, not a tuning pass.
+## Correctness & Coverage
+
+Every number is backed by `tests/test_differential.py` vs `xml.etree.ElementTree` (ragged, empty, entities, unicode, comments with fake row tags) and `splitter` 18 tests. `benchmarks/bench_extended.py` (`all` or `--quick`) covers 104 benchmarks/file (native + source×sink + pushdowns + chunk/bounded/batch/pipeline) ×3 rounds, best-of-N after warmup.
 
 ========================================================================
 PAGE: https://crxml.emiliano-go.com/pipeline-fusion/

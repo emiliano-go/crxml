@@ -1,0 +1,304 @@
+"""
+Extended benchmark suite for crxml — covers ALL use cases and combinations.
+
+Covers:
+- File sizes: 10, 50, 100, 1000 MB (1 GB optional / --skip-1gb)
+- Native engines: read_to_columnar (single), read_to_columnar_multi (2), read_to_columnar_par (2/4/8/16/32), read_to_columnar_bounded (64/256 MB)
+- Source engines: stream, columnar, parallel, auto (with _resolve_engine)
+- Sinks: iter (dict), iter_batches, to_arrow, to_dataframe, to_pandas, to_polars, to_parquet, Pipeline+stages, rypipe fusion
+- Pushdowns: baseline, drop_fields (half/all), field_mapping (rename), field_types (int64/float64), dictionary, auto_dict, filter (eq/ne/compare/and/or/not), schema ordering, use_mmap on/off
+- Batch sizes for streaming: 1024 vs 4096
+- Chunk scaling for parallel
+
+Reuses generation helpers from benchmarks.py. Run with --quick for 10 MB only (CI) or --full for all including 1 GB.
+"""
+
+import argparse
+import os
+import statistics
+import time
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).parent
+# Reuse generation logic from benchmarks.py
+sys.path.insert(0, str(HERE))
+from benchmarks import (
+    generate_file as gen_file,
+    HEAD, TAIL,  # noqa: F401
+)
+
+BENCH_DATA = HERE / "bench_data"
+BENCH_DATA.mkdir(exist_ok=True)
+
+# Import after generation helpers to avoid circular
+from crxml import CrystalXMLSource, _crxml_core as _core
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def best_of(fn, rounds=3):
+    best = float("inf")
+    rows = 0
+    for _ in range(rounds):
+        t0 = time.perf_counter()
+        res = fn()
+        dt = time.perf_counter() - t0
+        # row count extraction
+        try:
+            if isinstance(res, int):
+                rows = res
+            elif hasattr(res, "num_rows"):
+                rows = res.num_rows
+            elif hasattr(res, "__len__"):
+                try:
+                    rows = len(res)
+                except Exception:
+                    rows = 0
+            elif res is None:
+                rows = 0
+            else:
+                rows = 0
+        except Exception:
+            rows = 0
+        best = min(best, dt)
+    return best, rows
+
+def report(path: Path, label: str, fn, rounds=3, **kwargs):
+    sz = path.stat().st_size
+    try:
+        dt, rows = best_of(fn, rounds=rounds)
+        mb = sz / dt / 1024 / 1024 if dt > 0 else 0
+        rps = rows / dt if dt > 0 and rows else 0
+        # pull kwargs for display
+        extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
+        print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
+        return dt, rows, mb
+    except Exception as e:
+        print(f"  {label:38s} FAILED: {e}")
+        return None, 0, 0
+
+def ensure_files(targets, gen_only=False, skip_1gb=False):
+    for mb, p in targets:
+        if mb == 1024 and skip_1gb:
+            print(f"Skipping {p.name} (--skip-1gb)")
+            continue
+        if p.exists():
+            print(f"Skipping {p.name} ({p.stat().st_size/1024/1024:.1f} MB)")
+            continue
+        if gen_only:
+            print(f"Need {p.name} but --gen-only and missing — generate with --gen-only to create")
+            continue
+        print(f"Generating {mb} MB {p.name}...")
+        gen_file(mb, p)
+
+# ---------------------------------------------------------------------------
+# Matrix definitions
+# ---------------------------------------------------------------------------
+
+NATIVE_FUNCS = {
+    "single": lambda p: _core.read_to_columnar(str(p), row_tag="Details"),
+    "multi2": lambda p: _core.read_to_columnar_multi(str(p), row_tag="Details", num_chunks=2),
+    "par4": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=4),
+    "par8": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=8),
+    "par16": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=16),
+    "par32": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=32),
+    "bounded64": lambda p: _core.read_to_columnar_bounded(str(p), row_tag="Details", memory=64*1024*1024),
+    "bounded256": lambda p: _core.read_to_columnar_bounded(str(p), row_tag="Details", memory=256*1024*1024),
+}
+
+ENGINES = ["stream", "columnar", "parallel", "auto"]
+SINKS = ["iter", "iter_batches", "to_arrow", "to_dataframe", "to_pandas", "to_polars", "to_parquet"]
+
+PUSHDOWNS = {
+    "baseline": {},
+    "drop_half": {"drop_fields": ["Field22","Field23","Field38"]},
+    "drop_all": {"drop_fields": ["Field22","Field23","Field38","Field39","Field61","Field73","Level","Section","Text20","Text21","FieldG"]},
+    "rename": {"field_mapping": {"Field22": "Price","Field23": "Qty"}},
+    "typed_int": {"field_types": {"Field22": "int64","Field23": "int64"}},
+    "typed_float": {"field_types": {"Field22": "float64"}},
+    "dict": {"dictionary_columns": ["Field38","Field39"]},
+    "auto_dict": {"auto_dict": True},
+    "filter_eq": {"filter": {"field": "Level", "op": "==", "value": "3"}},
+    "filter_ne": {"filter": {"field": "Level", "op": "!=", "value": "99"}},
+    "filter_compare": {"filter": {"field_a": "Field22", "op": ">", "field_b": "Field23"}},
+    "schema": {"schema": ["Field22","Field23","Field38","Field39","Field61","Field73","Level","Section","Text20"]},
+    "mmap_off": {"use_mmap": False},
+    "mmap_on": {"use_mmap": True},
+}
+
+def run_native_matrix(path: Path, rounds=3):
+    print(f"\n-- Native Exports {path.name} --")
+    for name, fn in NATIVE_FUNCS.items():
+        # skip bounded for tiny files where it falls back
+        if "bounded" in name and path.stat().st_size < 20*1024*1024:
+            continue
+        report(path, f"native {name}", lambda fn=fn, p=path: fn(p), rounds=rounds, engine=name)
+
+def run_source_engine_sink_matrix(path: Path, rounds=3, quick=False):
+    engines = ENGINES if not quick else ["stream","parallel"]
+    sinks = SINKS if not quick else ["iter","to_arrow"]
+    for engine in engines:
+        for sink in sinks:
+            # skip expensive combos in quick mode
+            if quick and sink in ("to_polars","to_parquet") and engine == "stream":
+                continue
+            # to_* sinks are not intended for stream engine (would fallback via rows and fail on sparse columns)
+            # Skip those combos and mark as N/A
+            if engine == "stream" and sink in ("to_arrow","to_dataframe","to_pandas","to_polars","to_parquet"):
+                # streaming to_arrow is via columnar; skip to avoid sparse-column KeyError
+                continue
+            def fn(engine=engine, sink=sink, p=path):
+                src = CrystalXMLSource(str(p), row_tag="Details", engine=engine)
+                if sink == "iter":
+                    return sum(1 for _ in src)
+                elif sink == "iter_batches":
+                    return sum(1 for _ in src._iter_batches(batch_size=1024))
+                elif sink == "to_arrow":
+                    return src.to_arrow()
+                elif sink in ("to_dataframe","to_pandas"):
+                    return src.to_dataframe()
+                elif sink == "to_polars":
+                    return src.to_polars()
+                elif sink == "to_parquet":
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=True) as tf:
+                        src.to_parquet(tf.name)
+                        return src.to_arrow()
+                else:
+                    return src.to_arrow()
+            label = f"src {engine:10s} → {sink}"
+            report(path, label, fn, rounds=rounds, engine=engine, sink=sink)
+
+def run_pushdown_matrix(path: Path, rounds=3, quick=False):
+    pushdowns = PUSHDOWNS if not quick else {k: v for k, v in PUSHDOWNS.items() if k in ("baseline","drop_half","filter_eq","auto_dict")}
+    for pd_name, kwargs in pushdowns.items():
+        for engine in (["columnar","parallel"] if not quick else ["parallel"]):
+            def fn(engine=engine, kw=kwargs, p=path):
+                src = CrystalXMLSource(str(p), row_tag="Details", engine=engine, **kw)
+                return src.to_arrow()
+            label = f"push {pd_name:14s} [{engine}]"
+            report(path, label, fn, rounds=rounds, **kwargs)
+
+def run_chunk_scaling(path: Path, rounds=3):
+    print(f"\n-- Chunk Scaling {path.name} --")
+    for n in [2,4,8,16,32,64]:
+        report(path, f"par n={n:2d}", lambda n=n, p=path: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=n), rounds=rounds, n=n)
+
+def run_bounded_scaling(path: Path, rounds=2):
+    print(f"\n-- Bounded Scaling {path.name} --")
+    for mem in ["64MB","256MB","512MB"]:
+        import re
+        m = re.match(r"(\d+)(MB|GB)", mem)
+        bytes_mem = int(m.group(1)) * (1024**2 if m.group(2)=="MB" else 1024**3)
+        report(path, f"bounded {mem}", lambda b=bytes_mem, p=path: _core.read_to_columnar_bounded(str(p), row_tag="Details", memory=b), rounds=rounds, mem=mem)
+
+def run_batch_size_matrix(path: Path, rounds=3):
+    print(f"\n-- Streaming Batch Sizes {path.name} --")
+    for bs in [256,1024,4096,8192]:
+        def fn(bs=bs, p=path):
+            src = CrystalXMLSource(str(p), row_tag="Details", engine="stream", batch_size=bs)
+            return sum(1 for _ in src)
+        report(path, f"stream batch={bs}", fn, rounds=rounds, batch=bs)
+
+def run_pipeline_matrix(path: Path, rounds=2):
+    print(f"\n-- Pipeline / Fusion {path.name} --")
+    try:
+        from crxml import CrystalXMLSource, DropFields, RenameFields, FilterRows, CastTypes
+        from crxml.pipeline import Pipeline
+    except Exception as e:
+        print(f"  pipeline skipped: {e}")
+        return
+    def fn_base():
+        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel")
+        return src.to_arrow()
+    report(path, "pipe base", fn_base, rounds=rounds)
+    def fn_drop():
+        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel", drop_fields=["Field22"])
+        return src.to_arrow()
+    report(path, "pipe drop", fn_drop, rounds=rounds)
+    def fn_rename():
+        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel", field_mapping={"Field22":"Price"})
+        return src.to_arrow()
+    report(path, "pipe rename", fn_rename, rounds=rounds)
+    def fn_filter():
+        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel", filter={"field":"Level","op":"==","value":"3"})
+        return src.to_arrow()
+    report(path, "pipe filter", fn_filter, rounds=rounds)
+    # Pipeline composition — iterate via Pipeline (not CrystalXMLSource.to_arrow)
+    try:
+        def fn_pipe():
+            src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel")
+            pipe = src | DropFields(["Field22"]) | FilterRows(field="Level", op="==", value="3")
+            # Try fast path _to_arrow, else fall back to iteration
+            tbl = pipe._to_arrow()
+            if tbl is not None:
+                return tbl.num_rows
+            return sum(1 for _ in pipe)
+        report(path, "Pipeline Drop+Filter", fn_pipe, rounds=rounds)
+    except Exception as e:
+        print(f"  Pipeline Drop+Filter skipped: {e}")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="Extended crxml benchmarks — all use cases × combinations")
+    ap.add_argument("--quick", action="store_true", help="10 MB only, minimal combos (CI)")
+    ap.add_argument("--skip-1gb", action="store_true", help="Skip 1 GB file even in full mode")
+    ap.add_argument("--gen-only", action="store_true", help="Only generate files")
+    ap.add_argument("--rounds", type=int, default=3, help="Rounds best-of-N (default 3)")
+    ap.add_argument("--include", type=str, default="all", help="Comma list of sections: native,source,pushdown,chunk,bounded,batch,pipeline or all")
+    args = ap.parse_args()
+
+    # File matrix
+    if args.quick:
+        targets = [(10, BENCH_DATA / "test_10mb.xml")]
+    else:
+        targets = [(10, BENCH_DATA / "test_10mb.xml"),
+                   (50, BENCH_DATA / "test_50mb.xml"),
+                   (100, BENCH_DATA / "test_100mb.xml"),
+                   (1024, BENCH_DATA / "test_1gb.xml")]
+
+    print("="*70)
+    print("Generating / verifying files")
+    print("="*70)
+    ensure_files(targets, gen_only=args.gen_only, skip_1gb=args.skip_1gb)
+    if args.gen_only:
+        return
+
+    include = set(args.include.split(",")) if args.include != "all" else {"native","source","pushdown","chunk","bounded","batch","pipeline"}
+    rounds = args.rounds
+
+    for mb, p in targets:
+        if not p.exists():
+            print(f"\nSkipping missing {p.name}")
+            continue
+        if mb == 1024 and args.skip_1gb:
+            continue
+        size = p.stat().st_size / 1024 / 1024
+        print("\n" + "="*70)
+        print(f"FILE {p.name}  {size:.1f} MB  {mb} MB target")
+        print("="*70)
+
+        if "native" in include:
+            run_native_matrix(p, rounds=rounds)
+        if "source" in include:
+            run_source_engine_sink_matrix(p, rounds=rounds, quick=args.quick)
+        if "pushdown" in include:
+            run_pushdown_matrix(p, rounds=rounds, quick=args.quick)
+        if "chunk" in include:
+            run_chunk_scaling(p, rounds=rounds)
+        if "bounded" in include and not args.quick:
+            run_bounded_scaling(p, rounds=2 if mb>100 else 2)
+        if "batch" in include and not args.quick:
+            run_batch_size_matrix(p, rounds=rounds)
+        if "pipeline" in include:
+            run_pipeline_matrix(p, rounds=2 if args.quick else 2)
+
+    print("\nDone.")
+
+if __name__ == "__main__":
+    main()

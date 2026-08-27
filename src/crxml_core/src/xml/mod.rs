@@ -6,6 +6,7 @@
 
 pub mod decoder;
 pub mod error;
+pub(crate) mod scanner;
 pub mod splitter;
 
 pub use decoder::CrystalXmlDecoder;

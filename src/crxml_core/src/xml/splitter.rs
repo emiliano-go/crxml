@@ -2,9 +2,8 @@
 
 use std::ops::Range;
 
-use rypipe_core::Splitter;
 use memchr;
-
+use rypipe_core::Splitter;
 
 /// Format-specific splitter for Crystal Reports-style XML.
 ///

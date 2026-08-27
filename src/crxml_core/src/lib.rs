@@ -18,6 +18,36 @@ use std::path::Path;
 #[cfg(feature = "profile")]
 use std::time::Instant;
 
+/// Auto-enable mmap for large uncompressed files (>50 MB) to avoid
+/// `std::fs::read` copy (~3–10% of wall per `perf`). Respects explicit
+/// `use_mmap=true`; when `use_mmap=false` and file is large, checks magic
+/// bytes for gzip/zstd/lz4 and only enables mmap for uncompressed.
+fn auto_mmap(path: &Path, use_mmap: bool) -> bool {
+    if use_mmap {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() <= 50 * 1024 * 1024 {
+        return false;
+    }
+    // Check compression magic before enabling mmap; compressed files are
+    // decompressed into Owned via InputBuffer::detect_compression anyway.
+    if let Ok(mut f) = File::open(path) {
+        use std::io::Read;
+        let mut buf = [0u8; 4];
+        let n = f.read(&mut buf).unwrap_or(0);
+        if n >= 2 && buf[0..2] == [0x1f, 0x8b] {
+            return false; // gzip
+        }
+        if n >= 4 && (buf == [0x28, 0xb5, 0x2f, 0xfd] || buf == [0x04, 0x22, 0x4d, 0x18]) {
+            return false; // zstd / lz4
+        }
+    }
+    true
+}
+
 mod xml;
 
 // Fast allocator: replaces the system heap for all Rust-side
@@ -74,14 +104,13 @@ fn build_plan_from_kwargs(
 
     if let Some(ft) = field_types {
         for (name, type_str) in ft {
-            let ft = rypipe_core::FieldType::from_str(&type_str)
-                .ok_or_else(|| {
-                    let valid = "string, int64, float64, bool";
-                    PyException::new_err(format!(
-                        "unknown field type '{type_str}' for '{name}'; \
+            let ft = rypipe_core::FieldType::from_str(&type_str).ok_or_else(|| {
+                let valid = "string, int64, float64, bool";
+                PyException::new_err(format!(
+                    "unknown field type '{type_str}' for '{name}'; \
                          valid types: {valid}"
-                    ))
-                })?;
+                ))
+            })?;
             plan.field_types.insert(name, ft);
         }
     }
@@ -101,9 +130,7 @@ fn build_plan_from_kwargs(
             let field_b = f.get("field_b").unwrap().to_owned();
             let cop = rypipe_core::CompareOp::from_str(&op).ok_or_else(|| {
                 let valid = ">, <, >=, <=, ==, !=";
-                PlanError::new_err(format!(
-                    "unsupported compare op {op:?}; valid: {valid}"
-                ))
+                PlanError::new_err(format!("unsupported compare op {op:?}; valid: {valid}"))
             })?;
             plan.filter = Some(rypipe_core::FilterPredicate::Compare {
                 field_a,
@@ -185,7 +212,9 @@ fn concat_tables(a: PyObject, b: PyObject, py: Python<'_>) -> PyResult<PyObject>
     // Schemas differ (column order or auto_dict promotion): use promote.
     let kwargs = PyDict::new(py);
     kwargs.set_item("promote_options", "default")?;
-    Ok(pa.call_method("concat_tables", (tables_list,), Some(&kwargs))?.into())
+    Ok(pa
+        .call_method("concat_tables", (tables_list,), Some(&kwargs))?
+        .into())
 }
 
 fn record_batches_to_table(batches: Vec<RecordBatch>, py: Python<'_>) -> PyResult<PyObject> {
@@ -224,7 +253,13 @@ pub fn read_to_columnar(
     prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
-        field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
+        field_mapping,
+        drop_fields,
+        filter,
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
     )?;
 
     let p = Path::new(&path);
@@ -233,11 +268,15 @@ pub fn read_to_columnar(
     }
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
 
-    let input = rypipe_core::InputBuffer::open(p, use_mmap, prefault).map_err(map_rypipe_err)?;
+    let mmap = auto_mmap(p, use_mmap);
+    let input = rypipe_core::InputBuffer::open(p, mmap, prefault).map_err(map_rypipe_err)?;
     let bytes = input.as_slice();
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
-    let mut table_builder =
-        rypipe_core::TableBuilder::with_plan((bytes.len() / 512).max(64), plan.clone());
+    // Use splitter's estimate for capacity instead of constant 512.
+    let est_row = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag)
+        .estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
+    let cap = (bytes.len() / est_row.max(512)).max(64);
+    let mut table_builder = rypipe_core::TableBuilder::with_plan(cap, plan.clone());
     decoder.validate(bytes).map_err(map_rypipe_err)?;
     decoder
         .parse_chunk(bytes, &mut table_builder)
@@ -274,7 +313,13 @@ pub fn read_to_columnar_multi(
     prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
-        field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
+        field_mapping,
+        drop_fields,
+        filter,
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
     )?;
 
     let p = Path::new(&path);
@@ -283,25 +328,31 @@ pub fn read_to_columnar_multi(
     }
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
 
-    let input = rypipe_core::InputBuffer::open(p, use_mmap, prefault).map_err(map_rypipe_err)?;
+    let mmap = auto_mmap(p, use_mmap);
+    let input = rypipe_core::InputBuffer::open(p, mmap, prefault).map_err(map_rypipe_err)?;
     let bytes = input.as_slice();
     let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let split_points = splitter.find_split_points(bytes, num_chunks);
     let ranges = split_points_to_ranges(&split_points, bytes.len());
 
-    let mut merged =
-        rypipe_core::TableBuilder::with_plan((bytes.len() / 512).max(64), plan.clone());
+    let est_row = splitter.estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
+    let cap = (bytes.len() / est_row.max(512)).max(64);
+    let mut merged = rypipe_core::TableBuilder::with_plan(cap, plan.clone());
     for range in ranges {
         let mut sink =
-            rypipe_core::TableBuilder::with_plan((range.len() / 512).max(64), plan.clone());
-        decoder
-            .validate(&bytes[range.clone()])
-            .map_err(|e| XmlError::new_err(format!("Columnar parse error in chunk {:?}: {}", range, e)))?;
+            rypipe_core::TableBuilder::with_plan((range.len() / est_row.max(512)).max(64), plan.clone());
+        decoder.validate(&bytes[range.clone()]).map_err(|e| {
+            XmlError::new_err(format!("Columnar parse error in chunk {:?}: {}", range, e))
+        })?;
         decoder
             .parse_chunk(&bytes[range.clone()], &mut sink)
-            .map_err(|e| XmlError::new_err(format!("Columnar parse error in chunk {:?}: {}", range, e)))?;
-        merged.extend(sink).map_err(|e| MergeError::new_err(e.to_string()))?;
+            .map_err(|e| {
+                XmlError::new_err(format!("Columnar parse error in chunk {:?}: {}", range, e))
+            })?;
+        merged
+            .extend(sink)
+            .map_err(|e| MergeError::new_err(e.to_string()))?;
     }
 
     if merged.num_columns() == 0 {
@@ -335,7 +386,13 @@ pub fn read_to_columnar_par(
     prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
-        field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
+        field_mapping,
+        drop_fields,
+        filter,
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
     )?;
 
     let p = Path::new(&path);
@@ -344,7 +401,8 @@ pub fn read_to_columnar_par(
     }
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
 
-    let input = rypipe_core::InputBuffer::open(p, use_mmap, prefault).map_err(map_rypipe_err)?;
+    let mmap = auto_mmap(p, use_mmap);
+    let input = rypipe_core::InputBuffer::open(p, mmap, prefault).map_err(map_rypipe_err)?;
     let bytes = input.as_slice();
     let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
@@ -371,7 +429,13 @@ pub fn read_to_columnar_bounded(
     prefault: bool,
 ) -> PyResult<PyObject> {
     let plan = build_plan_from_kwargs(
-        field_mapping, drop_fields, filter, field_types, dictionary_columns, schema, auto_dict,
+        field_mapping,
+        drop_fields,
+        filter,
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
     )?;
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
 
@@ -403,7 +467,9 @@ fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
     let mut sink = rypipe_core::TableBuilder::with_plan(est, plan);
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(row_tag);
     decoder.validate(bytes).map_err(map_rypipe_err)?;
-    decoder.parse_chunk(bytes, &mut sink).map_err(map_rypipe_err)?;
+    decoder
+        .parse_chunk(bytes, &mut sink)
+        .map_err(map_rypipe_err)?;
     let batch = sink.finish().map_err(map_rypipe_err)?;
     Python::with_gil(|py| record_batch_to_table(batch, py))
 }
@@ -460,10 +526,17 @@ macro_rules! measure_el {
 
 #[cfg(not(feature = "profile"))]
 macro_rules! measure_el {
-    ($profile:expr, $field:ident, $body:expr) => { $body };
+    ($profile:expr, $field:ident, $body:expr) => {
+        $body
+    };
 }
 
-/// Pure-Rust parsing state for the stream engine.
+/// Pure-Rust parsing state for the stream engine (super-optimized).
+///
+/// Uses the same `memchr` scanner as columnar (`crate::xml::scanner`) but
+/// yields rows one-by-one via a `RowSink` instead of `TableBuilder`. Holds
+/// `InputBuffer` (mmap or owned) like columnar for zero-copy, and reuses
+/// `find_special_regions` / `next_row_start` for split-scan quality.
 ///
 /// # Load-bearing invariants
 /// - Holds **no** `Py<...>` objects. This is required for `py.allow_threads`
@@ -471,18 +544,46 @@ macro_rules! measure_el {
 ///   interned-key cache) lives on `CrxmlReader` beside this struct, and only
 ///   the GIL-held dict-build code touches it.
 struct RowParser {
-    reader: Reader<BufReader<File>>,
-    buf: Vec<u8>,
-    inner_buf: Vec<u8>,
+    input: rypipe_core::InputBuffer,
+    pos: usize,
+    regions: Vec<Range<usize>>,
+    row_tag: Vec<u8>,
     /// Per-row scratch buffer (cleared each row, retains capacity).
     row: Vec<(String, String)>,
-    row_tag: Vec<u8>,
     /// Flat field buffer for batched output. Grows to fit one batch.
     batch_vals: Vec<(String, String)>,
     /// Field count per row in `batch_vals`, for slicing.
     batch_lens: Vec<usize>,
     #[cfg(feature = "profile")]
     profile: ProfileCounters,
+}
+
+/// Adapter sink for streaming: pushes `Value::Str` directly into `RowParser::row`
+/// without `TableBuilder`'s `FxHashMap` / arena / `row_dirty` overhead. Used
+/// only by `RowParser::read_one_row` / `read_batch_into`.
+struct RowSink<'a> {
+    row: &'a mut Vec<(String, String)>,
+}
+
+impl<'a> rypipe_core::ColumnarSink for RowSink<'a> {
+    fn begin_row(&mut self) {
+        self.row.clear();
+    }
+    fn put_field(&mut self, name: &str, value: rypipe_core::Value<'_>) {
+        // `scanner` only emits `Value::Str`; other variants are coerced via `to_string`.
+        let v = match value {
+            rypipe_core::Value::Str(s) => s.to_string(),
+            rypipe_core::Value::Int64(i) => i.to_string(),
+            rypipe_core::Value::Float64(f) => f.to_string(),
+            rypipe_core::Value::Bool(b) => b.to_string(),
+            _ => String::new(),
+        };
+        self.row.push((name.to_string(), v));
+    }
+    fn end_row(&mut self) {}
+    fn finish(&mut self) -> rypipe_core::Result<RecordBatch> {
+        Ok(RecordBatch::new_empty(std::sync::Arc::new(arrow::datatypes::Schema::empty())))
+    }
 }
 
 /// Streaming CR XML row parser exposed to Python.
@@ -514,208 +615,15 @@ fn new_dict(py: Python<'_>) -> Bound<'_, PyDict> {
 // Pure-Rust helpers (not #[pymethods]): no Python objects touched.
 impl RowParser {
     fn read_one_row(&mut self) -> Result<Option<usize>, String> {
-        #[cfg(feature = "profile")]
-        let profile = &mut self.profile;
-        let RowParser { reader, buf, inner_buf, row, row_tag, .. } = self;
-        row.clear();
-
-        loop {
-            let event = measure_el!(profile, event_loop_ns, reader
-                .read_event_into(buf)
-                .map_err(|e| format!("XML parse error: {}", e))?);
-
-            match event {
-                Event::Empty(ref e) if e.name().as_ref() == row_tag.as_slice() => {
-                    for attr in e.attributes() {
-                        let attr = attr.map_err(|e| format!("Attribute error: {}", e))?;
-                        let key = std::str::from_utf8(attr.key.as_ref())
-                            .map_err(|e| format!("Non-UTF8 attribute key: {}", e))?;
-                        let value = measure_el!(profile, unescape_ns, attr
-                            .unescape_value()
-                            .map_err(|e| format!("Value unescape error: {}", e))?);
-                        row.push((key.to_owned(), value.into_owned()));
-                    }
-                    buf.clear();
-                    return Ok(Some(row.len()));
-                }
-
-                Event::Start(ref e) if e.name().as_ref() == row_tag.as_slice() => {
-                    for attr in e.attributes() {
-                        let attr = attr.map_err(|e| format!("Attribute error: {}", e))?;
-                        let key = std::str::from_utf8(attr.key.as_ref())
-                            .map_err(|e| format!("Non-UTF8 attribute key: {}", e))?;
-                        let value = measure_el!(profile, unescape_ns, attr
-                            .unescape_value()
-                            .map_err(|e| format!("Value unescape error: {}", e))?);
-                        row.push((key.to_owned(), value.into_owned()));
-                    }
-
-                    loop {
-                        let child_event = measure_el!(profile, event_loop_ns, reader
-                            .read_event_into(buf)
-                            .map_err(|e| format!("XML parse error: {}", e))?);
-
-                        match child_event {
-                            Event::Start(ref child) | Event::Empty(ref child) => {
-                                let child_name = child.name();
-                                let child_tag = child_name.as_ref();
-
-                                if child_tag == b"Field" {
-                                    let mut field_name: Option<String> = None;
-                                    for attr in child.attributes() {
-                                        if let Ok(attr) = attr {
-                                            let attr_key = attr.key.as_ref();
-                                            if attr_key == b"FieldName" || attr_key == b"Name" {
-                                                if let Ok(value) = measure_el!(profile, unescape_ns, attr.unescape_value()) {
-                                                    field_name = Some(value.into_owned());
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let key = field_name.unwrap_or_else(|| "Field".to_string());
-
-                                    let mut text = String::new();
-                                    if matches!(child_event, Event::Start(_)) {
-                                        let field_end_bytes = child_name.as_ref();
-                                        loop {
-                                            let inner = measure_el!(profile, event_loop_ns, reader
-                                                .read_event_into(inner_buf)
-                                                .map_err(|e| format!("XML parse error: {}", e))?);
-                                            match inner {
-                                                Event::Start(ref inner_child)
-                                                | Event::Empty(ref inner_child) => {
-                                                    let inner_child_name = inner_child.name();
-                                                    let inner_tag = inner_child_name.as_ref();
-                                                    if inner_tag == b"FormattedValue"
-                                                        || inner_tag == b"Value"
-                                                    {
-                                                        if matches!(inner, Event::Start(_)) {
-                                                            let text_event = measure_el!(profile, event_loop_ns, reader
-                                                                .read_event_into(inner_buf)
-                                                                .map_err(|e| {
-                                                                    format!("Text read error: {}", e)
-                                                                })?);
-                                                            if let Event::Text(txt) = text_event {
-                                                                text = measure_el!(profile, unescape_ns, txt
-                                                                    .unescape()
-                                                                    .map_err(|e| {
-                                                                        format!(
-                                                                            "Text unescape error: {}",
-                                                                            e
-                                                                        )
-                                                                    })?
-                                                                    .into_owned());
-                                                            }
-                                                        }
-                                                        inner_buf.clear();
-                                                    }
-                                                }
-                                                Event::End(ref e)
-                                                    if e.name().as_ref()
-                                                        == field_end_bytes =>
-                                                {
-                                                    break;
-                                                }
-                                                Event::Eof => return Ok(None),
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    row.push((key, text));
-                                } else if child_tag == b"Text" {
-                                    let mut text_name: Option<String> = None;
-                                    for attr in child.attributes() {
-                                        if let Ok(attr) = attr {
-                                            if attr.key.as_ref() == b"Name" {
-                                                if let Ok(value) = measure_el!(profile, unescape_ns, attr.unescape_value()) {
-                                                    text_name = Some(value.into_owned());
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let key = text_name.unwrap_or_else(|| "Text".to_string());
-
-                                    let mut text = String::new();
-                                    if matches!(child_event, Event::Start(_)) {
-                                        let text_end_bytes = child_name.as_ref();
-                                        loop {
-                                            let inner = measure_el!(profile, event_loop_ns, reader
-                                                .read_event_into(inner_buf)
-                                                .map_err(|e| format!("XML parse error: {}", e))?);
-                                            match inner {
-                                                Event::Start(ref inner_child)
-                                                | Event::Empty(ref inner_child) => {
-                                                    let inner_child_name = inner_child.name();
-                                                    let inner_tag = inner_child_name.as_ref();
-                                                    if inner_tag == b"TextValue"
-                                                    {
-                                                        if matches!(inner, Event::Start(_)) {
-                                                            let text_event = measure_el!(profile, event_loop_ns, reader
-                                                                .read_event_into(inner_buf)
-                                                                .map_err(|e| {
-                                                                    format!("Text read error: {}", e)
-                                                                })?);
-                                                            if let Event::Text(txt) = text_event {
-                                                                text = measure_el!(profile, unescape_ns, txt
-                                                                    .unescape()
-                                                                    .map_err(|e| {
-                                                                        format!(
-                                                                            "Text unescape error: {}",
-                                                                            e
-                                                                        )
-                                                                    })?
-                                                                    .into_owned());
-                                                            }
-                                                        }
-                                                        inner_buf.clear();
-                                                    }
-                                                }
-                                                Event::End(ref e)
-                                                    if e.name().as_ref()
-                                                        == text_end_bytes =>
-                                                {
-                                                    break;
-                                                }
-                                                Event::Eof => return Ok(None),
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    row.push((key, text));
-                                } else if child_tag == b"Section" {
-                                    let sn = child
-                                        .attributes()
-                                        .filter_map(|a| a.ok())
-                                        .find(|a| a.key.as_ref() == b"SectionNumber")
-                                        .and_then(|a| measure_el!(profile, unescape_ns, a.unescape_value().ok()))
-                                        .unwrap_or_default()
-                                        .into_owned();
-                                    row.push(("Section".to_string(), sn));
-                                } else {
-                                    let key = std::str::from_utf8(child_tag)
-                                        .map_err(|e| {
-                                            format!("Non-UTF8 tag name: {}", e)
-                                        })?
-                                        .to_owned();
-                                    row.push((key, String::new()));
-                                }
-                            }
-
-                            Event::End(ref e) if e.name().as_ref() == row_tag.as_slice() => {
-                                break;
-                            }
-                            Event::Eof => return Ok(None),
-                            _ => {}
-                        }
-                    }
-                    return Ok(Some(row.len()));
-                }
-
-                Event::Eof => return Ok(None),
-                _ => {}
+        self.row.clear();
+        let bytes = self.input.as_slice();
+        let mut sink = RowSink { row: &mut self.row };
+        match crate::xml::scanner::scan_one_row(bytes, self.pos, &self.row_tag, &self.regions, &mut sink) {
+            Some(next) => {
+                self.pos = next;
+                Ok(Some(self.row.len()))
             }
+            None => Ok(None),
         }
     }
 
@@ -745,17 +653,30 @@ impl CrxmlReader {
         if !p.is_file() {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
         }
-        let file = File::open(p)
-            .map_err(|e| PyIOError::new_err(format!("Cannot open {}: {}", path, e)))?;
-        let reader = Reader::from_reader(BufReader::with_capacity(128 * 1024, file));
         let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+        let mmap = auto_mmap(p, false);
+        let input = rypipe_core::InputBuffer::open(p, mmap, false)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let regions = {
+            let bytes = input.as_slice();
+            let (regs, _) = crate::xml::splitter::find_special_regions(bytes);
+            regs
+        };
+        {
+            let bytes = input.as_slice();
+            rypipe_core::RecordParser::validate(
+                &crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag),
+                bytes,
+            )
+            .map_err(|e| XmlError::new_err(e.to_string()))?;
+        }
         Ok(CrxmlReader {
             parser: RowParser {
-                reader,
-                buf: Vec::with_capacity(4096),
-                inner_buf: Vec::with_capacity(4096),
-                row: Vec::with_capacity(16),
+                input,
+                pos: 0,
+                regions,
                 row_tag,
+                row: Vec::with_capacity(16),
                 batch_vals: Vec::with_capacity(16 * 1024),
                 batch_lens: Vec::with_capacity(1024),
                 #[cfg(feature = "profile")]
@@ -844,7 +765,6 @@ impl CrxmlReader {
     fn reset_profile(&mut self) {
         self.parser.profile = ProfileCounters::default();
     }
-
 }
 
 #[pymodule]
