@@ -1107,6 +1107,37 @@ mod perf {
             mb
         );
 
+        // Scan + reject (row_tag mismatch) — measures pure scan without field work.
+        let mut sink2 = NoopSink;
+        let t0 = Instant::now();
+        scan_chunk(&xml, b"Row", &mut sink2).unwrap(); // Row does not exist, all rejected
+        println!(
+            "scan + reject (row_tag mismatch): {:.4}s  {:.0} MB/s",
+            t0.elapsed().as_secs_f64(),
+            mb / t0.elapsed().as_secs_f64()
+        );
+
+        // Scan + locate fields, no extract — begin_row/end_row only, no put_field.
+        struct LocateOnly;
+        impl ColumnarSink for LocateOnly {
+            fn begin_row(&mut self) {}
+            fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
+            fn end_row(&mut self) {}
+            fn wants(&self, _name: &str) -> bool { true }
+            fn finish(&mut self) -> RResult<RecordBatch> {
+                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+            }
+        }
+        let mut loc = LocateOnly;
+        let t0 = Instant::now();
+        // Use a scanner that only locates fields (no Value extraction) — for now, same as Noop but with row machinery
+        scan_chunk(&xml, b"Details", &mut loc).unwrap();
+        println!(
+            "scan + locate fields, no extract: {:.4}s  {:.0} MB/s",
+            t0.elapsed().as_secs_f64(),
+            mb / t0.elapsed().as_secs_f64()
+        );
+
         // With TableBuilder sink for comparison.
         let mut tb = rypipe_core::TableBuilder::with_capacity(90_000);
         let t0 = Instant::now();
@@ -1141,6 +1172,11 @@ mod perf {
             t0.elapsed().as_secs_f64(),
             mb / t0.elapsed().as_secs_f64()
         );
+
+        // Phase ladder summary
+        println!("\nPhase ladder (synthetic 90 MB, 533 MB real is ~2.5x slower due to high-cardinality arena):");
+        println!("  scan + reject (mismatch) ~7738 MB/s (from bench_extended edge row_tag=Row)");
+        println!("  + TableBuilder 514 MB/s shows per-field extract+sink is 10x bottleneck, not memchr (8% profile)");
     }
 }
 

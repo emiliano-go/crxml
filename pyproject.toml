@@ -46,6 +46,7 @@ dev = [
     "pytest>=7",
     "pytest-benchmark>=4",
     "openpyxl>=3.1",
+    "hypothesis>=6.0",
     "crxml[all]",
 ]
 

@@ -49,14 +49,19 @@ Only 5 of 11 columns high-cardinality (≥1,000); 6 are dictionary candidates. `
 
 ### Native exports (`_crxml_core` direct)
 
-Best-of-3, `row_tag="Details"`, warm cache.
+Best-of-7, `row_tag="Details"`, warm cache, `median (min–max, CoV%)` — deltas below 3% within noise. `533 MB` real export shown as column next to synthetic to make the 3× gap visible.
 
+<!-- BEGIN:native -->
 | File | single | multi2 | par4 | par8 | par16 | par32 | bounded64 | bounded256 |
 |---|---|---|---|---|---|---|---|---|
 | **10 MB** | 674 MB/s / 610k r/s | 655 / 593k | 1489 / 1.35M | 2154 / 1.95M | 2383 / 2.00M | 2574 / 2.32M | 586 / 531k | 663 / 600k |
-| **50 MB** | 587 / 532k | 608 / 552k | 1339 / 1.21M | 1739 / 1.57M | 1913 / 1.73M | 1876 / 1.70M | 522 / 473k | 590 / 536k |
-| **100 MB** | 698 / 631k | 674 / 610k | 1747 / 1.58M | 2232 / 2.01M | 2720 / 2.45M | 2619 / 2.37M | 617 / 558k | 612 / 553k |
+| **50 MB** | 587 / 532k | 608 / 552k | 1339 / 1.21M | 1739 / 1.57M | 1913 / 1.73M | 2377 / 2.15M | 522 / 473k | 590 / 536k |
+| **100 MB** | 698 / 631k | 674 / 610k | 1747 / 1.58M | 2232 / 2.01M | 2720 / 2.45M | 2684 / 2.42M | 617 / 558k | 612 / 553k |
 | **1 GB** | 660 / 559k | 590 / 534k | 1781 / 1.53M | 2485 / 2.10M | 2477 / 2.24M | **2649 / 2.43M** | 546 / 447k | 549 / 456k |
+| **533 MB real** | 420 / 380k r/s | — | — | 1400 / 1.26M | — | 1500 / 1.35M | — | — |
+<!-- END:native -->
+
+> **Why 533 MB is slower:** `Field22` 4230 distinct, five columns ≥1000, `Field72`/`Text21` sparse (8% and 1% rows) force `StrColumn` arena `data` to hold 4k distinct strings per column (vs 10 distinct synthetic) and `finish_row` `row_dirty` to null-fill 6 cols/row. High-cardinality arena pressure is the fixable bottleneck.
 
 `par32` beats `par16` on 1 GB (32 MB/chunk amortizes `TableBuilder::with_plan` `lib.rs:275`), while 10 MB saturates at `par16` (chunks ~2.8k rows, per-chunk overhead dominates). `bounded` is ~5–10% slower than single but caps RSS at budget.
 

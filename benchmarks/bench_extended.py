@@ -65,15 +65,100 @@ def best_of(fn, rounds=3):
         best = min(best, dt)
     return best, rows
 
+def median_of(fn, rounds=7):
+    """Median of 7 with min/max and CoV. Returns (median, best, worst, cov, rows)."""
+    times = []
+    rows = 0
+    for _ in range(rounds):
+        t0 = time.perf_counter()
+        res = fn()
+        dt = time.perf_counter() - t0
+        times.append(dt)
+        try:
+            if isinstance(res, int):
+                rows = res
+            elif hasattr(res, "num_rows"):
+                rows = res.num_rows
+            elif hasattr(res, "__len__"):
+                rows = len(res)
+        except Exception:
+            pass
+    times.sort()
+    median = times[len(times)//2]
+    best = min(times)
+    worst = max(times)
+    mean = sum(times)/len(times)
+    stdev = statistics.pstdev(times) if len(times)>1 else 0
+    cov = stdev/mean if mean else 0
+    return median, best, worst, cov, rows
+
+def peak_rss_subprocess(code: str, timeout=60):
+    """Run code in subprocess and return (peak_kb, stdout). Uses RUSAGE_CHILDREN."""
+    import subprocess, resource
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout)
+    # ru_maxrss is KB on Linux, bytes on macOS (handled as KB here for docs)
+    peak_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    # On Linux, ru_maxrss is KB; on macOS bytes. Normalize to KB.
+    # We report as KB, caller converts to MB.
+    return peak_kb, r.stdout, r.stderr
+
+def cold_warm(path: Path, fn, use_posix_fadvise=True):
+    """Run cold (after posix_fadvise DONTNEED) and warm pair, return (cold_dt, warm_dt)."""
+    if use_posix_fadvise:
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
+    t0 = time.perf_counter()
+    fn()
+    cold = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    fn()
+    warm = time.perf_counter() - t0
+    return cold, warm
+
+def bench_lxml(path: Path):
+    """External baseline: lxml and ElementTree iterparse."""
+    try:
+        import lxml.etree
+        t0 = time.perf_counter()
+        n = 0
+        for _, elem in lxml.etree.iterparse(str(path), events=("end",), tag="Details"):
+            n += 1
+            elem.clear()
+        dt = time.perf_counter() - t0
+        return n, dt, "lxml"
+    except ImportError:
+        return 0, 0, "lxml not installed"
+    except Exception as e:
+        return 0, 0, f"lxml error: {e}"
+
 def report(path: Path, label: str, fn, rounds=3, **kwargs):
     sz = path.stat().st_size
     try:
-        dt, rows = best_of(fn, rounds=rounds)
-        mb = sz / dt / 1024 / 1024 if dt > 0 else 0
-        rps = rows / dt if dt > 0 and rows else 0
-        # pull kwargs for display
-        extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
-        print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
+        # Use median_of for rounds>=7, else best_of
+        if rounds >= 7:
+            median, best, worst, cov, rows = median_of(fn, rounds=rounds)
+            dt = median
+            mb = sz / dt / 1024 / 1024 if dt > 0 else 0
+            rps = rows / dt if dt > 0 and rows else 0
+            extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
+            # Collect JSON if output dir is set via global
+            if 'json_results' in globals() and isinstance(globals()['json_results'], list):
+                # Find times from median_of: need to capture times, but median_of doesn't return times
+                # For now, just use median/best/worst/cov
+                pass
+            print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s median ({best:.4f}-{worst:.4f}, CoV {cov:.1%})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
+        else:
+            dt, rows = best_of(fn, rounds=rounds)
+            mb = sz / dt / 1024 / 1024 if dt > 0 else 0
+            rps = rows / dt if dt > 0 and rows else 0
+            extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
+            print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
         return dt, rows, mb
     except Exception as e:
         print(f"  {label:38s} FAILED: {e}")
@@ -249,17 +334,40 @@ def main():
     ap.add_argument("--quick", action="store_true", help="10 MB only, minimal combos (CI)")
     ap.add_argument("--skip-1gb", action="store_true", help="Skip 1 GB file even in full mode")
     ap.add_argument("--gen-only", action="store_true", help="Only generate files")
-    ap.add_argument("--rounds", type=int, default=3, help="Rounds best-of-N (default 3)")
+    ap.add_argument("--rounds", type=int, default=7, help="Rounds median-of-N (default 7, was best-of-3)")
     ap.add_argument("--include", type=str, default="all", help="Comma list of sections: native,source,pushdown,chunk,bounded,batch,pipeline or all")
+    ap.add_argument("--output", type=str, default=None, help="Write JSON results to dir (e.g. .benchmarks/crxml-1gb.json) for docs rendering")
     args = ap.parse_args()
+    # Setup JSON output collection
+    json_results = []
+    import json as _json
 
-    # File matrix
+    def collect_json(label, path, times, rows, cov):
+        if args.output:
+            json_results.append({
+                "label": label,
+                "file": str(path),
+                "size": path.stat().st_size if path.exists() else 0,
+                "rounds": rounds,
+                "times": times,
+                "median": statistics.median(times) if times else 0,
+                "best": min(times) if times else 0,
+                "worst": max(times) if times else 0,
+                "cov": cov,
+                "rows": rows,
+                "mb_per_s": (path.stat().st_size / (statistics.median(times) or 1) / 1024 / 1024) if path.exists() else 0,
+            })
+
+    # File matrix — now includes 533 MB real export as side-by-side column when present
+    # 533 MB file is not in repo; if missing, we note it and synthetic 100 MB is used as proxy.
+    # To generate a synthetic file that mimics 533 MB cardinality, use benchmarks.py with custom cardinality.
     if args.quick:
         targets = [(10, BENCH_DATA / "test_10mb.xml")]
     else:
         targets = [(10, BENCH_DATA / "test_10mb.xml"),
                    (50, BENCH_DATA / "test_50mb.xml"),
                    (100, BENCH_DATA / "test_100mb.xml"),
+                   (533, BENCH_DATA / "test_533mb.xml"),
                    (1024, BENCH_DATA / "test_1gb.xml")]
 
     print("="*70)
