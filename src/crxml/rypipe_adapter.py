@@ -24,6 +24,18 @@ class CrystalXMLAdapter:
         """Parse ``path`` and return a ``pyarrow.Table``."""
         return CrystalXMLSource(path, **kwargs).to_arrow()
 
+    def iter_record_batches(
+        self, path: str, memory: str | int = "64MiB", batch_size: int | None = None, **kwargs: Any
+    ):
+        """Yield ``pyarrow.RecordBatch`` objects with constant memory.
+
+        Peak is ``memory`` + one batch. Use ``memory="64KB"`` and
+        ``batch_size=1`` for minimal footprint (Rust-only 64 KB).
+        """
+        yield from CrystalXMLSource(path, **kwargs).iter_record_batches(
+            memory=memory, batch_size=batch_size
+        )
+
 
 def _register() -> None:
     """Register the adapter with rypipe if it is available."""

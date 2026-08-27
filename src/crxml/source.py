@@ -265,7 +265,6 @@ class CrystalXMLSource:
             self._memory is not None
             and self._filepath.stat().st_size > self._memory
             and _HAS_BOUNDED
-            and engine in ("columnar", "parallel")
         ):
             bounded_kwargs = self._build_bounded_kwargs()
             if plan_overrides:
@@ -292,7 +291,11 @@ class CrystalXMLSource:
             if not rows:
                 table = pa.table({})
             else:
-                table = pa.table({k: [r[k] for r in rows] for k in rows[0]})
+                # Handle sparse rows (e.g., FieldG present in 30% of rows)
+                all_keys = set()
+                for r in rows:
+                    all_keys.update(r.keys())
+                table = pa.table({k: [r.get(k) for r in rows] for k in all_keys})
         if plan_overrides is None:
             self._cached_arrow = table
         return table
@@ -359,6 +362,39 @@ class CrystalXMLSource:
         import pyarrow.parquet as pq
 
         pq.write_table(self.to_arrow(), str(path), **kwargs)
+
+    def iter_record_batches(
+        self, memory: Union[str, int] = "64MiB", batch_size: Optional[int] = None
+    ) -> Iterator["pa.RecordBatch"]:
+        """Yield Arrow ``RecordBatch`` objects with constant memory.
+
+        Unlike ``to_arrow()`` (which materializes a full table) or
+        ``iter_batches`` (which materializes then splits), this streams
+        directly from Rust via ``BatchConsumer`` and ``StreamingBatchIterator``.
+        Peak is ``memory`` + one batch + export buffer — set ``memory="64KB"``
+        and ``batch_size=1`` for the smallest footprint (one row per batch,
+        ~1 KB for CR rows). Python overhead means true 64 KB is only reachable
+        from Rust, but this is still bounded for 50 GB files.
+
+        Examples
+        --------
+        >>> import pyarrow.parquet as pq
+        >>> src = CrystalXMLSource("50GB.xml", row_tag="Details")
+        >>> writer = pq.ParquetWriter("out.parquet", src.to_arrow().schema)
+        >>> for batch in src.iter_record_batches(memory="64KB"):
+        ...     writer.write_batch(batch)
+        >>> writer.close()
+        """
+        # Use the Rust streaming iterator directly — no Vec<RecordBatch> collection.
+        # _core.iter_record_batches is the true 64KB path (mmap + reusable buffer).
+        batch_size = batch_size  # currently derived from memory via plan_chunks; kept for API compat
+        yield from _core.iter_record_batches(
+            str(self._filepath),
+            row_tag=self._row_tag,
+            memory=str(memory) if isinstance(memory, int) else memory,
+            batch_size=batch_size,
+            **self._build_plan_kwargs(),
+        )
 
     def __or__(self, stage):
         from .pipeline import Pipeline

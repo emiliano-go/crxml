@@ -70,3 +70,45 @@ class Pipeline:
             batch_size=batch_size,
             workers=workers,
         )
+
+    def iter_record_batches(
+        self, memory: int | str = "64MiB", batch_size: int | None = None
+    ):
+        """Yield ``RecordBatch`` with constant memory.
+
+        Streaming via ``BatchConsumer`` when source and stages are fusable;
+        otherwise falls back to ``iter_arrow_batches``.
+        """
+        src = self._source
+        if hasattr(src, "iter_record_batches"):
+            try:
+                from .fusion import plan_split
+
+                plan_overrides, remaining = plan_split(self._stages)
+                if not remaining:
+                    yield from src.iter_record_batches(
+                        memory=memory, batch_size=batch_size, **(plan_overrides or {})
+                    )
+                    return
+            except Exception:
+                pass
+        yield from self.iter_arrow_batches(batch_size=batch_size)
+
+    def iter_arrow_batches(self, batch_size: int | None = None):
+        """Yield ``RecordBatch`` (materialized fallback)."""
+        if batch_size is None:
+            batch_size = self._batch_size
+        import pyarrow as pa
+
+        table = self._to_arrow()
+        if table is not None:
+            yield from table.to_batches(max_chunksize=batch_size)
+            return
+        batch: list[dict] = []
+        for row in self:
+            batch.append(row)
+            if len(batch) >= batch_size:
+                yield from pa.Table.from_pylist(batch).to_batches()
+                batch = []
+        if batch:
+            yield from pa.Table.from_pylist(batch).to_batches()

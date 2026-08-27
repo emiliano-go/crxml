@@ -767,12 +767,135 @@ impl CrxmlReader {
     }
 }
 
+#[pyclass]
+pub struct PyStreamingBatchIterator {
+    inner: std::sync::Mutex<Option<rypipe_core::StreamingBatchIterator>>,
+}
+
+#[pymethods]
+impl PyStreamingBatchIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        // Take the iterator out without holding the lock while blocking
+        let mut iter_opt = {
+            let mut guard = self.inner.lock().map_err(|_| PyException::new_err("iterator poisoned"))?;
+            guard.take()
+        };
+        if iter_opt.is_none() {
+            return Ok(None);
+        }
+        let next = py.allow_threads(|| iter_opt.as_mut().unwrap().next());
+        let mut guard = self.inner.lock().map_err(|_| PyException::new_err("iterator poisoned"))?;
+        match next {
+            Some(Ok(batch)) => {
+                *guard = iter_opt;
+                let obj = batch.to_pyarrow(py).map_err(|e| PyException::new_err(e.to_string()))?;
+                Ok(Some(obj.into()))
+            }
+            Some(Err(e)) => {
+                *guard = None;
+                Err(map_rypipe_err(e))
+            }
+            None => {
+                *guard = None;
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, row_tag=None, memory=None, batch_size=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, use_mmap=None))]
+pub fn iter_record_batches(
+    path: String,
+    row_tag: Option<String>,
+    memory: Option<PyObject>,
+    batch_size: Option<usize>,
+    field_mapping: Option<HashMap<String, String>>,
+    drop_fields: Option<Vec<String>>,
+    filter: Option<HashMap<String, String>>,
+    field_types: Option<HashMap<String, String>>,
+    dictionary_columns: Option<Vec<String>>,
+    schema: Option<Vec<String>>,
+    auto_dict: bool,
+    prefault: bool,
+    use_mmap: Option<bool>,
+) -> PyResult<PyStreamingBatchIterator> {
+    let plan = build_plan_from_kwargs(
+        field_mapping,
+        drop_fields,
+        filter,
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
+    )?;
+    let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
+    let budget = {
+        // Parse memory which may be int (bytes) or string ("64KB", "64MB", etc.)
+        Python::with_gil(|py| -> PyResult<rypipe_core::MemoryBudget> {
+            let mem_obj = match &memory {
+                Some(o) => o,
+                None => return Ok(rypipe_core::MemoryBudget::new(64*1024*1024)),
+            };
+            if let Ok(val) = mem_obj.extract::<usize>(py) {
+                Ok(rypipe_core::MemoryBudget::new(val.max(1)))
+            } else if let Ok(s) = mem_obj.extract::<String>(py) {
+                let s = s.trim().to_string();
+                let (num_str, unit) = if s.to_lowercase().ends_with("kb") {
+                    (s[..s.len()-2].to_string(), "KB")
+                } else if s.to_lowercase().ends_with("mb") {
+                    (s[..s.len()-2].to_string(), "MB")
+                } else if s.to_lowercase().ends_with("gb") {
+                    (s[..s.len()-2].to_string(), "GB")
+                } else if s.to_lowercase().ends_with("b") {
+                    (s[..s.len()-1].to_string(), "B")
+                } else {
+                    (s.clone(), "B")
+                };
+                let num: f64 = num_str.parse().map_err(|_| PyException::new_err(format!("invalid memory {:?}", s)))?;
+                let mult = match unit {
+                    "B" => 1,
+                    "KB" => 1024,
+                    "MB" => 1024*1024,
+                    "GB" => 1024*1024*1024,
+                    _ => 1,
+                };
+                Ok(rypipe_core::MemoryBudget::new(((num * mult as f64) as usize).max(1)))
+            } else {
+                Err(PyException::new_err(format!("invalid memory {:?}", mem_obj)))
+            }
+        })?
+    };
+    let _batch_size = batch_size; // currently derived from budget via plan_chunks; kept for API compat
+    let p = Path::new(&path);
+    if !p.is_file() {
+        return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
+    }
+    let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
+    let parser = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
+    let iter = rypipe_core::StreamingBatchIterator::new(
+        p.to_path_buf(),
+        splitter,
+        parser,
+        plan,
+        budget,
+        prefault,
+    );
+    Ok(PyStreamingBatchIterator { inner: std::sync::Mutex::new(Some(iter)) })
+}
+
 #[pymodule]
 fn _crxml_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("XmlError", m.py().get_type::<XmlError>())?;
     m.add("PlanError", m.py().get_type::<PlanError>())?;
     m.add("MergeError", m.py().get_type::<MergeError>())?;
     m.add_class::<CrxmlReader>()?;
+    m.add_class::<PyStreamingBatchIterator>()?;
+    m.add_function(wrap_pyfunction!(iter_record_batches, m)?)?;
     m.add_function(wrap_pyfunction!(read_to_columnar, m)?)?;
     m.add_function(wrap_pyfunction!(read_to_columnar_multi, m)?)?;
     m.add_function(wrap_pyfunction!(read_to_columnar_par, m)?)?;
