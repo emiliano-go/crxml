@@ -488,7 +488,9 @@ fn get_par_profile(py: Python<'_>) -> PyResult<PyObject> {
 #[cfg(feature = "testing")]
 fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
     let plan = rypipe_core::ExecutionPlan::new();
-    let est = (bytes.len() / 512).max(64);
+    let est_row = crate::xml::CrystalXmlSplitter::with_row_tag(row_tag)
+        .estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
+    let est = (bytes.len() / est_row.max(512)).max(64);
     let mut sink = rypipe_core::TableBuilder::with_plan(est, plan);
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(row_tag);
     decoder.validate(bytes).map_err(map_rypipe_err)?;

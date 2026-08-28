@@ -1640,7 +1640,8 @@ mod perf {
         let bytes = std::fs::read(&path).expect("failed to read BENCH_FILE");
         let mb = bytes.len() as f64 / 1024.0 / 1024.0;
 
-        // Reset counter
+        // Reset counter (profiling only)
+        #[cfg(feature = "profiling")]
         rypipe_core::RESOLVE_AND_PUT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 
         // Run full parse (production path)
@@ -1648,16 +1649,21 @@ mod perf {
         scan_chunk(&bytes, b"Details", &mut tb).unwrap();
         let _ = tb.finish().unwrap();
 
-        let count = rypipe_core::RESOLVE_AND_PUT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        let rows = tb.num_rows();
-        let cols = tb.num_columns();
-        println!("\n=== resolve_and_put counter ===");
-        println!("file: {:.1} MB, {} rows, {} cols", mb, rows, cols);
-        println!("resolve_and_put calls: {count}");
-        println!("assertion: count > 0");
+        #[cfg(feature = "profiling")]
+        {
+            let count = rypipe_core::RESOLVE_AND_PUT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let rows = tb.num_rows();
+            let cols = tb.num_columns();
+            println!("\n=== resolve_and_put counter ===");
+            println!("file: {:.1} MB, {} rows, {} cols", mb, rows, cols);
+            println!("resolve_and_put calls: {count}");
+            println!("assertion: count > 0");
 
-        assert!(count > 0, "resolve_and_put was never called! Production may not be using the optimized path.");
-        println!("PASS: resolve_and_put fires on the scanner path");
+            assert!(count > 0, "resolve_and_put was never called! Production may not be using the optimized path.");
+            println!("PASS: resolve_and_put fires on the scanner path");
+        }
+        #[cfg(not(feature = "profiling"))]
+        println!("resolve_and_put counter: profiling feature not enabled, skipping check");
     }
 
     struct TravFile;
