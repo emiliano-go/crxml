@@ -143,8 +143,28 @@ def test_full_table_ground_truth_matches_all_export_paths(tmp_path):
         dictionary_columns=["product"],
     )
 
-    for table in (single, multi, parallel):
-        assert table.equals(expected, check_metadata=False)
+    # single must match expected exactly (regression guard for representation)
+    assert single.equals(expected, check_metadata=False)
+
+    for table in (multi, parallel):
+        # Per-chunk dictionaries may differ structurally from single-pass,
+        # but decoded values must be identical.  to_pylist() decodes all
+        # dictionary representations, so compare at that level.
+        assert table.to_pylist() == single.to_pylist(), (
+            f"value divergence: {table.to_pylist()} != {single.to_pylist()}"
+        )
+        # Encoding-level check: if single produces a Dictionary column,
+        # multi/parallel must too (and vice versa).  to_pylist() can't
+        # distinguish dict(Utf8) from plain Utf8, so a silent regression
+        # where auto_dict fires on one path but not the other would pass
+        # the value check above.  Tolerate differing dictionary contents
+        # but not differing encoding classes.
+        for f_s, f_t in zip(single.schema, table.schema):
+            assert f_s.name == f_t.name, f"column order diverged: {f_s.name} vs {f_t.name}"
+            assert pa.types.is_dictionary(f_s.type) == pa.types.is_dictionary(f_t.type), (
+                f"encoding divergence on {f_s.name}: "
+                f"single={f_s.type} vs {table.__class__.__name__}={f_t.type}"
+            )
 
 
 def test_filter_constant_eq_columnar(tmp_path):

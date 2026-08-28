@@ -48,7 +48,7 @@ fn auto_mmap(path: &Path, use_mmap: bool) -> bool {
     true
 }
 
-mod xml;
+pub mod xml;
 
 // Fast allocator: replaces the system heap for all Rust-side
 // allocations (profiling showed ~27% of CPU in malloc/free).
@@ -475,13 +475,35 @@ pub fn read_to_columnar_bounded(
     Python::with_gil(|py| record_batches_to_table(batches, py))
 }
 
-#[cfg(feature = "profile")]
+/// Read chunk-time profile from the last parallel run.
+/// Returns split_scan_ns, chunk_sum_ns, chunk_max_ns, chunk_mean_ns,
+/// chunk_count, and spread (max/mean).
 #[pyfunction]
 fn get_par_profile(py: Python<'_>) -> PyResult<PyObject> {
+    let (split_scan_ns, chunk_sum_ns, chunk_max_ns, chunk_count) =
+        rypipe_core::parallel::chunk_profile();
+    let (special_regions_ns, split_loop_ns) = crate::xml::splitter::split_timing();
+    let discovery_ns = rypipe_core::parallel_stream::discovery_profile();
     let d = PyDict::new(py);
-    d.set_item("split_scan_ns", 0u64)?;
-    d.set_item("parse_ns", 0u64)?;
-    d.set_item("assembly_export_ns", 0u64)?;
+    d.set_item("split_scan_ns", split_scan_ns)?;
+    d.set_item("special_regions_ns", special_regions_ns)?;
+    d.set_item("split_loop_ns", split_loop_ns)?;
+    d.set_item("discovery_ns", discovery_ns)?;
+    d.set_item("chunk_sum_ns", chunk_sum_ns)?;
+    d.set_item("chunk_max_ns", chunk_max_ns)?;
+    d.set_item("chunk_count", chunk_count)?;
+    let chunk_mean_ns = if chunk_count > 0 {
+        chunk_sum_ns / chunk_count
+    } else {
+        0
+    };
+    d.set_item("chunk_mean_ns", chunk_mean_ns)?;
+    let spread = if chunk_mean_ns > 0 {
+        chunk_max_ns as f64 / chunk_mean_ns as f64
+    } else {
+        0.0
+    };
+    d.set_item("spread", spread)?;
     Ok(d.into())
 }
 
@@ -797,9 +819,23 @@ impl CrxmlReader {
     }
 }
 
+enum StreamingIter {
+    Single(rypipe_core::StreamingBatchIterator),
+    Parallel(rypipe_core::ParallelStreamingBatchIterator),
+}
+
+impl StreamingIter {
+    fn next_batch(&mut self) -> Option<Result<arrow::record_batch::RecordBatch, rypipe_core::Error>> {
+        match self {
+            StreamingIter::Single(it) => it.next(),
+            StreamingIter::Parallel(it) => it.next(),
+        }
+    }
+}
+
 #[pyclass]
 pub struct PyStreamingBatchIterator {
-    inner: std::sync::Mutex<Option<rypipe_core::StreamingBatchIterator>>,
+    inner: std::sync::Mutex<Option<StreamingIter>>,
 }
 
 #[pymethods]
@@ -817,7 +853,7 @@ impl PyStreamingBatchIterator {
         if iter_opt.is_none() {
             return Ok(None);
         }
-        let next = py.allow_threads(|| iter_opt.as_mut().unwrap().next());
+        let next = py.allow_threads(|| iter_opt.as_mut().unwrap().next_batch());
         let mut guard = self.inner.lock().map_err(|_| PyException::new_err("iterator poisoned"))?;
         match next {
             Some(Ok(batch)) => {
@@ -838,12 +874,13 @@ impl PyStreamingBatchIterator {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, memory=None, batch_size=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, use_mmap=None))]
+#[pyo3(signature = (path, row_tag=None, memory=None, batch_size=None, threads=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, use_mmap=None))]
 pub fn iter_record_batches(
     path: String,
     row_tag: Option<String>,
     memory: Option<PyObject>,
     batch_size: Option<usize>,
+    threads: Option<usize>,
     field_mapping: Option<HashMap<String, String>>,
     drop_fields: Option<Vec<String>>,
     filter: Option<HashMap<String, String>>,
@@ -907,15 +944,76 @@ pub fn iter_record_batches(
     }
     let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
     let parser = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
-    let iter = rypipe_core::StreamingBatchIterator::new(
-        p.to_path_buf(),
-        splitter,
-        parser,
-        plan,
-        budget,
-        prefault,
-    );
+    let num_threads = threads.unwrap_or_else(|| {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    });
+    let iter = if num_threads > 1 {
+        let opts = rypipe_core::ParallelStreamOpts {
+            threads: num_threads,
+            ordered: true,
+            max_reorder: 0,
+            schema: None,
+        };
+        StreamingIter::Parallel(rypipe_core::ParallelStreamingBatchIterator::new(
+            p.to_path_buf(),
+            splitter,
+            parser,
+            plan,
+            budget,
+            prefault,
+            opts,
+        ))
+    } else {
+        StreamingIter::Single(rypipe_core::StreamingBatchIterator::new(
+            p.to_path_buf(),
+            splitter,
+            parser,
+            plan,
+            budget,
+            prefault,
+        ))
+    };
     Ok(PyStreamingBatchIterator { inner: std::sync::Mutex::new(Some(iter)) })
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, row_tag=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false))]
+pub fn discover_schema(
+    path: String,
+    row_tag: Option<String>,
+    field_mapping: Option<HashMap<String, String>>,
+    drop_fields: Option<Vec<String>>,
+    filter: Option<HashMap<String, String>>,
+    field_types: Option<HashMap<String, String>>,
+    dictionary_columns: Option<Vec<String>>,
+    schema: Option<Vec<String>>,
+    auto_dict: bool,
+) -> PyResult<Vec<String>> {
+    let plan = build_plan_from_kwargs(
+        field_mapping,
+        drop_fields,
+        filter,
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
+    )?;
+    let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
+    let p = Path::new(&path);
+    if !p.is_file() {
+        return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
+    }
+    // Use rypipe's public helper: discovery via sampled windows or full scan.
+    // This is the fast path for batch workloads: discover once on a sample file,
+    // then pass `schema=` to `iter_record_batches` for every file (4980 MB/s vs 3828).
+    let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
+    let parser = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
+    let input = rypipe_core::InputBuffer::open(p, true, false).map_err(map_rypipe_err)?;
+    let bytes = input.as_slice();
+    let frozen = rypipe_core::parallel_stream::discover_schema_for_bytes(
+        bytes, &splitter, &parser, &plan,
+    );
+    Ok(frozen.column_names().iter().map(|s| s.to_string()).collect())
 }
 
 #[pymodule]
@@ -930,15 +1028,16 @@ fn _crxml_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_to_columnar_multi, m)?)?;
     m.add_function(wrap_pyfunction!(read_to_columnar_par, m)?)?;
     m.add_function(wrap_pyfunction!(read_to_columnar_bounded, m)?)?;
-    #[cfg(feature = "profile")]
-    {
-        m.add_function(wrap_pyfunction!(get_par_profile, m)?)?;
-    }
+    m.add_function(wrap_pyfunction!(get_par_profile, m)?)?;
+    m.add_function(wrap_pyfunction!(discover_schema, m)?)?;
     #[cfg(feature = "testing")]
     {
         m.add_function(wrap_pyfunction!(_test_parse_both, m)?)?;
         m.add_function(wrap_pyfunction!(_test_parse_fast, m)?)?;
         m.add_function(wrap_pyfunction!(_test_parse_quickxml, m)?)?;
     }
+    // Build provenance: the git SHA this .so was compiled from.
+    // Used by benchmarks to verify the extension matches HEAD.
+    m.add("__build_sha__", env!("CRXML_BUILD_SHA"))?;
     Ok(())
 }

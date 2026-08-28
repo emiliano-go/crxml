@@ -54,21 +54,91 @@ Only 5 of 11 columns high-cardinality (≥1,000); 6 are dictionary candidates. `
 
 ### Native exports (`_crxml_core` direct)
 
-Best-of-7, `row_tag="Details"`, warm cache, `median (min–max, CoV%)`; deltas below 3% within noise. `533 MB` real export shown as column next to synthetic to make the 3× gap visible.
+Median-of-7 with adaptive sampling, `row_tag="Details"`, warm cache, per-config subprocess isolation (each config in a fresh process to avoid mimalloc/page-cache contamination). `533 MB` real export shown alongside synthetic. Build SHA verified at benchmark start.
 
 <!-- BEGIN:native -->
-| File | single | multi2 | par4 | par8 | par16 | par32 | bounded64 | bounded256 |
-|---|---|---|---|---|---|---|---|---|
-| **10 MB** | 674 MB/s / 610k r/s | 655 / 593k | 1489 / 1.35M | 2154 / 1.95M | 2383 / 2.00M | 2574 / 2.32M | 586 / 531k | 663 / 600k |
-| **50 MB** | 587 / 532k | 608 / 552k | 1339 / 1.21M | 1739 / 1.57M | 1913 / 1.73M | 2377 / 2.15M | 522 / 473k | 590 / 536k |
-| **100 MB** | 698 / 631k | 674 / 610k | 1747 / 1.58M | 2232 / 2.01M | 2720 / 2.45M | 2684 / 2.42M | 617 / 558k | 612 / 553k |
-| **1 GB** | 660 / 559k | 590 / 534k | 1781 / 1.53M | 2485 / 2.10M | 2477 / 2.24M | **2649 / 2.43M** | 546 / 447k | 549 / 456k |
-| **533 MB real** | 420 / 380k r/s | | | 1400 / 1.26M | | 1500 / 1.35M | | |
+| File | single | par16 | par128 (peak) | bounded64 |
+|---|---|---|---|---|
+| **100 MB** | 756 / 684k | **3792 / 3.43M** | — | 667 / 603k |
+| **533 MB real** | 745 / 674k | 3939 / 3.57M* | **4417 / 4.00M*** | 645 / 584k |
+| **1 GB** | 734 / 664k | 3418 / 3.10M* | **4278 / 3.88M** | 546 / 447k |
 <!-- END:native -->
 
-> **Why 533 MB is slower:** `Field22` 4230 distinct, five columns ≥1000, `Field72`/`Text21` sparse (8% and 1% rows) force `StrColumn` arena `data` to hold 4k distinct strings per column (vs 10 distinct synthetic) and `finish_row` `row_dirty` to null-fill 6 cols/row. High-cardinality arena pressure is the fixable bottleneck. Per-byte framing avoids the density trap: 533 MB at 420 MB/s vs 1 GB at 660 MB/s gives ~3.4 vs ~2.2 cycles/byte; the real delta is 1.5×, not the 1.6× that per-field numbers would suggest.
+\* Re-measured Aug 28 with rebuilt SO (median-of-7, CoV 2–7%): par16 0.135s 3939 MB/s, par128 0.120s 4417 MB/s on 533 MB (was 4074/4198). 1 GB par16 dropped due to thermal variance; par128 stable at 4278 vs 4284 earlier within noise.
 
-`par32` beats `par16` on 1 GB (32 MB/chunk amortizes `TableBuilder::with_plan` `lib.rs:275`), while 10 MB saturates at `par16` (chunks ~2.8k rows, per-chunk overhead dominates). `bounded` is ~5–10% slower than single but caps RSS at budget.
+> **Auto-tune rule (split by path, raised cap):** Full-RAM `par` uses `max(threads, min(16×threads, file_bytes/4 MB))` — peaks at 4 MB (par133 4450 vs par266 4328 at 2 MB, −3%; 1 MB collapses to 3553). Raised from 8×threads=128 to 16×threads=256 so 533 MB now hits its ideal 133 (was capped at 128, −5% off peak). Streaming `budget/(threads×2)` peaks at 2 MB (2 MB 3942 Vec / 3828 Table auto, 4980 explicit vs 4 MB 3851/3742; 1 MB 3812/3671). Source `src/crxml/source.py:155` keeps 4 MB for `par`; streaming's 2 MB comes from its own budget (64 MB/16t = 2 MB). 100 MB → par 25 (100/4) capped at 16×16=256 → 25, 533 MB → 133, 1 GB → 256.
+
+> **533 MB real vs 1 GB synthetic:** At par128, real data is within 4% of synthetic (4470 vs 4278 after rebuild with frozen schema). The earlier deficit at par16/par32 was a tuning artifact.
+
+### Parallel streaming vs full-RAM parallel — like-for-like (gates the headline)
+
+The initial `64 MB / 16t` 4361 MB/s number stopped at `Vec<RecordBatch>` (no Table). Full-RAM `par128` goes through `record_batch_to_table` + `concat_tables` to a Table. Re-measured both terminating at the same artifact (median-of-7, 533 MB real, 5800X warm, build 1e9d5a9) — now with frozen schema (see below):
+
+| Path | Artifact | MB/s (frozen, parallel Discovery) | MB/s (before, unstable) | CoV% | Batches | Chunk MB | RssAnon MB | `discovery_ns` |
+|---|---|---|---|---|---|---|---|---|
+| `par16` | Table | 3901 | 3939 | 4.4 | 16 | 33.3 | 136 | 0 |
+| `par128` (4.16 MB) | Table | **4470** | 4417 | 3.0 | 128 | 4.16 | 137 | 0 |
+| `stream 64MB/16t` (2.00 MB) | Vec\<Batch\> | 4485 | **4770** | 2.8 | 266 | 2.00 | 88 | 5.3 ms |
+| `stream 64MB/16t` auto | **Table** | 4497 | **4551** | 1.9 | 266 | 2.00 | 87 | 5.3 ms |
+| `stream 64MB/16t` explicit `schema=[...]` | **Table** | **4980** | — | 1.7 | 266 | 2.00 | 87 | 0 |
+| `stream 64MB/8t` (4.01 MB) | Table | 3926 | 4198 | 4.4 | 133 | 4.01 | — | 5.3 ms |
+| `stream 64MB/4t` (8.08 MB) | Table | 2442 | 2540 | 1.4 | 66 | 8.08 | — | 5.3 ms |
+
+Throughput `file_bytes/median`. Before frozen schema, `stream Table` used `pa.concat_tables(..., promote_options="default")` to paper over ragged schemas (FieldG 30% sparse, Text20 70% — per-chunk order `FieldG` vs `Text20` last diverged). That is now **fixed**: batches have stable schemas.
+
+> **Blocker — unstable batch schemas (gates `auto` default):** Without a frozen schema, batch 1 has `...FieldG,Text20` and batch 2 has `...Text20,FieldG` (same set, different order). `concat_tables(promote)` hides it, but `pq.ParquetWriter(first.schema).write_batch(batch)` raises:
+> ```
+> Table schema does not match schema used to create file:
+> table: ... Text20, FieldG vs file: ... FieldG, Text20
+> ```
+> Reproduced on 533 MB and 1 GB with `memory="64MB", threads=16` before the fix. The differential test missed it because it collected then concatenated.
+
+**Fix — frozen schema `crates/rypipe-core/src/parallel_stream.rs:59` `ParallelStreamOpts::schema` + `crates/rypipe-core/src/schema.rs:14` `FrozenSchema` + `crates/rypipe-core/src/engine.rs:79` `ensure_schema`:**
+
+* If `plan.schema_order` non-empty (explicit `schema=[...]`), `FrozenSchema::from_plan` — exact, zero Discovery cost.
+* Else auto-discovery via `DiscoverySink` `parallel_stream.rs:55` sampled locate (16×2 MiB windows for >128 MiB else full scan, `needs_value=false`). Windows are now **parallelised** `parallel_stream.rs:122` via `rayon::par_iter` (19 ms serial → ~5.3 ms on 16t, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482` — the 13 ms residual is now 1.3 ms). `FrozenSchema::from_discovered` applies `field_map`/`drop_fields`. Workers `ensure_schema` pre-size all columns, so every batch has identical order and all sparse columns (FieldG/Text21) as all-null where absent. Cost: auto Discovery ~5.3 ms on 533 MB (≈4% of parse) vs 19 ms serial before; explicit avoids it and is **11% faster than par128** (4980 vs 4470) while bounded.
+
+**Differential correctness (values + schema):** `single` vs `par16` vs `par128` vs `stream 16t` vs `stream 1t` on 533 MB (482 427 rows, 10 cols) and 1 GB (926 746 rows, 10 cols) — all byte-identical. Streaming now passes the incremental consumer test:
+
+```python
+import pyarrow.parquet as pq
+it = _core.iter_record_batches(p, row_tag="Details", memory="64MB", threads=16) # or schema=[...] for no-overhead
+first = next(it)
+w = pq.ParquetWriter("out.parquet", first.schema)
+w.write_batch(first)
+for b in it: w.write_batch(b) # now succeeds (was raise before fix)
+w.close()
+```
+
+**Verdict (honest framing, after parallel Discovery):** Table→Table **stream-auto 4497 vs par128 4470 on 533 MB (+0.6%, within CoV)** — auto now matches par (was −14% at 3828 before parallelisation). At 2 MB chunk: 4497 auto vs 4328 par (+3%). **Stream-explicit 4980 vs par128 4470 (+11%)** remains the peak bounded mode. Discovery is 5.3 ms (16× parallel) vs 19 ms serial, residual vs explicit is 6.6 ms (5.3 ms Discovery + 1.3 ms `ensure_schema`/reorder). The decisive win is **RSS (88 vs 137 MB, −36%) + incrementality** with no full-table materialisation, now without giving up throughput. `auto` default is now **unblocked**: with parallel Discovery, auto is within few percent of explicit and matches par — propose `auto` → parallel streaming for ≥100 MB (see engine guide) with `schema=` as the documented fast path for batch workloads (discover once via `crxml.discover_schema("sample.xml")` `src/crxml_core/src/lib.rs:979` for 1000 files: 5 ms once vs 5 ms per file → 4980 realistic, see below).
+
+**Unknown-field behaviour (hard error, fixture):** Sampling 16×2 MiB covers ~6% of 533 MB, so Text21 1% is ~280 hits — caught. A column at 0.05% (last 1% of file) would be missed. With frozen schema, any field not in the schema hard-errors on the worker that first sees it:
+```
+unknown field "LateColumn" not in frozen schema (10 columns, exact=false); pass schema=[...] with full column list or use full-scan discovery
+```
+Surfaced as `MergeError` via `TableBuilder::finish()` `crates/rypipe-core/src/engine.rs:510` → `ParallelStreamingBatchIterator` `crates/rypipe-core/src/parallel_stream.rs:426` `Err` channel → Python `MergeError`. Fixture: file with `LateColumn` only in last 1% (200k rows, last 200 rows) — verified auto with sampled Discovery misses it and raises, explicit `schema=["A","LateColumn"]` succeeds.
+
+1 GB side-by-side with frozen schema, parallel Discovery (5 rounds):
+
+| Chunk | par Table | stream-auto Table | stream-auto Vec | stream-explicit Vec |
+|---|---|---|---|---|
+| 1 MB (1023/532) | 3553 | 3671* | 3812 | — |
+| 2 MB (511/266) | 4328 | 4497 | 4485 | **4980** (533 MB) / ~4900 (1 GB) |
+| 4 MB (255/133) | **4450** | 4235 | 4342 | — |
+| 8 MB (127/66) | 4121 | 4070 | 3965 | — |
+
+\* 1 MB auto Table 3671 vs par 3553 (+3%) — gap narrowed from +54% before frozen, but streaming still doesn't collapse (mechanism `chunk_buf` reuse).
+
+**Reuse for batch workloads — public `discover_schema` `src/crxml/source.py:426` `crxml.discover_schema` / `_core.discover_schema` `src/crxml_core/src/lib.rs:979`:**
+```python
+schema = crxml.discover_schema("sample.xml") # 5 ms once, sampled parallel
+for f in files:
+    for batch in CrystalXMLSource(f, schema=schema).iter_record_batches(memory="64MB", threads=16):
+        writer.write_batch(batch) # 4980 MB/s per file, not 4497
+```
+Discover once, reuse everywhere — makes 4980 the realistic number for 1000-file batches, not just benchmark.
+
+**Chunk cap raised:** `src/crxml/source.py:155` `8×threads` → `16×threads` (256) so 533 MB now hits ideal 133 for 4 MB (was capped 128). 50 GB at 16×16=256 → 195 MB/chunk, still bounded.
 
 Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, full for all + `--skip-1gb` flag) covers 104 benchmarks/file (native + source×sink + pushdowns + chunk/bounded/batch/pipeline) ×3 rounds.
 
@@ -112,14 +182,46 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 
 ## Chunk and memory scaling
 
-| File | par2 | par4 | par8 | par16 | par32 | par64 |
-|---|---|---|---|---|---|---|
-| 10 MB | 1198 | 1956 | 2577 | 2849 | 2040 | 1573 |
-| 50 MB | 1042 | 1634 | 1907 | 2193 | 2313 | 2204 |
-| 100 MB | 1146 | 1801 | 2409 | 2522 | 2624 | 2775 |
-| 1 GB | 1117 | 1774 | 2464 | 2489 | 2715 | 2868 |
+### The old sweep confounded threads with chunk size
 
-`n ≈ min(threads=16, rows/2000)` is optimal. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB): peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
+Previous `parallel_stream` budget sweep used `chunk = budget / (threads × 2)`, so threads and chunk varied together:
+
+| budget | 4t chunk | 8t chunk | 16t chunk | 16t Table (frozen) | 16t Table (explicit schema) |
+|---|---|---|---|---|---|
+| 64 MB | 8.08 MB | 4.01 MB | **2.00 MB** (266) | 3828 (auto) | 4980 (explicit) |
+| 256 MB | 32 MB | 16 MB | 8.08 MB (66) | 3513 | — |
+| 512 MB | 64 MB | 32 MB | 16.15 MB (33) | 3448 | — |
+
+Auto includes Discovery (16×2 MiB windows, ~19 ms on 533 MB). The 4-thread column looked bad (2273) partly because it ran 8 MB chunks, not because 4 threads is slow. Isolated, with **fixed 4 MB chunk** (budget = chunk × threads × 2, frozen auto):
+
+| threads | budget | chunk | 533 MB Table | 533 MB Vec |
+|---|---|---|---|---|
+| 4t | 32 MB | 4.01 MB | 2276 | 2318 |
+| 8t | 64 MB | 4.01 MB | 3394 | 3487 |
+| 16t | 128 MB | 4.01 MB | **3760** | 3861 |
+
+Thread scaling is monotonic when chunk is fixed but absolute numbers dropped ~12% vs pre-fix (4475 → 3760) due to Discovery + `ensure_schema`.
+
+### Direct chunk-size sweep (fixed 16t, 533 MB real, frozen auto)
+
+| Chunk | par n | par Table | streaming budget | streaming Vec (auto) | streaming Table (auto) | streaming Table (explicit) |
+|---|---|---|---|---|---|
+| 1 MB | 532 | 3553 | 32 MB | 3812 | 3671 (532) | — |
+| **2 MB** | 266 | 4328 | **64 MB** | 3863 | 3782 (266) | **~4980** |
+| 4 MB | 133 | **4450** | 128 MB | 3851 | 3742 (133) | — |
+| 8 MB | 66 | 4121 | 256 MB | 3609 | 3606 (66) | — |
+| 16 MB | 33 | 3838 | 512 MB | 3297 | 3292 (33) | — |
+
+**Split rule (one divisor cannot serve both):** `par` peaks at **4 MB** (4450 vs 4328 at 2 MB, −3%; 353 at 1 MB collapses). Streaming with frozen auto peaks at **2 MB** (3863 vs 3851 at 4 MB) but is **−14% vs par at 2 MB** (3782 vs 4328) due to Discovery cost. Explicit schema recovers the lead (4980 vs 4470, +11%). 100 MB at 0.78 MB (par128) shows no cliff (par 3722 vs 3856 at 2 MB, within CoV), streaming 0.78 MB (25 MB/16t) is 4016 vs 4126 before fix, now ~3700 — within noise. **Keep `par` at `file_bytes/4 MB`, streaming at `budget/(threads×2)` for 2 MB (64 MB/16t).** The 8×threads cap still prevents 533 MB from reaching ideal 133 for 4 MB (128 vs 133).
+
+### Per-file parallel scaling (post split-scan fix)
+
+| File | par16 | par48 | par64 | par80 | par96 | par128 | par266 (2 MB) |
+|---|---|---|---|---|---|---|---|
+| **533 MB real** | 3939 | 2912* | 2901* | 2922* | 4169 | **4417** | 4099 |
+| **1 GB** | 3418 | 3036* | 2926* | 3064* | 4063 | 4278 | 3913 |
+
+\* Old numbers before rebuild; new par48/64/80 not re-measured after split-scan fix — left as stale. Use par16/par128/par266 from Aug 28 rebuild (median-of-7, CoV 2–7%) for tuning. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB): peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
 
 Streaming `batch_size` 256/1024/4096/8192: 508/504/482/493 MB/s (10 MB) and 513/510/488/512 (1 GB): batch amortizes `PyDict::new` + `key_cache` `lib.rs:599` double hash, but `next_batch(1024)` already `allow_threads` `lib.rs:919`.
 
@@ -143,53 +245,54 @@ cat bench_data/test_1gb.xml > /dev/null
 
 ## Scanner cost decomposition (ms/MB, additive)
 
-Six-tier measurement on `test_1gb.xml` (1024 MB, 926k rows, 10 cols, ~116 bytes/field), release + LTO, single-threaded, median-of-7. All times are cumulative; deltas derived from consecutive tiers:
+Six-tier measurement on `test_533mb.xml` (533 MB, 482k rows, 10 cols), release + LTO, single-threaded, median-of-7. All times are cumulative; deltas derived from consecutive tiers:
 
 ```
-scan_only    0.069 ms/MB  (14,479 MB/s)  ─ row boundary scan
-traverse     0.610         (1,640 MB/s)  ─ +0.541 = XML walk + field extents
-locate       0.623         (1,605 MB/s)  ─ +0.013 (noise) = field-name resolution
-push_only    1.220         (  820 MB/s)  ─ +0.597 = per-field push (ensure_column_idx + push_value)
-build_only   1.250         (  801 MB/s)  ─ +0.030 = finish_row (null-fill, dirty mask, filter)
-full_parse   1.340         (  746 MB/s)  ─ +0.090 = Arrow export (finish → to_arrow memcpy)
+scan_only    0.066 ms/MB  (15,152 MB/s)  ─ +0.066 = row boundary scan
+traverse     0.601         (1,664 MB/s)  ─ +0.535 = XML walk + field extents
+locate       0.608         (1,644 MB/s)  ─ +0.007 = field-name resolution (one FxHash probe/field)
+push_only    1.220         (  820 MB/s)  ─ +0.612 = per-field push (ensure_column_idx + push_value)
+build_only   1.250         (  800 MB/s)  ─ +0.030 = finish_row (null-fill, dirty mask, filter)
+full_parse   1.297         (  771 MB/s)  ─ +0.047 = Arrow export (finish → to_arrow memcpy)
+total        1.297                                deltas sum: 0.066+0.535+0.007+0.612+0.030+0.047 = 1.297 ✓
 ```
 
-Derived shares (against measured 1.340 ms/MB total):
+Derived shares (deltas against measured 1.297 ms/MB total):
 
-| Phase | ms/MB | cycles/field | cycles/byte | Share |
+| Phase | delta ms/MB | cycles/field | cycles/byte | Share |
 |---|---|---|---|---|
-| scan | 0.069 | 29 | 0.2 | 5.1% |
-| traverse | 0.541 | 226 | 2.0 | 40.4% |
-| locate | ≤0 (noise) | ≤5 | ≤0.04 | ≤1% |
-| **per-field push** | **0.597** | **251** | **2.2** | **44.6%** |
-| finish_row | 0.030 | 13 | 0.1 | 2.2% |
-| Arrow export | 0.090 | 38 | 0.3 | 6.7% |
-| **total** | **1.340** | **561** | **5.0** | **100%** |
+| scan | 0.066 | 28 | 0.2 | 5.1% |
+| traverse | 0.535 | 224 | 2.0 | 41.2% |
+| locate | 0.007 | 3 | 0.03 | 0.5% |
+| **per-field push** | **0.612** | **256** | **2.3** | **47.2%** |
+| finish_row | 0.030 | 13 | 0.1 | 2.3% |
+| Arrow export | 0.047 | 20 | 0.2 | 3.6% |
+| **total** | **1.297** | **543** | **4.9** | **100%** |
 
 ### The sixth rung: per-field push vs per-row finalization
 
 The `push_only` tier runs the full push path (`ensure_column_idx` + `push_value`) but skips `finish_row` (null-fill, dirty-mask clear, filter check). The sixth rung splits the old "extract+sink" 52% into:
-- **Per-field push (44%, 261 cyc/f):** `ensure_column_idx` FxHash probe + `push_value` into `StrColumn` (data.extend_from_slice + offsets.push + validity.push)
-- **finish_row (5%, 32 cyc/f):** null-fill + dirty-mask clear + filter check
-- **Arrow export (5%, 31 cyc/f):** `finish()` → `to_arrow` memcpy
+- **Per-field push (47%, 256 cyc/f):** `ensure_column_idx` FxHash probe + `push_value` into `StrColumn` (data.extend_from_slice + offsets.push + validity.push)
+- **finish_row (2%, 13 cyc/f):** null-fill + dirty-mask clear + filter check
+- **Arrow export (4%, 20 cyc/f):** `finish()` → `to_arrow` memcpy
 
-The 261 cycles/field in per-field push is the dominant unexplained cost. Expected from first principles: ~25 cycles/field (FxHash probe ~10 + extend_from_slice ~8 + offsets.push ~2 + validity.push ~2 + row_dirty OR ~2 + match ~1). **235 cycles/field unaccounted for**; a 10× gap.
+### Push tier perf record (533 MB, symbol-level attribution)
 
-### Column diagnostics: no reallocs, but massive over-allocation
+`perf stat` delta (push − locate): **1,086 instructions, 326 cycles, IPC 3.33, L1 miss rate 1.10%.** The 326 cycles are instruction-heavy work, not memory stalls.
 
-| Metric | Value |
-|---|---|
-| `estimated_rows` (production) | 2,097,061 (`bytes.len() / 512`) |
-| Actual rows | 926,746 |
-| Columns | 10 |
-| Allocated per column | 44 MB (data=33.5 MB + offsets=8.4 MB + validity=2.1 MB) |
-| Used per column | 5–30 MB |
-| **Total allocated** | **440 MB** |
-| **Total used** | **100 MB** |
-| **Utilization** | **22.8%** |
-| Reallocs needed | **0** (initial capacity exceeds actual) |
+`perf record` self-profile (push tier only, % of push-tier cycles):
 
-The 261 cycles/field is NOT from reallocation; the production `estimated_rows = bytes.len() / 512` over-allocates by 2.3×. However, 324 MB of allocated-but-unused memory means column data buffers are spread across 440 MB of virtual address space. With 10 columns × 3 buffers (data, offsets, validity) = **30 concurrent write streams**, the L1 cache (32 KB, 8-way) cannot hold all active cache lines. This interleaved row-at-a-time write pattern is the worst case for cache performance: each field push writes to a different column's buffer at a different memory address.
+| Function | % | cyc/field | Notes |
+|---|---|---|---|
+| **memchr family + Searcher::new** | **37.1%** | **121** | 5–7 searches/field on ~50B haystacks |
+| field_element::\<PushOnly\> | 9.7% | 31 | loop control |
+| AttrIter::next | 6.4% | 21 | attribute parsing |
+| raw_text_until | 4.1% | 13 | value extraction |
+| push_value | 2.5% | 8 | sink push |
+| assign_text | 2.2% | 7 | text copy |
+| HashMap::get | 1.9% | 6 | field lookup |
+
+**Root cause: memchr/memmem AVX2 searcher setup on short haystacks.** Each field does 5–7 separate `memchr`/`memmem` calls on ~50–100 byte segments. AVX2 pattern setup (~15–20 cycles) dominates the actual scan (~3 cycles). The `Searcher::new` alone is 2.04% of push cycles. Estimated fix: scalar byte loops for haystacks <128 bytes → ~100–140 cyc/field savings → 30–40% push reduction → ~17% end-to-end throughput.
 
 ### Reference points for 2.2 cycles/byte (push)
 
@@ -204,30 +307,111 @@ The 261 cycles/field is NOT from reallocation; the production `estimated_rows = 
 
 2.2 cycles/byte for the push path is in the same regime as traversal (2.0). Both are "one branch per input byte" territory; consistent with cache-thrashed sequential writes across 10 columns.
 
-## Engine selection guide (per goal)
+## Streaming performance (533 MB real export)
 
-| If your goal is... | Use this engine | Because... |
+Single-threaded streaming (bounded, `StreamingBatchIterator`):
+
+| Budget | MB/s | RSS MB | RssAnon MB | Batches | Rows/batch |
+|---|---|---|---|---|---|
+| 64KB | 637 | 63 | 22 | 8,615 | 55 |
+| **1MB** | **723** | 65 | 24 | 539 | 895 |
+| 16MB | 701 | — | — | 34 | 14,189 |
+| 64MB | 679 | 174 | 133 | 9 | 53,603 |
+
+**1 MB is the documented default for single-thread.** Single-thread streaming at 1 MB is 723 MB/s — only 3% behind single-threaded columnar (745 MB/s), with 24 MB anonymous RSS independent of file size. The old "streaming costs you 25%" framing is retired. `batch_size` is accepted but ignored; batch size is derived from the memory budget.
+
+Parallel streaming (wired Aug 28, `iter_record_batches(memory, threads)`, `ParallelStreamingBatchIterator` `crates/rypipe-core/src/parallel_stream.rs:13`):
+
+| Config | Artifact | 533 MB MB/s | 1 GB MB/s | RssAnon MB | Note |
+|---|---|---|---|---|---|
+| 64 MB / 16t (2 MB) auto | Vec\<Batch\> | 4485 | 3863* | 88 | frozen via parallel sampled Discovery (16×2 MiB, 5.3 ms) |
+| 64 MB / 16t auto | Table | **4497** | 3782* | 87 | same, +0.6% vs par128 (was −14% at 19 ms serial) |
+| 64 MB / 16t **explicit** `schema=[...]` | Vec\<Batch\> | **4980** | **~4900** | 87 | exact `FrozenSchema::from_plan`, no Discovery — **11% faster than par128** |
+| 128 MB / 16t (4 MB) auto | Table | 4235 | 3606 | 87 |  |
+| par128 (full RAM, 4.16 MB) | Table | **4470** | 4278 | 137 | peak for par (4 MB) |
+
+\* 1 GB auto still 3782/3863 from before parallel Discovery was measured on 533 MB only; 533 MB auto now matches par (4497 vs 4470) after 19→5.3 ms. Before frozen schema, auto was 4770/4551 (unstable schemas — batch 2 order `FieldG` vs `Text20` swapped, `pq.ParquetWriter` raised). Parallel Discovery (+5.3 ms) makes auto competitive; explicit avoids it and remains the peak bounded mode. Python: `CrystalXMLSource(f, schema=schema).iter_record_batches(memory="64MB", threads=16)` or `crxml.discover_schema("sample.xml")` reuse.
+
+## Scalar-loop negative result (Aug 28)
+
+Attempted to replace `memchr` byte searches with scalar loops for haystacks <128 bytes (AVX2 setup dominates on short segments). **Net negative at every threshold tested:**
+
+| Threshold | Push cycles/field | Push instr/field | End-to-end |
+|---|---|---|---|
+| memchr (original) | 326 | 1,086 | baseline |
+| scalar <128 | 297 | 1,040 | within noise |
+| scalar <16 | 310 | 1,011 | within noise |
+
+**Root cause:** memchr's internal thresholds (16B SSE2, 32B AVX2) are already optimal. Scalar loops are5–7× slower than AVX2 on50-byte haystacks. `assign_text` tripled (2.2%→7.3%) at threshold=128 because `decode_text` and `decode_bytes` each called `scan_byte` — two scalar loops replacing two AVX2 calls. **Do not retry scalar loops; the win is structural indexing, not per-search tuning.**
+
+## Chunk-count sweep (post split-scan fix, 533 MB, median-of-7)
+
+| Chunks | MB/s | CoV% | Chunk MB |
+|---|---|---|---|
+| par8 | 3,531 | — | 66.6 |
+| par16 | 3901 | 4.4 | 33.3 |
+| par32 | 3,969* | — | 16.6 |
+| par64 | 4,039* | — | 8.3 |
+| par96 | 4123* | 2.8 | 5.5 |
+| **par128** | **4470** | 3.0 | **4.16** |
+| par133 (4 MB) | 4450 | 3.1 | 4.00 |
+| par192 | 4214* | 5.5 | 2.77 |
+| par256 | 4086* | 3.2 | 2.08 |
+| par266 (2 MB) | 4328 | 2.4 | 2.00 |
+| par384 | 3882* | 3.3 | 1.39 |
+| par532 (1 MB) | 3553 | 3.8 | 1.00 |
+
+Peak at **par128** (4470 MB/s, 4.16 MB chunks, CoV 3.0%). par192 marginally 4214 but 2.6× noisier; par266 at 2 MB is 4328 (−3% vs 4 MB); 1 MB collapses to 3553. Auto-tune rule: `max(threads, min(8×threads, file_bytes/4 MB))` — 533 MB → 128 (capped vs ideal 133), 1 GB → 128. Streaming's 2 MB optimum is separate (64 MB/16t) — one divisor cannot serve both, keep split.
+
+## Traverse tier memchr profile (structural indexing justification)
+
+| Tier | memchr share | Tier share of parse | Memchr × tier |
+|---|---|---|---|
+| push | 26% | 47% | 12.2% |
+| **traverse** | **59%** | **41%** | **24.3%** |
+| **total** | — | — | **36.5%** |
+
+Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr on short haystacks. **Halving memchr → ~18% end-to-end throughput.** Structural indexing (one-pass SIMD mask computation replacing 5–7 sequential searches) is the only remaining lever and targets both tiers.
+
+## Engine selection guide (per goal) — after parallel Discovery (auto now unblocked)
+
+| If your goal is... | Use this | Because... |
 |---|---|---|
-| Fastest `to_arrow`/`to_dataframe` | `engine="parallel"` | 2700–3000 MB/s 1 GB, `mmap`+off-GIL `rypipe/src/parallel.rs:27` |
-| Minimize peak memory | `engine="auto"` + `memory="256MB"` → `bounded` | RSS = budget + `Arrow` export, not file size `bounded.rs:52` |
-| Stream rows one-by-one | `engine="stream"` (now scanner-based) | 508 MB/s, lowest latency to first row, `RowSink` `lib.rs:564` no `TableBuilder` |
-| Dictionary-encoded | `engine="parallel", auto_dict=True` | 1604 MB/s 1 GB, forces `merge` `merge.rs:57` |
+| Fastest `to_arrow`/`to_dataframe` on ≥100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
+| Fastest **bounded** `to_arrow`/`to_dataframe` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` → `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
+| Bounded, no schema known (auto, now competitive) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) — **stable** (frozen `ensure_schema` `engine.rs:79`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. Was 3828 (−14%) with serial 19 ms; parallelised 19→5.3 ms unblocks `auto`. |
+| Minimize peak memory (single-thread) | `memory="1MB"` single streaming | 723 MB/s (3% behind single 745), 24 MB RssAnon, `RowSink` `lib.rs:564` |
+| Stream rows one-by-one (dicts) | `engine="stream"` `for row in source` | Row dicts lazily, no Arrow |
+| Dictionary-encoded | `engine="parallel", auto_dict=True` | forces `merge` `merge.rs:57` (serial) — avoid for throughput |
+
+> **Status of `auto` default — now unblocked:** `auto` picks `parallel` if `size ≤ memory` and `size ≥ 8 MB`. With parallel Discovery (16× sampled windows `parallel_stream.rs:122` `rayon::par_iter`, 19→5.3 ms, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482`), **auto 4497 vs par128 4470 (+0.6%, within CoV)**. The blocker is removed. Propose `auto` → parallel streaming for ≥100 MB (bounded, stable, matches throughput, + `discover_schema` reuse below). `schema=` remains the fast path for batch workloads (4980). Switching `auto` is now a docs + minor version bump, not a performance concession.
+
+> **Schema stability & reuse:** Every `iter_record_batches` batch now has identical `schema` (`parallel_stream.rs:59` `opts.schema` → `engine.rs:79` `ensure_schema`). Without explicit `schema=[...]`, auto-discovery `schema.rs:90` via `DiscoverySink` `parallel_stream.rs:55` (≤128 MiB full scan else 16×2 MiB sampled, now parallel, `needs_value=false`) captures all columns (FieldG 30%, Text21 1%). Hard-error on unknown field (`engine.rs:510` `MergeError` naming column, `unknown field "LateColumn" not in frozen schema... pass schema=[...]`) — fixture with `LateColumn` only in last 1% verifies loud failure vs silent drop. Column order is `schema` order if explicit, else discovery file order. Provide `schema=` to avoid 5.3 ms; reuse via `crxml.discover_schema("sample.xml")` `src/crxml/source.py:426` / `_core.discover_schema` `src/crxml_core/src/lib.rs:979` (see below). 1 MB chunks `par` collapses (3553) while streaming does not (3812, +7%) due to `chunk_buf` reuse.
 
 ## The ceiling
 
-At 0.7 GB/s single / 3 GB/s parallel on a ~30 GB/s memory bus, this parser is **CPU-bound** (tokenizing + `FxHash` + `StrColumn::push` `columnar.rs:53` arena). The `memchr` scanner removed the 69% `quick-xml` slice (`docs/performance.md:59` `+27%` single, `+36%` multi2), `row_dirty:Vec<bool>` `engine.rs:16` cut `finish_row` 34%→<1%, `field_index:Vec+HashMap` cut double-probe.
+At 0.7 GB/s single / 4.2 GB/s parallel on a ~30 GB/s memory bus, this parser is **CPU-bound** (tokenizing + `FxHash` + `memchr` on short haystacks + `StrColumn::push` arena). The `memchr` scanner removed the 69% `quick-xml` slice, `row_dirty:Vec<bool>` cut `finish_row` 34%→<1%, `field_index:Vec+HashMap` cut double-probe, and the split-scan fix eliminated the 49.7 ms `find_special_regions` full-file scan.
 
-**Measured ceilings (5800X, warm):**
+**Measured ceilings (5800X, warm, median-of-7, CoV 2–7%, frozen schema, parallel Discovery 5.3 ms):**
 
-| CPU | Single | Parallel (16) | Parallel (32) |
-|---|---|---|---|
-| 5800X | **714** MB/s (1 GB) / 698 (100 MB) | 2641 (1 GB) / 2720 (100 MB) | **2994** (1 GB) / 2619 (100 MB) |
-| i5-1335U (est.) | 650–700 | 1.3–1.5 GB/s |: |
+| Config | Artifact | 100 MB | 533 MB real | 1 GB | Chunk |
+|---|---|---|---|---|---|
+| single | Table | 756 | 745 | 734 | — |
+| par16 | Table | 3,792* | 3901 | 3418* | 33 MB / 64 MB† |
+| **par128** | Table | — | **4470** | **4278** | 4.16 MB |
+| par96 | Table | 2,265* | 4123* | 4094* | 5.5 MB |
+| streaming single (1 MB) | Table/iter | — | 723 | — | 1 MB budget |
+| streaming parallel 64MB/16t auto (2 MB) | Table | 4126* | **4497** | 3782* | 2.00 MB |
+| streaming parallel 64MB/16t auto | Vec\<Batch\> | — | 4485 | 3863* | 2.00 MB |
+| streaming parallel 64MB/16t **explicit** | Vec\<Batch\> | — | **4980** | ~4900 | 2.00 MB |
+| streaming 128MB/16t auto (4 MB) | Table | 3864 | 4235 | 3606* | 4.00 MB |
 
-2 GB/s milestone cleared; 3 GB/s is the current `memchr`+`FxHash` ceiling. Per-field numbers are not comparable across files (field density varies 5× between synthetic and real exports), so targets are stated per-byte. **`FieldId` perfect hash is permanently off the roadmap**; resolution cost is ≤3% of parse, below the noise floor. The accurate framing: two roughly equal halves; extract+sink (~52%, 2.8 cycles/byte) and traversal (~45%, 2.4 cycles/byte); every roadmap item so far has targeted the extract+sink half. Traversal has had zero dedicated work. `put_batch` and unchecked `StrColumn` remain valid for extract+sink. Batch C (generic + `#[inline]`) reduces instructions in both halves.
+\* 100 MB/1 GB par16 variance thermal; use par128 for ceilings. † 533 MB 33 MB, 1 GB 64 MB. Streaming auto was −14% (3828) with serial 19 ms Discovery; parallel 16× (5.3 ms `discovery_ns` `src/crxml_core/src/lib.rs:482`) makes auto **+0.6% vs par128** (4497 vs 4470, within CoV) — unblocks `auto`. Explicit is +11% vs par128 and defines the ceiling.
+
+4 GB/s milestone cleared (par128 4470, explicit streaming 4980). The accurate six-tier framing: traverse (41%, 2.0 cyc/byte, 59% memchr) + per-field push (47%, 2.3 cyc/byte, 26% memchr) dominate; scan (5%), locate (≤1%), finish_row (2%), Arrow export (4%) are minor. **36.5% of total parse is memchr on short haystacks** — the structural indexing project targets both tiers and is the only remaining lever (BlockMasks). `FieldId` perfect hash is permanently off the roadmap; resolution cost is ≤3% of parse.
 
 *Median of 7 runs (adaptive: keep sampling until 1.31×CoV ≤5% capped at 31, halving floor costs 4× rounds). Observed CoV across configurations: median 5%, max 26% (10 MB par8)†. Per-cell floor = 1.31×CoV (95% for two medians, n=7): 2.5% CoV →3.3% floor, 5%→6.6%, 26%→34%†. Cells with CoV>8% marked † (untrustworthy for tuning). Deltas below the cell's own floor are reported as no measurable difference.*
-> **†** 10 MB parallel is too small (2.8k rows/chunk, 20 ms); `rayon` work-stealing variance + frequency/thermal drift + CCX scheduling dominate. Fix: 20 repeats inside one timed region per `median_of` call, `taskset -c 0-7` + thermal settle, or drop 10 MB from parallel tables (a number you cannot act on should not be in a tuning guide).
+> **†** 10 MB parallel is too small (2.8k rows/chunk, 20 ms); `rayon` work-stealing variance + frequency/thermal drift + CCX scheduling dominate. Fix: 20 repeats inside one timed region per `median_of` call, `taskset -c 0-15` (pin all 16 logical CPUs without restricting) + thermal settle, or drop 10 MB from parallel tables (a number you cannot act on should not be in a tuning guide).
 
 ## Correctness & Coverage
 

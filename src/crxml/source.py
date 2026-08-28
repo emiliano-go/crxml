@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import warnings
 from pathlib import Path
 from typing import Iterator, Optional, Union
 
@@ -151,10 +152,15 @@ class CrystalXMLSource:
 
         self._row_tag = row_tag
         self._memory = _parse_memory(memory)
-        # 4x threads: finer chunks even out per-chunk parse-time variance,
-        # but beyond ~4x the rayon join/spin overhead wins (VTune showed 43%
-        # spin at 8x on 24 cores; 3-4x measured fastest with the scanner).
-        self._num_chunks = 4 * (threads if threads > 0 else _default_threads())
+        # Auto-tune: separate optima (Aug 28 sweep, now with frozen schema).
+        # Full-RAM par peaks at 4 MB (par133 4450 vs par266 4328 at 2 MB, −3%;
+        # 1 MB 3553 collapses). Streaming auto peaks at 2 MB but is −14% vs par
+        # due to Discovery; explicit schema 4980 beats par. 8×threads capped
+        # 533 MB at 128 vs ideal 133 for 4 MB. Raise to 16×threads to clear it
+        # while still bounding 50 GB (16×16=256 chunks, 195 MB/chunk at 50 GB).
+        t = threads if threads > 0 else _default_threads()
+        file_bytes = self._filepath.stat().st_size
+        self._num_chunks = max(t, min(16 * t, file_bytes // (4 * 1024 * 1024)))
         self._field_mapping = field_mapping or {}
         self._drop_fields = drop_fields or []
         self._filter = filter
@@ -374,7 +380,8 @@ class CrystalXMLSource:
         pq.write_table(self.to_arrow(), str(path), **kwargs)
 
     def iter_record_batches(
-        self, memory: Union[str, int] = "64MiB", batch_size: Optional[int] = None
+        self, memory: Union[str, int] = "64MiB", batch_size: Optional[int] = None,
+        threads: Optional[int] = None,
     ) -> Iterator["pa.RecordBatch"]:
         """Yield Arrow ``RecordBatch`` objects with constant memory.
 
@@ -397,12 +404,19 @@ class CrystalXMLSource:
         """
         # Use the Rust streaming iterator directly — no Vec<RecordBatch> collection.
         # _core.iter_record_batches is the true 64KB path (mmap + reusable buffer).
-        batch_size = batch_size  # currently derived from memory via plan_chunks; kept for API compat
+        if batch_size is not None:
+            warnings.warn(
+                "batch_size is ignored; batch size is derived from the memory budget. "
+                "Pass memory='1MB' (default) for ~895 rows/batch.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         yield from _core.iter_record_batches(
             str(self._filepath),
             row_tag=self._row_tag,
             memory=str(memory) if isinstance(memory, int) else memory,
             batch_size=batch_size,
+            threads=threads,
             **self._build_plan_kwargs(),
         )
 
@@ -410,3 +424,44 @@ class CrystalXMLSource:
         from .pipeline import Pipeline
 
         return Pipeline(self) | stage
+
+
+def discover_schema(
+    source: Union[str, Path],
+    *,
+    row_tag: str = "Details",
+    field_mapping: Optional[dict[str, str]] = None,
+    drop_fields: Optional[list[str]] = None,
+    filter: Optional[dict[str, str]] = None,
+    field_types: Optional[dict[str, str]] = None,
+    dictionary_columns: Optional[list[str]] = None,
+    schema: Optional[list[str]] = None,
+    auto_dict: bool = False,
+) -> list[str]:
+    """Discover the frozen schema for a file (reusable across batch workloads).
+
+    Scans `source` once (full scan for ≤128 MB, else 16×2 MiB sampled windows
+    in parallel via `rayon`) and returns the column names in file order after
+    applying `field_mapping`/`drop_fields`/`filter` etc. Pass the result as
+    ``CrystalXMLSource(..., schema=schema).iter_record_batches(...)`` to avoid
+    per-file Discovery (≈5 ms on 533 MB, ~19 ms serial before parallelisation)
+    and hit the explicit fast path (4980 MB/s vs 3828 auto on 533 MB).
+
+    Example
+    -------
+    >>> schema = crxml.discover_schema("sample.xml")
+    >>> for f in files:
+    ...     for batch in CrystalXMLSource(f, schema=schema).iter_record_batches(memory="64MB", threads=16):
+    ...         writer.write_batch(batch)
+    """
+    return _core.discover_schema(
+        str(source),
+        row_tag=row_tag,
+        field_mapping=field_mapping,
+        drop_fields=drop_fields,
+        filter=filter,
+        field_types=field_types,
+        dictionary_columns=dictionary_columns,
+        schema=schema,
+        auto_dict=auto_dict,
+    )

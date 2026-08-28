@@ -8,6 +8,7 @@ __version__ = "1.1.0"
 
 __all__ = [
     "CrystalXMLSource",
+    "discover_schema",
     "Pipeline",
     "RenameFields",
     "CastTypes",
@@ -23,6 +24,7 @@ __all__ = [
 
 _modules = {
     "CrystalXMLSource": ".source",
+    "discover_schema": ".source",
     "Pipeline": ".pipeline",
     "RenameFields": ".stages",
     "CastTypes": ".stages",

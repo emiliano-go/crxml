@@ -51,7 +51,7 @@ enum Flow {
 }
 
 /// Scan a chunk of CR XML bytes, emitting rows into `sink`.
-pub(crate) fn scan_chunk<S: ColumnarSink + ?Sized>(
+pub fn scan_chunk<S: ColumnarSink + ?Sized>(
     bytes: &[u8],
     row_tag: &[u8],
     sink: &mut S,
@@ -452,10 +452,17 @@ impl OpenTag<'_> {
     }
 }
 
+/// Byte search: delegates to memchr (AVX2/SSE2).
+/// memchr handles short haystacks internally via its own thresholds.
+#[inline(always)]
+fn scan_byte(haystack: &[u8], needle: u8) -> Option<usize> {
+    memchr(needle, haystack)
+}
+
 /// Offset of the next `<` at or after `from`.
 #[inline(always)]
 fn next_lt(bytes: &[u8], from: usize) -> Option<usize> {
-    memchr(b'<', &bytes[from..]).map(|rel| from + rel)
+    scan_byte(&bytes[from..], b'<').map(|rel| from + rel)
 }
 
 #[inline]
@@ -495,15 +502,17 @@ fn scan_open_tag(bytes: &[u8], lt: usize) -> Option<OpenTag<'_>> {
     let name = &bytes[name_start..i];
     let name_end = i;
 
-    // Walk to '>' honoring quoted attribute values, using SIMD jumps.
+    // Walk to '>' honoring quoted attribute values.
+    // Scalar triple-scan for short interiors, memchr3 for long.
     let gt = loop {
-        let rel = memchr3(b'"', b'\'', b'>', &bytes[i..])?;
+        let remaining = &bytes[i..];
+        let rel = memchr3(b'"', b'\'', b'>', remaining)?;
         let at = i + rel;
         if bytes[at] == b'>' {
             break at;
         }
         // Jump past the matching closing quote in one search.
-        i = at + 1 + memchr(bytes[at], &bytes[at + 1..])? + 1;
+        i = at + 1 + scan_byte(&bytes[at + 1..], bytes[at])? + 1;
     };
 
     let self_closing = gt > name_start && bytes[gt - 1] == b'/';
@@ -519,7 +528,7 @@ fn scan_open_tag(bytes: &[u8], lt: usize) -> Option<OpenTag<'_>> {
 #[inline(always)]
 fn scan_close_tag(bytes: &[u8], lt: usize) -> Option<(&[u8], usize)> {
     let start = lt + 2;
-    let gt_rel = memchr(b'>', &bytes[start..])?;
+    let gt_rel = scan_byte(&bytes[start..], b'>')?;
     let gt = start + gt_rel;
     let raw = &bytes[start..gt];
     // Trim trailing whitespace (`</Row >`); leading whitespace is invalid.
@@ -537,15 +546,15 @@ fn scan_close_tag(bytes: &[u8], lt: usize) -> Option<(&[u8], usize)> {
 fn skip_construct(bytes: &[u8], lt: usize) -> Option<usize> {
     let rest = &bytes[lt..];
     if rest.starts_with(b"<!--") {
-        let end_rel = memmem::find(&bytes[lt + 4..], b"-->")?;
+        let end_rel = COMMENT_END.find(&bytes[lt + 4..])?;
         return Some(lt + 4 + end_rel + 3);
     }
     if rest.starts_with(b"<![CDATA[") {
-        let end_rel = memmem::find(&bytes[lt + 9..], b"]]>")?;
+        let end_rel = CDATA_END.find(&bytes[lt + 9..])?;
         return Some(lt + 9 + end_rel + 3);
     }
     // PI, DOCTYPE, and friends end at the first '>'.
-    let gt_rel = memchr(b'>', &bytes[lt + 1..])?;
+    let gt_rel = scan_byte(&bytes[lt + 1..], b'>')?;
     Some(lt + 1 + gt_rel + 1)
 }
 
@@ -633,6 +642,16 @@ static CLOSE_FORMATTED: LazyLock<memmem::Finder> =
 static CLOSE_TEXTVALUE: LazyLock<memmem::Finder> =
     LazyLock::new(|| memmem::Finder::new("</TextValue"));
 
+// Searchers for skip_construct (comments / CDATA end markers).
+static COMMENT_END: LazyLock<memmem::Finder> =
+    LazyLock::new(|| memmem::Finder::new("-->"));
+static CDATA_END: LazyLock<memmem::Finder> =
+    LazyLock::new(|| memmem::Finder::new("]]>"));
+
+// Searchers for estimate_bytes_per_row (row-tag prefix).
+static DETAILS_OPEN: LazyLock<memmem::Finder> =
+    LazyLock::new(|| memmem::Finder::new("<Details"));
+
 /// Pattern lengths (`</` + name) for advancing past a found close tag.
 const PAT_FIELD: usize = 7;
 const PAT_TEXT: usize = 6;
@@ -667,7 +686,7 @@ fn find_close_after(
             search = search + rel + 1;
             continue;
         }
-        let gt_rel = memchr(b'>', &bytes[after_pat..])?;
+        let gt_rel = scan_byte(&bytes[after_pat..], b'>')?;
         return Some(after_pat + gt_rel + 1);
     }
     None
@@ -684,7 +703,7 @@ fn raw_text_until<'a>(
 ) -> Option<(&'a [u8], usize)> {
     let close_lt = find_close_start(bytes, content_start, finder, pat_len, regions)?;
     let after_name = close_lt + pat_len;
-    let gt_rel = memchr(b'>', &bytes[after_name..])?;
+    let gt_rel = scan_byte(&bytes[after_name..], b'>')?;
     let after = after_name + gt_rel + 1;
     Some((&bytes[content_start..close_lt], after))
 }
@@ -727,13 +746,13 @@ fn assign_text<'a>(slot: &mut Cow<'a, str>, raw: &'a [u8]) {
 /// Text content: cut at the first `<` (quick-xml reads a single Text event),
 /// then unescape when an entity is present.
 fn decode_text(raw: &[u8]) -> Cow<'_, str> {
-    let cut = memchr(b'<', raw).unwrap_or(raw.len());
+    let cut = scan_byte(raw, b'<').unwrap_or(raw.len());
     decode_bytes(&raw[..cut])
 }
 
 fn decode_bytes(raw: &[u8]) -> Cow<'_, str> {
     let s = utf8_unchecked(raw);
-    if memchr(b'&', raw).is_none() {
+    if scan_byte(raw, b'&').is_none() {
         Cow::Borrowed(s)
     } else {
         quick_xml::escape::unescape(s).unwrap_or(Cow::Borrowed(s))
@@ -1246,9 +1265,11 @@ mod perf {
         println!("  total:        {:.2} ms/MB", t_full / mb * 1000.0);
     }
 
-    /// Run four-tier decomposition on a real file using mmap (same path as
-    /// production `read_to_columnar`). Five-tier decomposition with
-    /// median-of-7 and CoV reporting.
+    /// Run six-tier decomposition on a real file using mmap (same path as
+    /// production `read_to_columnar`). Median-of-7 with adaptive CoV reporting.
+    ///
+    /// Six tiers: scan_only → traverse → locate → push_only → build_only → full_parse.
+    /// Each tier adds exactly one cost layer (additive, not ratios).
     ///
     /// Set BENCH_FILE env var to the XML file path, e.g.:
     /// ```
@@ -1272,22 +1293,32 @@ mod perf {
         let mb = bytes.len() as f64 / 1024.0 / 1024.0;
         let n = 7usize; // median-of-7
 
-        // Warmup all tiers
-        {
-            let mut wf = rypipe_core::TableBuilder::with_capacity(100_000);
-            scan_chunk(&bytes, b"Details", &mut wf).unwrap();
-            let _ = wf.finish();
+        // BENCH_TIER env var: run only the named tier (for isolated perf stat).
+        // Empty or unset = run all tiers.
+        let bench_tier = std::env::var("BENCH_TIER").unwrap_or_default();
+
+        // Warmup all tiers (skip when running single tier for perf stat)
+        if bench_tier.is_empty() {
+            {
+                let mut wf = rypipe_core::TableBuilder::with_capacity(100_000);
+                scan_chunk(&bytes, b"Details", &mut wf).unwrap();
+                let _ = wf.finish();
+            }
+            {
+                let mut wt = TravFile;
+                scan_chunk(&bytes, b"Details", &mut wt).unwrap();
+            }
+            {
+                let mut wl = LocateFile { plan: rypipe_core::ExecutionPlan::new() };
+                scan_chunk(&bytes, b"Details", &mut wl).unwrap();
+            }
         }
-        {
-            let mut wt = TravFile;
-            scan_chunk(&bytes, b"Details", &mut wt).unwrap();
-        }
-        {
-            let mut wl = LocateFile { plan: rypipe_core::ExecutionPlan::new() };
-            scan_chunk(&bytes, b"Details", &mut wl).unwrap();
-        }
+        let run = |name: &str| bench_tier.is_empty() || bench_tier == name;
 
         println!("\n=== Six-tier scanner decomposition ({:.1} MB, {} runs, path: {}) ===", mb, n, path);
+        if !bench_tier.is_empty() {
+            println!("  (BENCH_TIER={bench_tier} — only running that tier)");
+        }
 
         // Helper: run a closure n times, return (median, CoV)
         fn bench(n: usize, mut f: impl FnMut()) -> (f64, f64) {
@@ -1305,14 +1336,14 @@ mod perf {
         }
 
         // --- Tier 1: scan_only ---
-        let (t_scan, cov_scan) = bench(n, || {
+        let (t_scan, cov_scan) = if run("scan") { bench(n, || {
             let mut _pos = 0usize;
             let mut _count = 0usize;
             while let Some(rel) = memchr::memmem::find(&bytes[_pos..], b"<Details") {
                 _count += 1;
                 _pos += rel + 8;
             }
-        });
+        }) } else { (0.0, 0.0) };
         // Count rows once (stable)
         let mut count = 0usize;
         let mut pos = 0;
@@ -1322,16 +1353,16 @@ mod perf {
         }
 
         // --- Tier 2: traverse ---
-        let (t_trav, cov_trav) = bench(n, || {
+        let (t_trav, cov_trav) = if run("traverse") { bench(n, || {
             let mut trav = TravFile;
             scan_chunk(&bytes, b"Details", &mut trav).unwrap();
-        });
+        }) } else { (0.0, 0.0) };
 
         // --- Tier 3: locate ---
-        let (t_loc, cov_loc) = bench(n, || {
+        let (t_loc, cov_loc) = if run("locate") { bench(n, || {
             let mut loc = LocateFile { plan: rypipe_core::ExecutionPlan::new() };
             scan_chunk(&bytes, b"Details", &mut loc).unwrap();
-        });
+        }) } else { (0.0, 0.0) };
 
         // --- Tier 4: push_only (scan + per-field push, no finish_row) ---
         // end_row calls advance_row() only — skips null-fill, dirty-mask clear,
@@ -1364,33 +1395,35 @@ mod perf {
                 self.inner.finish()
             }
         }
-        let (t_push, cov_push) = bench(n, || {
+        let (t_push, cov_push) = if run("push") { bench(n, || {
             let mut pb = PushOnly { inner: rypipe_core::TableBuilder::with_capacity(100_000) };
             scan_chunk(&bytes, b"Details", &mut pb).unwrap();
-        });
+        }) } else { (0.0, 0.0) };
 
         // --- Tier 5: build_only (scan + sink, no Arrow export) ---
-        let (t_build, cov_build) = bench(n, || {
+        let (t_build, cov_build) = if run("build") { bench(n, || {
             let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
             scan_chunk(&bytes, b"Details", &mut tb).unwrap();
             // Do NOT call tb.finish() — this isolates scan+push from Arrow export.
-        });
+        }) } else { (0.0, 0.0) };
 
         // --- Tier 6: full_parse (scan + sink + Arrow export) ---
         let mut last_rows = 0usize;
         let mut last_cols = 0usize;
-        let (t_full, cov_full) = bench(n, || {
+        let (t_full, cov_full) = if run("full") { bench(n, || {
             let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
             scan_chunk(&bytes, b"Details", &mut tb).unwrap();
             let batch = tb.finish().unwrap();
             last_rows = batch.num_rows();
             last_cols = batch.num_columns();
-        });
+        }) } else { (0.0, 0.0) };
 
-        // --- Cross-tier assertions ---
-        assert!(last_rows > 0, "full_parse produced zero rows");
-        assert!(last_cols > 0, "full_parse produced zero columns");
-        assert_eq!(count, last_rows, "scan_only {count} != full_parse {last_rows}");
+        // --- Cross-tier assertions (skip when running single tier) ---
+        if bench_tier.is_empty() {
+            assert!(last_rows > 0, "full_parse produced zero rows");
+            assert!(last_cols > 0, "full_parse produced zero columns");
+            assert_eq!(count, last_rows, "scan_only {count} != full_parse {last_rows}");
+        }
 
         // --- Noise floor: 1.31 × CoV ---
         fn floor(cov: f64) -> f64 { 1.31 * cov * 100.0 }
@@ -1405,11 +1438,7 @@ mod perf {
                 let delta = ms_mb - prev;
                 let cov_pct = $cov * 100.0;
                 let fl = floor($cov);
-                if prev > 0.0 {
-                    println!("{:14} {:8.4} {:8.0} {:6.2}+{:5.2} {:6.1}% {:6.1}%", $name, $t, mb/$t, ms_mb, delta, cov_pct, fl);
-                } else {
-                    println!("{:14} {:8.4} {:8.0} {:7.2}    {:6.1}% {:6.1}%", $name, $t, mb/$t, ms_mb, cov_pct, fl);
-                }
+                println!("{:14} {:8.4} {:8.0} {:6.2}+{:5.2} {:6.1}% {:6.1}%", $name, $t, mb/$t, ms_mb, delta, cov_pct, fl);
                 prev = ms_mb;
             }};
         }
@@ -1419,6 +1448,15 @@ mod perf {
         row!("push_only", t_push, cov_push);
         row!("build_only", t_build, cov_build);
         row!("full_parse", t_full, cov_full);
+
+        // Sanity: deltas must sum to total (skip when running single tier)
+        if bench_tier.is_empty() {
+            let delta_sum = (t_scan + (t_trav - t_scan) + (t_loc - t_trav)
+                + (t_push - t_loc) + (t_build - t_push) + (t_full - t_build)) / mb * 1000.0;
+            let total_ms = t_full / mb * 1000.0;
+            assert!((delta_sum - total_ms).abs() < 0.001,
+                "ladder reconciliation failed: deltas sum to {delta_sum:.3} but total is {total_ms:.3}");
+        }
 
         println!("\nms/MB decomposition (deltas from consecutive tiers):");
         println!("  scan_only:    {:.3} ± {:.1}% ms/MB", t_scan / mb * 1000.0, cov_scan * 100.0);

@@ -1,9 +1,22 @@
 //! Chunk splitter for Crystal Reports XML streams.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use memchr;
 use rypipe_core::Splitter;
+
+// Timing for split phases — read via `split_timing()`.
+static SPECIAL_REGIONS_NS: AtomicU64 = AtomicU64::new(0);
+static SPLIT_LOOP_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read (special_regions_ns, split_loop_ns) from the last `compute_splits` call.
+pub fn split_timing() -> (u64, u64) {
+    (
+        SPECIAL_REGIONS_NS.load(Ordering::Relaxed),
+        SPLIT_LOOP_NS.load(Ordering::Relaxed),
+    )
+}
 
 /// Format-specific splitter for Crystal Reports-style XML.
 ///
@@ -141,6 +154,71 @@ pub(crate) fn next_row_start(
 }
 
 /// Compute N chunk byte ranges from `bytes`, each containing a whole number
+/// Check if byte offset `at` is inside a `<!-- ... -->` or `<![CDATA[ ... ]]>` region
+/// by scanning backwards a bounded distance (64 KB window).
+/// Returns true if the candidate is inside a comment or CDATA.
+fn in_comment_or_cdata(bytes: &[u8], at: usize) -> bool {
+    let window_start = at.saturating_sub(64 * 1024);
+    let region = &bytes[window_start..at];
+
+    // Find the last `<!--` in the window
+    let mut last_comment_abs = None;
+    {
+        let mut pos = 0;
+        while let Some(rel) = memchr::memmem::find(&region[pos..], b"<!--") {
+            last_comment_abs = Some(window_start + pos + rel);
+            pos += rel + 4;
+        }
+    }
+    if let Some(open) = last_comment_abs {
+        if memchr::memmem::find(&bytes[open + 4..at], b"-->").is_none() {
+            return true;
+        }
+    }
+
+    // Find the last `<![CDATA[` in the window
+    let mut last_cdata_abs = None;
+    {
+        let mut pos = 0;
+        while let Some(rel) = memchr::memmem::find(&region[pos..], b"<![CDATA[") {
+            last_cdata_abs = Some(window_start + pos + rel);
+            pos += rel + 9;
+        }
+    }
+    if let Some(open) = last_cdata_abs {
+        if memchr::memmem::find(&bytes[open + 9..at], b"]]>").is_none() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Find next row start with backward scan per candidate (no pre-computed skip).
+pub(crate) fn next_row_start_fast(bytes: &[u8], from: usize, tag: &[u8]) -> Option<usize> {
+    if from >= bytes.len() {
+        return None;
+    }
+    let mut full_tag = Vec::with_capacity(1 + tag.len());
+    full_tag.push(b'<');
+    full_tag.extend_from_slice(tag);
+    let mut p = from;
+    while let Some(rel) = memchr::memmem::find(&bytes[p..], &full_tag) {
+        let at = p + rel;
+        let after = at + 1 + tag.len();
+        let boundary = matches!(
+            bytes.get(after),
+            Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
+        );
+        if boundary && !in_comment_or_cdata(bytes, at) {
+            return Some(at);
+        }
+        p = at + 1;
+    }
+    None
+}
+
+/// Compute N chunk byte ranges from `bytes`, each containing a whole number
 /// of complete rows.
 ///
 /// Falls back to a single `0..bytes.len()` chunk when:
@@ -148,43 +226,47 @@ pub(crate) fn next_row_start(
 /// - the file is too small to produce that many non-empty chunks
 /// - no valid split point could be found for a nominal boundary
 pub(crate) fn compute_splits(bytes: &[u8], row_tag: &[u8], num_chunks: usize) -> Vec<Range<usize>> {
+    use std::time::Instant;
     if num_chunks <= 1 || bytes.is_empty() {
         return std::iter::once(0..bytes.len()).collect();
     }
 
-    let (skip, _) = find_special_regions(bytes);
-    let mut split_points: Vec<usize> = Vec::with_capacity(num_chunks + 1);
-    split_points.push(0);
+    // Skip the O(file) find_special_regions scan entirely.
+    // Each candidate does a bounded backward scan (64 KB window) instead.
+    // Cost: O(chunks × 64 KB) ≈ 6 MB for 96 chunks, vs O(file) = 533 MB.
+    SPECIAL_REGIONS_NS.store(0, Ordering::Relaxed);
 
-    for i in 1..num_chunks {
-        let nominal = bytes.len() * i / num_chunks;
-        match next_row_start(bytes, nominal, row_tag, &skip) {
-            Some(at) => {
-                // Deduplicate: if this split point is the same as the last one
-                // (happens when multiple nominals land in the same gap), push
-                // forward to the *next* valid row start instead.
-                if at == *split_points.last().unwrap() {
-                    if let Some(next) = next_row_start(bytes, at + 1, row_tag, &skip) {
-                        split_points.push(next);
-                    } else {
-                        // No more row starts; use single chunk
-                        return std::iter::once(0..bytes.len()).collect();
-                    }
-                } else {
-                    split_points.push(at);
-                }
-            }
-            None => {
-                // Fewer rows than chunks; fall back
-                return std::iter::once(0..bytes.len()).collect();
-            }
-        }
+    let t1 = Instant::now();
+    let nominal_offsets: Vec<usize> = (1..num_chunks)
+        .map(|i| bytes.len() * i / num_chunks)
+        .collect();
+
+    use rayon::prelude::*;
+    let found: Vec<Option<usize>> = nominal_offsets
+        .par_iter()
+        .map(|&nominal| next_row_start_fast(bytes, nominal, row_tag))
+        .collect();
+    SPLIT_LOOP_NS.store(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    // Filter out None (fewer rows than chunks → fall back)
+    if found.iter().any(|o| o.is_none()) {
+        return std::iter::once(0..bytes.len()).collect();
     }
 
+    // Sort and deduplicate
+    let mut split_points: Vec<usize> = Vec::with_capacity(found.len() + 2);
+    split_points.push(0);
+    {
+        let mut sorted: Vec<usize> = found.into_iter().flatten().collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        split_points.extend(sorted);
+    }
     split_points.push(bytes.len());
+    split_points.dedup();
 
     // Build ranges from split points
-    let mut ranges: Vec<Range<usize>> = Vec::with_capacity(num_chunks);
+    let mut ranges: Vec<Range<usize>> = Vec::with_capacity(split_points.len() - 1);
     for i in 0..split_points.len() - 1 {
         let start = split_points[i];
         let end = split_points[i + 1];

@@ -239,3 +239,54 @@ def test_no_rows_all_engines(tmp_path):
     assert list(CrystalXMLSource(path, row_tag="Row", engine="stream")) == []
     t = CrystalXMLSource(path, row_tag="Row", engine="columnar").to_arrow()
     assert t.num_rows == 0
+
+
+def test_sparse_disjoint_columns_all_engines(tmp_path):
+    """Rows with completely disjoint field sets — the 533 MB real export pattern.
+
+    Field72 appears in 8% of rows, Text21 in 1% (sparse). The stream engine
+    used first-row columns as schema and crashed with KeyError when later rows
+    had fields not in row 0. Regression test for source.py:295.
+    """
+    data = (
+        b'<?xml version="1.0"?>\n<R>'
+        # Row 0: only field 'a'
+        b'<Row><Field FieldName="a"><FormattedValue>1</FormattedValue></Field></Row>'
+        # Row 1: only field 'b' (disjoint from row 0)
+        b'<Row><Field FieldName="b"><FormattedValue>2</FormattedValue></Field></Row>'
+        # Row 2: fields 'a' and 'b'
+        b'<Row><Field FieldName="a"><FormattedValue>3</FormattedValue></Field>'
+        b'<Field FieldName="b"><FormattedValue>4</FormattedValue></Field></Row>'
+        # Row 3: only field 'c' (new field, never seen before)
+        b'<Row><Field FieldName="c"><FormattedValue>5</FormattedValue></Field></Row>'
+        # Row 4: only field 'a'
+        b'<Row><Field FieldName="a"><FormattedValue>6</FormattedValue></Field></Row>'
+        # Row 5: fields 'b' and 'c' (no 'a')
+        b'<Row><Field FieldName="b"><FormattedValue>7</FormattedValue></Field>'
+        b'<Field FieldName="c"><FormattedValue>8</FormattedValue></Field></Row>'
+        b'</R>'
+    )
+    path = _write(tmp_path, data, "sparse.xml")
+    expected = _null_fill(_oracle_rows(data))
+
+    # All three engines must produce identical output
+    stream = _null_fill(list(CrystalXMLSource(path, row_tag="Row", engine="stream")))
+    col = _null_fill(
+        CrystalXMLSource(path, row_tag="Row", engine="columnar")
+        .to_arrow()
+        .to_pylist()
+    )
+    par = _null_fill(
+        CrystalXMLSource(path, row_tag="Row", engine="parallel", threads=2)
+        .to_arrow()
+        .to_pylist()
+    )
+    bounded = _null_fill(
+        CrystalXMLSource(path, row_tag="Row", engine="columnar", memory="1KB")
+        .to_arrow()
+        .to_pylist()
+    )
+    assert stream == expected, "stream diverged on sparse disjoint columns"
+    assert col == expected, "columnar diverged on sparse disjoint columns"
+    assert par == expected, "parallel diverged on sparse disjoint columns"
+    assert bounded == expected, "bounded diverged on sparse disjoint columns"
