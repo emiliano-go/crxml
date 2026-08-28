@@ -125,6 +125,14 @@ fn parse_row<S: ColumnarSink + ?Sized>(
             ChildFlow::Truncated => return Flow::Truncated,
             ChildFlow::Recover => return Flow::Recover,
         };
+        if sink.row_rejected() {
+            if let Some(after) = find_close_details(bytes, cur, regions) {
+                sink.end_row();
+                return Flow::At(after);
+            } else {
+                return Flow::Truncated;
+            }
+        }
     }
 }
 
@@ -641,6 +649,7 @@ static CLOSE_FORMATTED: LazyLock<memmem::Finder> =
     LazyLock::new(|| memmem::Finder::new("</FormattedValue"));
 static CLOSE_TEXTVALUE: LazyLock<memmem::Finder> =
     LazyLock::new(|| memmem::Finder::new("</TextValue"));
+static CLOSE_DETAILS: LazyLock<memmem::Finder> = LazyLock::new(|| memmem::Finder::new("</Details"));
 
 // Searchers for skip_construct (comments / CDATA end markers).
 static COMMENT_END: LazyLock<memmem::Finder> =
@@ -655,6 +664,7 @@ static DETAILS_OPEN: LazyLock<memmem::Finder> =
 /// Pattern lengths (`</` + name) for advancing past a found close tag.
 const PAT_FIELD: usize = 7;
 const PAT_TEXT: usize = 6;
+const PAT_DETAILS: usize = 10;
 const PAT_FORMATTED_VALUE: usize = 16;
 const PAT_VALUE: usize = 7;
 const PAT_TEXT_VALUE: usize = 11;
@@ -690,6 +700,10 @@ fn find_close_after(
         return Some(after_pat + gt_rel + 1);
     }
     None
+}
+
+fn find_close_details(bytes: &[u8], from: usize, regions: &[Range<usize>]) -> Option<usize> {
+    find_close_after(bytes, from, &CLOSE_DETAILS, PAT_DETAILS, regions)
 }
 
 /// Raw text between an already-scanned open tag and its matching close tag.

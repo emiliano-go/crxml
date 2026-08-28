@@ -4,7 +4,7 @@
 
 ### Bug Fixes
 
-- **Sparse-column KeyError on collect/dict path**: `CrystalXMLSource.to_arrow()` used the first row's keys as schema and `r[k]` for lookup. When a later row carried a field the first row lacked (e.g., `Field72` in 8% of rows, `Text21` in 1% — the common pattern in real Crystal Reports exports), the stream engine threw `KeyError`. Fixed to union all row keys and use `r.get(k)`. This is a user-facing correctness fix: most real exports have sparse columns, and the crash occurred on the default `to_arrow()` path.
+- **Sparse-column KeyError on collect/dict path**: `CrystalXMLSource.to_arrow()` used the first row's keys as schema and `r[k]` for lookup. When a later row carried a field the first row lacked (e.g., `Field72` in 8% of rows, `Text21` in 1% - the common pattern in real Crystal Reports exports), the stream engine threw `KeyError`. Fixed to union all row keys and use `r.get(k)`. This is a user-facing correctness fix: most real exports have sparse columns, and the crash occurred on the default `to_arrow()` path.
 
 ## 1.2.0 (2026-08-23)
 

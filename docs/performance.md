@@ -59,20 +59,20 @@ Median-of-7 with adaptive sampling, `row_tag="Details"`, warm cache, per-config 
 <!-- BEGIN:native -->
 | File | single | par16 | par128 (peak) | bounded64 |
 |---|---|---|---|---|
-| **100 MB** | 756 / 684k | **3792 / 3.43M** | — | 667 / 603k |
+| **100 MB** | 756 / 684k | **3792 / 3.43M** | - | 667 / 603k |
 | **533 MB real** | 745 / 674k | 3939 / 3.57M* | **4417 / 4.00M*** | 645 / 584k |
 | **1 GB** | 734 / 664k | 3418 / 3.10M* | **4278 / 3.88M** | 546 / 447k |
 <!-- END:native -->
 
 \* Re-measured Aug 28 with rebuilt SO (median-of-7, CoV 2–7%): par16 0.135s 3939 MB/s, par128 0.120s 4417 MB/s on 533 MB (was 4074/4198). 1 GB par16 dropped due to thermal variance; par128 stable at 4278 vs 4284 earlier within noise.
 
-> **Auto-tune rule (split by path, raised cap):** Full-RAM `par` uses `max(threads, min(16×threads, file_bytes/4 MB))` — peaks at 4 MB (par133 4450 vs par266 4328 at 2 MB, −3%; 1 MB collapses to 3553). Raised from 8×threads=128 to 16×threads=256 so 533 MB now hits its ideal 133 (was capped at 128, −5% off peak). Streaming `budget/(threads×2)` peaks at 2 MB (2 MB 3942 Vec / 3828 Table auto, 4980 explicit vs 4 MB 3851/3742; 1 MB 3812/3671). Source `src/crxml/source.py:155` keeps 4 MB for `par`; streaming's 2 MB comes from its own budget (64 MB/16t = 2 MB). 100 MB → par 25 (100/4) capped at 16×16=256 → 25, 533 MB → 133, 1 GB → 256.
+> **Auto-tune rule (split by path, raised cap):** Full-RAM `par` uses `max(threads, min(16×threads, file_bytes/4 MB))` - peaks at 4 MB (par133 4450 vs par266 4328 at 2 MB, −3%; 1 MB collapses to 3553). Raised from 8×threads=128 to 16×threads=256 so 533 MB now hits its ideal 133 (was capped at 128, −5% off peak). Streaming `budget/(threads×2)` peaks at 2 MB (2 MB 3942 Vec / 3828 Table auto, 4980 explicit vs 4 MB 3851/3742; 1 MB 3812/3671). Source `src/crxml/source.py:155` keeps 4 MB for `par`; streaming's 2 MB comes from its own budget (64 MB/16t = 2 MB). 100 MB → par 25 (100/4) capped at 16×16=256 → 25, 533 MB → 133, 1 GB → 256.
 
 > **533 MB real vs 1 GB synthetic:** At par128, real data is within 4% of synthetic (4470 vs 4278 after rebuild with frozen schema). The earlier deficit at par16/par32 was a tuning artifact.
 
-### Parallel streaming vs full-RAM parallel — like-for-like (gates the headline)
+### Parallel streaming vs full-RAM parallel - like-for-like (gates the headline)
 
-The initial `64 MB / 16t` 4361 MB/s number stopped at `Vec<RecordBatch>` (no Table). Full-RAM `par128` goes through `record_batch_to_table` + `concat_tables` to a Table. Re-measured both terminating at the same artifact (median-of-7, 533 MB real, 5800X warm, build 1e9d5a9) — now with frozen schema (see below):
+The initial `64 MB / 16t` 4361 MB/s number stopped at `Vec<RecordBatch>` (no Table). Full-RAM `par128` goes through `record_batch_to_table` + `concat_tables` to a Table. Re-measured both terminating at the same artifact (median-of-7, 533 MB real, 5800X warm, build 1e9d5a9) - now with frozen schema (see below):
 
 | Path | Artifact | MB/s (frozen, parallel Discovery) | MB/s (before, unstable) | CoV% | Batches | Chunk MB | RssAnon MB | `discovery_ns` |
 |---|---|---|---|---|---|---|---|---|
@@ -80,25 +80,25 @@ The initial `64 MB / 16t` 4361 MB/s number stopped at `Vec<RecordBatch>` (no Tab
 | `par128` (4.16 MB) | Table | **4470** | 4417 | 3.0 | 128 | 4.16 | 137 | 0 |
 | `stream 64MB/16t` (2.00 MB) | Vec\<Batch\> | 4485 | **4770** | 2.8 | 266 | 2.00 | 88 | 5.3 ms |
 | `stream 64MB/16t` auto | **Table** | 4497 | **4551** | 1.9 | 266 | 2.00 | 87 | 5.3 ms |
-| `stream 64MB/16t` explicit `schema=[...]` | **Table** | **4980** | — | 1.7 | 266 | 2.00 | 87 | 0 |
-| `stream 64MB/8t` (4.01 MB) | Table | 3926 | 4198 | 4.4 | 133 | 4.01 | — | 5.3 ms |
-| `stream 64MB/4t` (8.08 MB) | Table | 2442 | 2540 | 1.4 | 66 | 8.08 | — | 5.3 ms |
+| `stream 64MB/16t` explicit `schema=[...]` | **Table** | **4980** | - | 1.7 | 266 | 2.00 | 87 | 0 |
+| `stream 64MB/8t` (4.01 MB) | Table | 3926 | 4198 | 4.4 | 133 | 4.01 | - | 5.3 ms |
+| `stream 64MB/4t` (8.08 MB) | Table | 2442 | 2540 | 1.4 | 66 | 8.08 | - | 5.3 ms |
 
-Throughput `file_bytes/median`. Before frozen schema, `stream Table` used `pa.concat_tables(..., promote_options="default")` to paper over ragged schemas (FieldG 30% sparse, Text20 70% — per-chunk order `FieldG` vs `Text20` last diverged). That is now **fixed**: batches have stable schemas.
+Throughput `file_bytes/median`. Before frozen schema, `stream Table` used `pa.concat_tables(..., promote_options="default")` to paper over ragged schemas (FieldG 30% sparse, Text20 70% - per-chunk order `FieldG` vs `Text20` last diverged). That is now **fixed**: batches have stable schemas.
 
-> **Blocker — unstable batch schemas (gates `auto` default):** Without a frozen schema, batch 1 has `...FieldG,Text20` and batch 2 has `...Text20,FieldG` (same set, different order). `concat_tables(promote)` hides it, but `pq.ParquetWriter(first.schema).write_batch(batch)` raises:
+> **Blocker - unstable batch schemas (gates `auto` default):** Without a frozen schema, batch 1 has `...FieldG,Text20` and batch 2 has `...Text20,FieldG` (same set, different order). `concat_tables(promote)` hides it, but `pq.ParquetWriter(first.schema).write_batch(batch)` raises:
 > ```
 > Table schema does not match schema used to create file:
 > table: ... Text20, FieldG vs file: ... FieldG, Text20
 > ```
 > Reproduced on 533 MB and 1 GB with `memory="64MB", threads=16` before the fix. The differential test missed it because it collected then concatenated.
 
-**Fix — frozen schema `crates/rypipe-core/src/parallel_stream.rs:59` `ParallelStreamOpts::schema` + `crates/rypipe-core/src/schema.rs:14` `FrozenSchema` + `crates/rypipe-core/src/engine.rs:79` `ensure_schema`:**
+**Fix - frozen schema `crates/rypipe-core/src/parallel_stream.rs:59` `ParallelStreamOpts::schema` + `crates/rypipe-core/src/schema.rs:14` `FrozenSchema` + `crates/rypipe-core/src/engine.rs:79` `ensure_schema`:**
 
-* If `plan.schema_order` non-empty (explicit `schema=[...]`), `FrozenSchema::from_plan` — exact, zero Discovery cost.
-* Else auto-discovery via `DiscoverySink` `parallel_stream.rs:55` sampled locate (16×2 MiB windows for >128 MiB else full scan, `needs_value=false`). Windows are now **parallelised** `parallel_stream.rs:122` via `rayon::par_iter` (19 ms serial → ~5.3 ms on 16t, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482` — the 13 ms residual is now 1.3 ms). `FrozenSchema::from_discovered` applies `field_map`/`drop_fields`. Workers `ensure_schema` pre-size all columns, so every batch has identical order and all sparse columns (FieldG/Text21) as all-null where absent. Cost: auto Discovery ~5.3 ms on 533 MB (≈4% of parse) vs 19 ms serial before; explicit avoids it and is **11% faster than par128** (4980 vs 4470) while bounded.
+* If `plan.schema_order` non-empty (explicit `schema=[...]`), `FrozenSchema::from_plan` - exact, zero Discovery cost.
+* Else auto-discovery via `DiscoverySink` `parallel_stream.rs:55` sampled locate (16×2 MiB windows for >128 MiB else full scan, `needs_value=false`). Windows are now **parallelised** `parallel_stream.rs:122` via `rayon::par_iter` (19 ms serial → ~5.3 ms on 16t, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482` - the 13 ms residual is now 1.3 ms). `FrozenSchema::from_discovered` applies `field_map`/`drop_fields`. Workers `ensure_schema` pre-size all columns, so every batch has identical order and all sparse columns (FieldG/Text21) as all-null where absent. Cost: auto Discovery ~5.3 ms on 533 MB (≈4% of parse) vs 19 ms serial before; explicit avoids it and is **11% faster than par128** (4980 vs 4470) while bounded.
 
-**Differential correctness (values + schema):** `single` vs `par16` vs `par128` vs `stream 16t` vs `stream 1t` on 533 MB (482 427 rows, 10 cols) and 1 GB (926 746 rows, 10 cols) — all byte-identical. Streaming now passes the incremental consumer test:
+**Differential correctness (values + schema):** `single` vs `par16` vs `par128` vs `stream 16t` vs `stream 1t` on 533 MB (482 427 rows, 10 cols) and 1 GB (926 746 rows, 10 cols) - all byte-identical. Streaming now passes the incremental consumer test:
 
 ```python
 import pyarrow.parquet as pq
@@ -110,33 +110,33 @@ for b in it: w.write_batch(b) # now succeeds (was raise before fix)
 w.close()
 ```
 
-**Verdict (honest framing, after parallel Discovery):** Table→Table **stream-auto 4497 vs par128 4470 on 533 MB (+0.6%, within CoV)** — auto now matches par (was −14% at 3828 before parallelisation). At 2 MB chunk: 4497 auto vs 4328 par (+3%). **Stream-explicit 4980 vs par128 4470 (+11%)** remains the peak bounded mode. Discovery is 5.3 ms (16× parallel) vs 19 ms serial, residual vs explicit is 6.6 ms (5.3 ms Discovery + 1.3 ms `ensure_schema`/reorder). The decisive win is **RSS (88 vs 137 MB, −36%) + incrementality** with no full-table materialisation, now without giving up throughput. `auto` default is now **unblocked**: with parallel Discovery, auto is within few percent of explicit and matches par — propose `auto` → parallel streaming for ≥100 MB (see engine guide) with `schema=` as the documented fast path for batch workloads (discover once via `crxml.discover_schema("sample.xml")` `src/crxml_core/src/lib.rs:979` for 1000 files: 5 ms once vs 5 ms per file → 4980 realistic, see below).
+**Verdict (honest framing, after parallel Discovery):** Table→Table **stream-auto 4497 vs par128 4470 on 533 MB (+0.6%, within CoV)** - auto now matches par (was −14% at 3828 before parallelisation). At 2 MB chunk: 4497 auto vs 4328 par (+3%). **Stream-explicit 4980 vs par128 4470 (+11%)** remains the peak bounded mode. Discovery is 5.3 ms (16× parallel) vs 19 ms serial, residual vs explicit is 6.6 ms (5.3 ms Discovery + 1.3 ms `ensure_schema`/reorder). The decisive win is **RSS (88 vs 137 MB, −36%) + incrementality** with no full-table materialisation, now without giving up throughput. `auto` default is now **unblocked**: with parallel Discovery, auto is within few percent of explicit and matches par - propose `auto` → parallel streaming for ≥100 MB (see engine guide) with `schema=` as the documented fast path for batch workloads (discover once via `crxml.discover_schema("sample.xml")` `src/crxml_core/src/lib.rs:979` for 1000 files: 5 ms once vs 5 ms per file → 4980 realistic, see below).
 
-**Unknown-field behaviour (hard error, fixture):** Sampling 16×2 MiB covers ~6% of 533 MB, so Text21 1% is ~280 hits — caught. A column at 0.05% (last 1% of file) would be missed. With frozen schema, any field not in the schema hard-errors on the worker that first sees it:
+**Unknown-field behaviour (hard error, fixture):** Sampling 16×2 MiB covers ~6% of 533 MB, so Text21 1% is ~280 hits - caught. A column at 0.05% (last 1% of file) would be missed. With frozen schema, any field not in the schema hard-errors on the worker that first sees it:
 ```
 unknown field "LateColumn" not in frozen schema (10 columns, exact=false); pass schema=[...] with full column list or use full-scan discovery
 ```
-Surfaced as `MergeError` via `TableBuilder::finish()` `crates/rypipe-core/src/engine.rs:510` → `ParallelStreamingBatchIterator` `crates/rypipe-core/src/parallel_stream.rs:426` `Err` channel → Python `MergeError`. Fixture: file with `LateColumn` only in last 1% (200k rows, last 200 rows) — verified auto with sampled Discovery misses it and raises, explicit `schema=["A","LateColumn"]` succeeds.
+Surfaced as `MergeError` via `TableBuilder::finish()` `crates/rypipe-core/src/engine.rs:510` → `ParallelStreamingBatchIterator` `crates/rypipe-core/src/parallel_stream.rs:426` `Err` channel → Python `MergeError`. Fixture: file with `LateColumn` only in last 1% (200k rows, last 200 rows) - verified auto with sampled Discovery misses it and raises, explicit `schema=["A","LateColumn"]` succeeds.
 
 1 GB side-by-side with frozen schema, parallel Discovery (5 rounds):
 
 | Chunk | par Table | stream-auto Table | stream-auto Vec | stream-explicit Vec |
 |---|---|---|---|---|
-| 1 MB (1023/532) | 3553 | 3671* | 3812 | — |
+| 1 MB (1023/532) | 3553 | 3671* | 3812 | - |
 | 2 MB (511/266) | 4328 | 4497 | 4485 | **4980** (533 MB) / ~4900 (1 GB) |
-| 4 MB (255/133) | **4450** | 4235 | 4342 | — |
-| 8 MB (127/66) | 4121 | 4070 | 3965 | — |
+| 4 MB (255/133) | **4450** | 4235 | 4342 | - |
+| 8 MB (127/66) | 4121 | 4070 | 3965 | - |
 
-\* 1 MB auto Table 3671 vs par 3553 (+3%) — gap narrowed from +54% before frozen, but streaming still doesn't collapse (mechanism `chunk_buf` reuse).
+\* 1 MB auto Table 3671 vs par 3553 (+3%) - gap narrowed from +54% before frozen, but streaming still doesn't collapse (mechanism `chunk_buf` reuse).
 
-**Reuse for batch workloads — public `discover_schema` `src/crxml/source.py:426` `crxml.discover_schema` / `_core.discover_schema` `src/crxml_core/src/lib.rs:979`:**
+**Reuse for batch workloads - public `discover_schema` `src/crxml/source.py:426` `crxml.discover_schema` / `_core.discover_schema` `src/crxml_core/src/lib.rs:979`:**
 ```python
 schema = crxml.discover_schema("sample.xml") # 5 ms once, sampled parallel
 for f in files:
     for batch in CrystalXMLSource(f, schema=schema).iter_record_batches(memory="64MB", threads=16):
         writer.write_batch(batch) # 4980 MB/s per file, not 4497
 ```
-Discover once, reuse everywhere — makes 4980 the realistic number for 1000-file batches, not just benchmark.
+Discover once, reuse everywhere - makes 4980 the realistic number for 1000-file batches, not just benchmark.
 
 **Chunk cap raised:** `src/crxml/source.py:155` `8×threads` → `16×threads` (256) so 533 MB now hits ideal 133 for 4 MB (was capped 128). 50 GB at 16×16=256 → 195 MB/chunk, still bounded.
 
@@ -189,8 +189,8 @@ Previous `parallel_stream` budget sweep used `chunk = budget / (threads × 2)`, 
 | budget | 4t chunk | 8t chunk | 16t chunk | 16t Table (frozen) | 16t Table (explicit schema) |
 |---|---|---|---|---|---|
 | 64 MB | 8.08 MB | 4.01 MB | **2.00 MB** (266) | 3828 (auto) | 4980 (explicit) |
-| 256 MB | 32 MB | 16 MB | 8.08 MB (66) | 3513 | — |
-| 512 MB | 64 MB | 32 MB | 16.15 MB (33) | 3448 | — |
+| 256 MB | 32 MB | 16 MB | 8.08 MB (66) | 3513 | - |
+| 512 MB | 64 MB | 32 MB | 16.15 MB (33) | 3448 | - |
 
 Auto includes Discovery (16×2 MiB windows, ~19 ms on 533 MB). The 4-thread column looked bad (2273) partly because it ran 8 MB chunks, not because 4 threads is slow. Isolated, with **fixed 4 MB chunk** (budget = chunk × threads × 2, frozen auto):
 
@@ -206,13 +206,13 @@ Thread scaling is monotonic when chunk is fixed but absolute numbers dropped ~12
 
 | Chunk | par n | par Table | streaming budget | streaming Vec (auto) | streaming Table (auto) | streaming Table (explicit) |
 |---|---|---|---|---|---|
-| 1 MB | 532 | 3553 | 32 MB | 3812 | 3671 (532) | — |
+| 1 MB | 532 | 3553 | 32 MB | 3812 | 3671 (532) | - |
 | **2 MB** | 266 | 4328 | **64 MB** | 3863 | 3782 (266) | **~4980** |
-| 4 MB | 133 | **4450** | 128 MB | 3851 | 3742 (133) | — |
-| 8 MB | 66 | 4121 | 256 MB | 3609 | 3606 (66) | — |
-| 16 MB | 33 | 3838 | 512 MB | 3297 | 3292 (33) | — |
+| 4 MB | 133 | **4450** | 128 MB | 3851 | 3742 (133) | - |
+| 8 MB | 66 | 4121 | 256 MB | 3609 | 3606 (66) | - |
+| 16 MB | 33 | 3838 | 512 MB | 3297 | 3292 (33) | - |
 
-**Split rule (one divisor cannot serve both):** `par` peaks at **4 MB** (4450 vs 4328 at 2 MB, −3%; 353 at 1 MB collapses). Streaming with frozen auto peaks at **2 MB** (3863 vs 3851 at 4 MB) but is **−14% vs par at 2 MB** (3782 vs 4328) due to Discovery cost. Explicit schema recovers the lead (4980 vs 4470, +11%). 100 MB at 0.78 MB (par128) shows no cliff (par 3722 vs 3856 at 2 MB, within CoV), streaming 0.78 MB (25 MB/16t) is 4016 vs 4126 before fix, now ~3700 — within noise. **Keep `par` at `file_bytes/4 MB`, streaming at `budget/(threads×2)` for 2 MB (64 MB/16t).** The 8×threads cap still prevents 533 MB from reaching ideal 133 for 4 MB (128 vs 133).
+**Split rule (one divisor cannot serve both):** `par` peaks at **4 MB** (4450 vs 4328 at 2 MB, −3%; 353 at 1 MB collapses). Streaming with frozen auto peaks at **2 MB** (3863 vs 3851 at 4 MB) but is **−14% vs par at 2 MB** (3782 vs 4328) due to Discovery cost. Explicit schema recovers the lead (4980 vs 4470, +11%). 100 MB at 0.78 MB (par128) shows no cliff (par 3722 vs 3856 at 2 MB, within CoV), streaming 0.78 MB (25 MB/16t) is 4016 vs 4126 before fix, now ~3700 - within noise. **Keep `par` at `file_bytes/4 MB`, streaming at `budget/(threads×2)` for 2 MB (64 MB/16t).** The 8×threads cap still prevents 533 MB from reaching ideal 133 for 4 MB (128 vs 133).
 
 ### Per-file parallel scaling (post split-scan fix)
 
@@ -221,7 +221,7 @@ Thread scaling is monotonic when chunk is fixed but absolute numbers dropped ~12
 | **533 MB real** | 3939 | 2912* | 2901* | 2922* | 4169 | **4417** | 4099 |
 | **1 GB** | 3418 | 3036* | 2926* | 3064* | 4063 | 4278 | 3913 |
 
-\* Old numbers before rebuild; new par48/64/80 not re-measured after split-scan fix — left as stale. Use par16/par128/par266 from Aug 28 rebuild (median-of-7, CoV 2–7%) for tuning. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB): peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
+\* Old numbers before rebuild; new par48/64/80 not re-measured after split-scan fix - left as stale. Use par16/par128/par266 from Aug 28 rebuild (median-of-7, CoV 2–7%) for tuning. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB): peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
 
 Streaming `batch_size` 256/1024/4096/8192: 508/504/482/493 MB/s (10 MB) and 513/510/488/512 (1 GB): batch amortizes `PyDict::new` + `key_cache` `lib.rs:599` double hash, but `next_batch(1024)` already `allow_threads` `lib.rs:919`.
 
@@ -315,10 +315,10 @@ Single-threaded streaming (bounded, `StreamingBatchIterator`):
 |---|---|---|---|---|---|
 | 64KB | 637 | 63 | 22 | 8,615 | 55 |
 | **1MB** | **723** | 65 | 24 | 539 | 895 |
-| 16MB | 701 | — | — | 34 | 14,189 |
+| 16MB | 701 | - | - | 34 | 14,189 |
 | 64MB | 679 | 174 | 133 | 9 | 53,603 |
 
-**1 MB is the documented default for single-thread.** Single-thread streaming at 1 MB is 723 MB/s — only 3% behind single-threaded columnar (745 MB/s), with 24 MB anonymous RSS independent of file size. The old "streaming costs you 25%" framing is retired. `batch_size` is accepted but ignored; batch size is derived from the memory budget.
+**1 MB is the documented default for single-thread.** Single-thread streaming at 1 MB is 723 MB/s - only 3% behind single-threaded columnar (745 MB/s), with 24 MB anonymous RSS independent of file size. The old "streaming costs you 25%" framing is retired. `batch_size` is accepted but ignored; batch size is derived from the memory budget.
 
 Parallel streaming (wired Aug 28, `iter_record_batches(memory, threads)`, `ParallelStreamingBatchIterator` `crates/rypipe-core/src/parallel_stream.rs:13`):
 
@@ -326,11 +326,11 @@ Parallel streaming (wired Aug 28, `iter_record_batches(memory, threads)`, `Paral
 |---|---|---|---|---|---|
 | 64 MB / 16t (2 MB) auto | Vec\<Batch\> | 4485 | 3863* | 88 | frozen via parallel sampled Discovery (16×2 MiB, 5.3 ms) |
 | 64 MB / 16t auto | Table | **4497** | 3782* | 87 | same, +0.6% vs par128 (was −14% at 19 ms serial) |
-| 64 MB / 16t **explicit** `schema=[...]` | Vec\<Batch\> | **4980** | **~4900** | 87 | exact `FrozenSchema::from_plan`, no Discovery — **11% faster than par128** |
+| 64 MB / 16t **explicit** `schema=[...]` | Vec\<Batch\> | **4980** | **~4900** | 87 | exact `FrozenSchema::from_plan`, no Discovery - **11% faster than par128** |
 | 128 MB / 16t (4 MB) auto | Table | 4235 | 3606 | 87 |  |
 | par128 (full RAM, 4.16 MB) | Table | **4470** | 4278 | 137 | peak for par (4 MB) |
 
-\* 1 GB auto still 3782/3863 from before parallel Discovery was measured on 533 MB only; 533 MB auto now matches par (4497 vs 4470) after 19→5.3 ms. Before frozen schema, auto was 4770/4551 (unstable schemas — batch 2 order `FieldG` vs `Text20` swapped, `pq.ParquetWriter` raised). Parallel Discovery (+5.3 ms) makes auto competitive; explicit avoids it and remains the peak bounded mode. Python: `CrystalXMLSource(f, schema=schema).iter_record_batches(memory="64MB", threads=16)` or `crxml.discover_schema("sample.xml")` reuse.
+\* 1 GB auto still 3782/3863 from before parallel Discovery was measured on 533 MB only; 533 MB auto now matches par (4497 vs 4470) after 19→5.3 ms. Before frozen schema, auto was 4770/4551 (unstable schemas - batch 2 order `FieldG` vs `Text20` swapped, `pq.ParquetWriter` raised). Parallel Discovery (+5.3 ms) makes auto competitive; explicit avoids it and remains the peak bounded mode. Python: `CrystalXMLSource(f, schema=schema).iter_record_batches(memory="64MB", threads=16)` or `crxml.discover_schema("sample.xml")` reuse.
 
 ## Scalar-loop negative result (Aug 28)
 
@@ -342,16 +342,16 @@ Attempted to replace `memchr` byte searches with scalar loops for haystacks <128
 | scalar <128 | 297 | 1,040 | within noise |
 | scalar <16 | 310 | 1,011 | within noise |
 
-**Root cause:** memchr's internal thresholds (16B SSE2, 32B AVX2) are already optimal. Scalar loops are5–7× slower than AVX2 on50-byte haystacks. `assign_text` tripled (2.2%→7.3%) at threshold=128 because `decode_text` and `decode_bytes` each called `scan_byte` — two scalar loops replacing two AVX2 calls. **Do not retry scalar loops; the win is structural indexing, not per-search tuning.**
+**Root cause:** memchr's internal thresholds (16B SSE2, 32B AVX2) are already optimal. Scalar loops are5–7× slower than AVX2 on50-byte haystacks. `assign_text` tripled (2.2%→7.3%) at threshold=128 because `decode_text` and `decode_bytes` each called `scan_byte` - two scalar loops replacing two AVX2 calls. **Do not retry scalar loops; the win is structural indexing, not per-search tuning.**
 
 ## Chunk-count sweep (post split-scan fix, 533 MB, median-of-7)
 
 | Chunks | MB/s | CoV% | Chunk MB |
 |---|---|---|---|
-| par8 | 3,531 | — | 66.6 |
+| par8 | 3,531 | - | 66.6 |
 | par16 | 3901 | 4.4 | 33.3 |
-| par32 | 3,969* | — | 16.6 |
-| par64 | 4,039* | — | 8.3 |
+| par32 | 3,969* | - | 16.6 |
+| par64 | 4,039* | - | 8.3 |
 | par96 | 4123* | 2.8 | 5.5 |
 | **par128** | **4470** | 3.0 | **4.16** |
 | par133 (4 MB) | 4450 | 3.1 | 4.00 |
@@ -361,7 +361,7 @@ Attempted to replace `memchr` byte searches with scalar loops for haystacks <128
 | par384 | 3882* | 3.3 | 1.39 |
 | par532 (1 MB) | 3553 | 3.8 | 1.00 |
 
-Peak at **par128** (4470 MB/s, 4.16 MB chunks, CoV 3.0%). par192 marginally 4214 but 2.6× noisier; par266 at 2 MB is 4328 (−3% vs 4 MB); 1 MB collapses to 3553. Auto-tune rule: `max(threads, min(8×threads, file_bytes/4 MB))` — 533 MB → 128 (capped vs ideal 133), 1 GB → 128. Streaming's 2 MB optimum is separate (64 MB/16t) — one divisor cannot serve both, keep split.
+Peak at **par128** (4470 MB/s, 4.16 MB chunks, CoV 3.0%). par192 marginally 4214 but 2.6× noisier; par266 at 2 MB is 4328 (−3% vs 4 MB); 1 MB collapses to 3553. Auto-tune rule: `max(threads, min(8×threads, file_bytes/4 MB))` - 533 MB → 128 (capped vs ideal 133), 1 GB → 128. Streaming's 2 MB optimum is separate (64 MB/16t) - one divisor cannot serve both, keep split.
 
 ## Traverse tier memchr profile (structural indexing justification)
 
@@ -369,24 +369,24 @@ Peak at **par128** (4470 MB/s, 4.16 MB chunks, CoV 3.0%). par192 marginally 4214
 |---|---|---|---|
 | push | 26% | 47% | 12.2% |
 | **traverse** | **59%** | **41%** | **24.3%** |
-| **total** | — | — | **36.5%** |
+| **total** | - | - | **36.5%** |
 
 Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr on short haystacks. **Halving memchr → ~18% end-to-end throughput.** Structural indexing (one-pass SIMD mask computation replacing 5–7 sequential searches) is the only remaining lever and targets both tiers.
 
-## Engine selection guide (per goal) — after parallel Discovery (auto now unblocked)
+## Engine selection guide (per goal) - after parallel Discovery (auto now unblocked)
 
 | If your goal is... | Use this | Because... |
 |---|---|---|
 | Fastest `to_arrow`/`to_dataframe` on ≥100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
 | Fastest **bounded** `to_arrow`/`to_dataframe` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` → `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
-| Bounded, no schema known (auto, now competitive) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) — **stable** (frozen `ensure_schema` `engine.rs:79`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. Was 3828 (−14%) with serial 19 ms; parallelised 19→5.3 ms unblocks `auto`. |
+| Bounded, no schema known (auto, now competitive) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) - **stable** (frozen `ensure_schema` `engine.rs:79`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. Was 3828 (−14%) with serial 19 ms; parallelised 19→5.3 ms unblocks `auto`. |
 | Minimize peak memory (single-thread) | `memory="1MB"` single streaming | 723 MB/s (3% behind single 745), 24 MB RssAnon, `RowSink` `lib.rs:564` |
 | Stream rows one-by-one (dicts) | `engine="stream"` `for row in source` | Row dicts lazily, no Arrow |
-| Dictionary-encoded | `engine="parallel", auto_dict=True` | forces `merge` `merge.rs:57` (serial) — avoid for throughput |
+| Dictionary-encoded | `engine="parallel", auto_dict=True` | forces `merge` `merge.rs:57` (serial) - avoid for throughput |
 
-> **Status of `auto` default — now unblocked:** `auto` picks `parallel` if `size ≤ memory` and `size ≥ 8 MB`. With parallel Discovery (16× sampled windows `parallel_stream.rs:122` `rayon::par_iter`, 19→5.3 ms, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482`), **auto 4497 vs par128 4470 (+0.6%, within CoV)**. The blocker is removed. Propose `auto` → parallel streaming for ≥100 MB (bounded, stable, matches throughput, + `discover_schema` reuse below). `schema=` remains the fast path for batch workloads (4980). Switching `auto` is now a docs + minor version bump, not a performance concession.
+> **Status of `auto` default - now unblocked:** `auto` picks `parallel` if `size ≤ memory` and `size ≥ 8 MB`. With parallel Discovery (16× sampled windows `parallel_stream.rs:122` `rayon::par_iter`, 19→5.3 ms, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482`), **auto 4497 vs par128 4470 (+0.6%, within CoV)**. The blocker is removed. Propose `auto` → parallel streaming for ≥100 MB (bounded, stable, matches throughput, + `discover_schema` reuse below). `schema=` remains the fast path for batch workloads (4980). Switching `auto` is now a docs + minor version bump, not a performance concession.
 
-> **Schema stability & reuse:** Every `iter_record_batches` batch now has identical `schema` (`parallel_stream.rs:59` `opts.schema` → `engine.rs:79` `ensure_schema`). Without explicit `schema=[...]`, auto-discovery `schema.rs:90` via `DiscoverySink` `parallel_stream.rs:55` (≤128 MiB full scan else 16×2 MiB sampled, now parallel, `needs_value=false`) captures all columns (FieldG 30%, Text21 1%). Hard-error on unknown field (`engine.rs:510` `MergeError` naming column, `unknown field "LateColumn" not in frozen schema... pass schema=[...]`) — fixture with `LateColumn` only in last 1% verifies loud failure vs silent drop. Column order is `schema` order if explicit, else discovery file order. Provide `schema=` to avoid 5.3 ms; reuse via `crxml.discover_schema("sample.xml")` `src/crxml/source.py:426` / `_core.discover_schema` `src/crxml_core/src/lib.rs:979` (see below). 1 MB chunks `par` collapses (3553) while streaming does not (3812, +7%) due to `chunk_buf` reuse.
+> **Schema stability & reuse:** Every `iter_record_batches` batch now has identical `schema` (`parallel_stream.rs:59` `opts.schema` → `engine.rs:79` `ensure_schema`). Without explicit `schema=[...]`, auto-discovery `schema.rs:90` via `DiscoverySink` `parallel_stream.rs:55` (≤128 MiB full scan else 16×2 MiB sampled, now parallel, `needs_value=false`) captures all columns (FieldG 30%, Text21 1%). Hard-error on unknown field (`engine.rs:510` `MergeError` naming column, `unknown field "LateColumn" not in frozen schema... pass schema=[...]`) - fixture with `LateColumn` only in last 1% verifies loud failure vs silent drop. Column order is `schema` order if explicit, else discovery file order. Provide `schema=` to avoid 5.3 ms; reuse via `crxml.discover_schema("sample.xml")` `src/crxml/source.py:426` / `_core.discover_schema` `src/crxml_core/src/lib.rs:979` (see below). 1 MB chunks `par` collapses (3553) while streaming does not (3812, +7%) due to `chunk_buf` reuse.
 
 ## The ceiling
 
@@ -396,19 +396,19 @@ At 0.7 GB/s single / 4.2 GB/s parallel on a ~30 GB/s memory bus, this parser is 
 
 | Config | Artifact | 100 MB | 533 MB real | 1 GB | Chunk |
 |---|---|---|---|---|---|
-| single | Table | 756 | 745 | 734 | — |
+| single | Table | 756 | 745 | 734 | - |
 | par16 | Table | 3,792* | 3901 | 3418* | 33 MB / 64 MB† |
-| **par128** | Table | — | **4470** | **4278** | 4.16 MB |
+| **par128** | Table | - | **4470** | **4278** | 4.16 MB |
 | par96 | Table | 2,265* | 4123* | 4094* | 5.5 MB |
-| streaming single (1 MB) | Table/iter | — | 723 | — | 1 MB budget |
+| streaming single (1 MB) | Table/iter | - | 723 | - | 1 MB budget |
 | streaming parallel 64MB/16t auto (2 MB) | Table | 4126* | **4497** | 3782* | 2.00 MB |
-| streaming parallel 64MB/16t auto | Vec\<Batch\> | — | 4485 | 3863* | 2.00 MB |
-| streaming parallel 64MB/16t **explicit** | Vec\<Batch\> | — | **4980** | ~4900 | 2.00 MB |
+| streaming parallel 64MB/16t auto | Vec\<Batch\> | - | 4485 | 3863* | 2.00 MB |
+| streaming parallel 64MB/16t **explicit** | Vec\<Batch\> | - | **4980** | ~4900 | 2.00 MB |
 | streaming 128MB/16t auto (4 MB) | Table | 3864 | 4235 | 3606* | 4.00 MB |
 
-\* 100 MB/1 GB par16 variance thermal; use par128 for ceilings. † 533 MB 33 MB, 1 GB 64 MB. Streaming auto was −14% (3828) with serial 19 ms Discovery; parallel 16× (5.3 ms `discovery_ns` `src/crxml_core/src/lib.rs:482`) makes auto **+0.6% vs par128** (4497 vs 4470, within CoV) — unblocks `auto`. Explicit is +11% vs par128 and defines the ceiling.
+\* 100 MB/1 GB par16 variance thermal; use par128 for ceilings. † 533 MB 33 MB, 1 GB 64 MB. Streaming auto was −14% (3828) with serial 19 ms Discovery; parallel 16× (5.3 ms `discovery_ns` `src/crxml_core/src/lib.rs:482`) makes auto **+0.6% vs par128** (4497 vs 4470, within CoV) - unblocks `auto`. Explicit is +11% vs par128 and defines the ceiling.
 
-4 GB/s milestone cleared (par128 4470, explicit streaming 4980). The accurate six-tier framing: traverse (41%, 2.0 cyc/byte, 59% memchr) + per-field push (47%, 2.3 cyc/byte, 26% memchr) dominate; scan (5%), locate (≤1%), finish_row (2%), Arrow export (4%) are minor. **36.5% of total parse is memchr on short haystacks** — the structural indexing project targets both tiers and is the only remaining lever (BlockMasks). `FieldId` perfect hash is permanently off the roadmap; resolution cost is ≤3% of parse.
+4 GB/s milestone cleared (par128 4470, explicit streaming 4980). The accurate six-tier framing: traverse (41%, 2.0 cyc/byte, 59% memchr) + per-field push (47%, 2.3 cyc/byte, 26% memchr) dominate; scan (5%), locate (≤1%), finish_row (2%), Arrow export (4%) are minor. **36.5% of total parse is memchr on short haystacks** - the structural indexing project targets both tiers and is the only remaining lever (BlockMasks). `FieldId` perfect hash is permanently off the roadmap; resolution cost is ≤3% of parse.
 
 *Median of 7 runs (adaptive: keep sampling until 1.31×CoV ≤5% capped at 31, halving floor costs 4× rounds). Observed CoV across configurations: median 5%, max 26% (10 MB par8)†. Per-cell floor = 1.31×CoV (95% for two medians, n=7): 2.5% CoV →3.3% floor, 5%→6.6%, 26%→34%†. Cells with CoV>8% marked † (untrustworthy for tuning). Deltas below the cell's own floor are reported as no measurable difference.*
 > **†** 10 MB parallel is too small (2.8k rows/chunk, 20 ms); `rayon` work-stealing variance + frequency/thermal drift + CCX scheduling dominate. Fix: 20 repeats inside one timed region per `median_of` call, `taskset -c 0-15` (pin all 16 logical CPUs without restricting) + thermal settle, or drop 10 MB from parallel tables (a number you cannot act on should not be in a tuning guide).
