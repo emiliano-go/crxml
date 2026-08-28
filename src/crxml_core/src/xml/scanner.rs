@@ -51,10 +51,10 @@ enum Flow {
 }
 
 /// Scan a chunk of CR XML bytes, emitting rows into `sink`.
-pub(crate) fn scan_chunk(
+pub(crate) fn scan_chunk<S: ColumnarSink + ?Sized>(
     bytes: &[u8],
     row_tag: &[u8],
-    sink: &mut dyn ColumnarSink,
+    sink: &mut S,
 ) -> Result<(), rypipe_core::Error> {
     let (regions, _) = find_special_regions(bytes);
     let mut pos = 0usize;
@@ -73,12 +73,12 @@ pub(crate) fn scan_chunk(
 /// Scan a single row starting at or after `pos`, emitting via `sink`.
 /// Returns `Some(next_pos)` on success (next search offset), `None` on EOF.
 /// Handles `Recover` by advancing one byte and retrying.
-pub(crate) fn scan_one_row(
+pub(crate) fn scan_one_row<S: ColumnarSink + ?Sized>(
     bytes: &[u8],
     mut pos: usize,
     row_tag: &[u8],
     regions: &[Range<usize>],
-    sink: &mut dyn ColumnarSink,
+    sink: &mut S,
 ) -> Option<usize> {
     loop {
         let start = next_row_start(bytes, pos, row_tag, regions)?;
@@ -91,12 +91,12 @@ pub(crate) fn scan_one_row(
 }
 
 /// Parse one row starting at the `<` of its open tag.
-fn parse_row(
+fn parse_row<S: ColumnarSink + ?Sized>(
     bytes: &[u8],
     lt: usize,
     row_tag: &[u8],
     regions: &[Range<usize>],
-    sink: &mut dyn ColumnarSink,
+    sink: &mut S,
 ) -> Flow {
     let open = match scan_open_tag(bytes, lt) {
         Some(o) => o,
@@ -138,12 +138,12 @@ enum ChildFlow {
     Recover,
 }
 
-fn scan_child(
+fn scan_child<S: ColumnarSink + ?Sized>(
     bytes: &[u8],
     cur: usize,
     row_tag: &[u8],
     regions: &[Range<usize>],
-    sink: &mut dyn ColumnarSink,
+    sink: &mut S,
 ) -> ChildFlow {
     let l = match next_lt(bytes, cur) {
         Some(p) => p,
@@ -181,9 +181,7 @@ fn scan_child(
         b"Section" => lift(section_element(bytes, &child, sink)),
         other => {
             let name = utf8_unchecked(other);
-            if sink.wants(name) {
-                sink.put_field(name, Value::Str(""));
-            }
+            sink.resolve_and_put(name, Value::Str(""));
             ChildFlow::Continue(child.after())
         }
     }
@@ -200,16 +198,13 @@ fn lift(flow: Flow) -> ChildFlow {
 /// Emit every attribute of an open tag as a field (used for the row tag).
 ///
 /// Returns true when a malformed attribute was found (row must be abandoned).
-fn emit_all_attrs(bytes: &[u8], open: &OpenTag<'_>, sink: &mut dyn ColumnarSink) -> bool {
+fn emit_all_attrs<S: ColumnarSink + ?Sized>(bytes: &[u8], open: &OpenTag<'_>, sink: &mut S) -> bool {
     for attr in AttrIter::new(open.interior(bytes)) {
         match attr {
             Ok((key_raw, val_raw)) => {
                 let key = decode_attr(key_raw);
-                if !sink.wants(&key) {
-                    continue;
-                }
                 let val = decode_attr(val_raw);
-                sink.put_field(&key, Value::Str(&val));
+                sink.resolve_and_put(&key, Value::Str(&val));
             }
             Err(()) => return true,
         }
@@ -219,11 +214,11 @@ fn emit_all_attrs(bytes: &[u8], open: &OpenTag<'_>, sink: &mut dyn ColumnarSink)
 
 /// Handle one `<Field ...>` element: skip entirely when the plan drops the
 /// resolved column, otherwise capture FormattedValue/Value text (last wins).
-fn field_element<'a>(
+fn field_element<'a, S: ColumnarSink + ?Sized>(
     bytes: &'a [u8],
     open: &OpenTag<'_>,
     regions: &[Range<usize>],
-    sink: &mut dyn ColumnarSink,
+    sink: &mut S,
 ) -> Flow {
     let interior = open.interior(bytes);
     let key_raw = match find_attr_value(interior, &[b"FieldName", b"Name"]) {
@@ -233,7 +228,30 @@ fn field_element<'a>(
     };
     let key = decode_attr(key_raw);
 
-    if !sink.wants(&key) {
+    // Fast paths for locate-only and traversal-only tiers.
+    if !sink.needs_value() {
+        if !sink.needs_resolve() {
+            // Traverse-only: find field extents, no sink calls at all.
+            return match find_close_after(bytes, open.after(), &CLOSE_FIELD, PAT_FIELD, regions) {
+                Some(after) => Flow::At(after),
+                None => Flow::Truncated,
+            };
+        }
+        // Locate-only: resolve field name, skip text extraction.
+        // wants() + resolve() are called; put_field is NOT.
+        if sink.wants(&key) {
+            let _resolved = sink.resolve(&key);
+        }
+        return match find_close_after(bytes, open.after(), &CLOSE_FIELD, PAT_FIELD, regions) {
+            Some(after) => Flow::At(after),
+            None => Flow::Truncated,
+        };
+    }
+
+    // Check if field is dropped via resolve (single hash probe).
+    // If kept, extract text and push via resolve_and_put (no second probe, no allocation).
+    let kept = sink.resolve(&key).is_some();
+    if !kept {
         return match find_close_after(bytes, open.after(), &CLOSE_FIELD, PAT_FIELD, regions) {
             Some(after) => Flow::At(after),
             None => Flow::Truncated,
@@ -260,7 +278,7 @@ fn field_element<'a>(
                 None => return Flow::Truncated,
             };
             if name == b"Field" {
-                sink.put_field(&key, Value::Str(text.as_ref()));
+                sink.resolve_and_put(&key, Value::Str(text.as_ref()));
                 return Flow::At(after);
             }
             cur = after;
@@ -297,11 +315,11 @@ fn field_element<'a>(
 }
 
 /// Handle one `<Text Name="...">` element with a `<TextValue>` child.
-fn text_element<'a>(
+fn text_element<'a, S: ColumnarSink + ?Sized>(
     bytes: &'a [u8],
     open: &OpenTag<'_>,
     regions: &[Range<usize>],
-    sink: &mut dyn ColumnarSink,
+    sink: &mut S,
 ) -> Flow {
     let interior = open.interior(bytes);
     let key_raw = match find_attr_value(interior, &[b"Name"]) {
@@ -311,7 +329,28 @@ fn text_element<'a>(
     };
     let key = decode_attr(key_raw);
 
-    if !sink.wants(&key) {
+    // Fast paths for locate-only and traversal-only tiers.
+    if !sink.needs_value() {
+        if !sink.needs_resolve() {
+            // Traverse-only: find field extents, no sink calls at all.
+            return match find_close_after(bytes, open.after(), &CLOSE_TEXT, PAT_TEXT, regions) {
+                Some(after) => Flow::At(after),
+                None => Flow::Truncated,
+            };
+        }
+        // Locate-only: resolve field name, skip text extraction.
+        if sink.wants(&key) {
+            let _resolved = sink.resolve(&key);
+        }
+        return match find_close_after(bytes, open.after(), &CLOSE_TEXT, PAT_TEXT, regions) {
+            Some(after) => Flow::At(after),
+            None => Flow::Truncated,
+        };
+    }
+
+    // Check if field is dropped via resolve (single hash probe).
+    let kept = sink.resolve(&key).is_some();
+    if !kept {
         return match find_close_after(bytes, open.after(), &CLOSE_TEXT, PAT_TEXT, regions) {
             Some(after) => Flow::At(after),
             None => Flow::Truncated,
@@ -338,7 +377,7 @@ fn text_element<'a>(
                 None => return Flow::Truncated,
             };
             if name == b"Text" {
-                sink.put_field(&key, Value::Str(text.as_ref()));
+                sink.resolve_and_put(&key, Value::Str(text.as_ref()));
                 return Flow::At(after);
             }
             cur = after;
@@ -370,17 +409,14 @@ fn text_element<'a>(
 }
 
 /// Emit the `Section` field from a `<Section SectionNumber="..">` element.
-fn section_element(bytes: &[u8], open: &OpenTag<'_>, sink: &mut dyn ColumnarSink) -> Flow {
-    if !sink.wants("Section") {
-        return Flow::At(open.after());
-    }
+fn section_element<S: ColumnarSink + ?Sized>(bytes: &[u8], open: &OpenTag<'_>, sink: &mut S) -> Flow {
     let interior = open.interior(bytes);
     let sn = match find_attr_value(interior, &[b"SectionNumber"]) {
         Ok(Some(v)) => decode_attr(v),
         Ok(None) => Cow::Borrowed(""),
         Err(()) => return Flow::Recover,
     };
-    sink.put_field("Section", Value::Str(sn.as_ref()));
+    sink.resolve_and_put("Section", Value::Str(sn.as_ref()));
     Flow::At(open.after())
 }
 
@@ -417,7 +453,7 @@ impl OpenTag<'_> {
 }
 
 /// Offset of the next `<` at or after `from`.
-#[inline]
+#[inline(always)]
 fn next_lt(bytes: &[u8], from: usize) -> Option<usize> {
     memchr(b'<', &bytes[from..]).map(|rel| from + rel)
 }
@@ -446,6 +482,7 @@ fn region_end(regions: &[Range<usize>], at: usize) -> usize {
 /// Scan an open tag starting at `<`. Quote-aware so `>` inside attribute
 /// values does not terminate the tag early. Returns `None` when EOF is hit
 /// before the closing `>` (truncated input).
+#[inline(always)]
 fn scan_open_tag(bytes: &[u8], lt: usize) -> Option<OpenTag<'_>> {
     let mut i = lt + 1;
     let name_start = i;
@@ -479,6 +516,7 @@ fn scan_open_tag(bytes: &[u8], lt: usize) -> Option<OpenTag<'_>> {
 }
 
 /// Parse a close tag starting at `</`. Returns `(name, offset_after_gt)`.
+#[inline(always)]
 fn scan_close_tag(bytes: &[u8], lt: usize) -> Option<(&[u8], usize)> {
     let start = lt + 2;
     let gt_rel = memchr(b'>', &bytes[start..])?;
@@ -573,6 +611,7 @@ fn is_ws(b: u8) -> bool {
 /// First attribute whose key matches any of `keys`, in document order.
 ///
 /// Returns `Err(())` when a malformed attribute precedes a match.
+#[inline(always)]
 fn find_attr_value<'a>(interior: &'a [u8], keys: &[&[u8]]) -> Result<Option<&'a [u8]>, ()> {
     for attr in AttrIter::new(interior) {
         let (key, val) = attr?;
@@ -1086,97 +1125,569 @@ mod perf {
 
     #[test]
     fn perf_scanner_ceiling() {
-        let xml = synth_xml(80_000); // ~90 MB
+        let xml = synth_xml(80_000); // ~90 MB, ~80k rows × 5 fields = ~400k fields
         let mb = xml.len() as f64 / 1024.0 / 1024.0;
-        let mut sink = NoopSink;
+        let fields_total: usize = 80_000 * 5; // 5 fields per row (3 Field + 1 Text + 1 Level attr)
+        let bytes_per_field = xml.len() as f64 / fields_total as f64;
 
-        // Warmup
-        scan_chunk(&xml, b"Details", &mut sink).unwrap();
-
-        let rounds = 3;
-        let mut best = f64::MAX;
-        for _ in 0..rounds {
-            let t0 = Instant::now();
-            scan_chunk(&xml, b"Details", &mut sink).unwrap();
-            best = best.min(t0.elapsed().as_secs_f64());
-        }
-        println!(
-            "\nscanner ceiling (NoopSink): {:.4}s  {:.0} MB/s  ({:.1} MB)",
-            best,
-            mb / best,
-            mb
-        );
-
-        // Scan + reject (row_tag mismatch) — measures pure scan without field work.
-        let mut sink2 = NoopSink;
-        let t0 = Instant::now();
-        scan_chunk(&xml, b"Row", &mut sink2).unwrap(); // Row does not exist, all rejected
-        println!(
-            "scan + reject (row_tag mismatch): {:.4}s  {:.0} MB/s",
-            t0.elapsed().as_secs_f64(),
-            mb / t0.elapsed().as_secs_f64()
-        );
-
-        // Scan + locate fields, no extract — begin_row/end_row only, no put_field.
-        struct LocateOnly;
-        impl ColumnarSink for LocateOnly {
-            fn begin_row(&mut self) {}
-            fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
-            fn end_row(&mut self) {}
-            fn wants(&self, _name: &str) -> bool { true }
+        // Warmup ALL tiers before timing to avoid cold-start ordering effects.
+        let mut ws1 = NoopSink;
+        scan_chunk(&xml, b"Details", &mut ws1).unwrap();
+        // Warm scan_only (memmem)
+        let _ = memchr::memmem::find(&xml, b"<Details");
+        // Warm locate tier
+        struct WarmLocate;
+        impl ColumnarSink for WarmLocate {
+            #[inline] fn begin_row(&mut self) {}
+            #[inline] fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
+            #[inline] fn end_row(&mut self) {}
+            #[inline] fn wants(&self, _name: &str) -> bool { true }
+            #[inline] fn needs_value(&self) -> bool { false }
             fn finish(&mut self) -> RResult<RecordBatch> {
                 Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
             }
         }
-        let mut loc = LocateOnly;
-        let t0 = Instant::now();
-        // Use a scanner that only locates fields (no Value extraction) — for now, same as Noop but with row machinery
-        scan_chunk(&xml, b"Details", &mut loc).unwrap();
-        println!(
-            "scan + locate fields, no extract: {:.4}s  {:.0} MB/s",
-            t0.elapsed().as_secs_f64(),
-            mb / t0.elapsed().as_secs_f64()
-        );
+        let mut ww = WarmLocate;
+        scan_chunk(&xml, b"Details", &mut ww).unwrap();
+        // Warm full tier
+        let mut wf = rypipe_core::TableBuilder::with_capacity(90_000);
+        scan_chunk(&xml, b"Details", &mut wf).unwrap();
+        let _ = wf.finish();
 
-        // With TableBuilder sink for comparison.
+        println!("\n=== Four-tier scanner decomposition ({:.1} MB, {} fields, {:.0} bytes/field) ===", mb, fields_total, bytes_per_field);
+
+        // --- Tier 1: scan_only ---
+        // Pure memmem find of row open tags. No XML parsing, no field walking.
+        // This is the absolute minimum: how fast can we find row boundaries?
+        let t0 = Instant::now();
+        let mut count = 0;
+        let mut pos = 0;
+        while let Some(rel) = memchr::memmem::find(&xml[pos..], b"<Details") {
+            count += 1;
+            pos += rel + 8; // len("<Details")
+        }
+        let t_scan = t0.elapsed().as_secs_f64();
+        let scan_mbs = mb / t_scan;
+        println!("scan_only          {t_scan:8.4}s  {scan_mbs:8.0} MB/s  (memmem <Details> only, {count} rows found)");
+
+        // --- Tier 2: traverse ---
+        // Walk fields, find extents, no resolve, no put_field.
+        // needs_value()=false + needs_resolve()=false: scanner finds Field/Text elements,
+        // reads Name attribute (for traversal cost), but skips wants/resolve/put_field.
+        struct TraverseOnly;
+        impl ColumnarSink for TraverseOnly {
+            #[inline] fn begin_row(&mut self) {}
+            #[inline] fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
+            #[inline] fn end_row(&mut self) {}
+            #[inline] fn wants(&self, _name: &str) -> bool { true }
+            #[inline] fn needs_value(&self) -> bool { false }
+            #[inline] fn needs_resolve(&self) -> bool { false }
+            fn finish(&mut self) -> RResult<RecordBatch> {
+                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+            }
+        }
+        let mut trav = TraverseOnly;
+        let t0 = Instant::now();
+        scan_chunk(&xml, b"Details", &mut trav).unwrap();
+        let t_trav = t0.elapsed().as_secs_f64();
+        let trav_mbs = mb / t_trav;
+        println!("traverse           {t_trav:8.4}s  {trav_mbs:8.0} MB/s  (no resolve, no put_field)");
+
+        // --- Tier 3: locate ---
+        // wants() + resolve(), no put_field, no text extraction.
+        // needs_value()=false + needs_resolve()=true: scanner calls wants() + resolve()
+        // but does NOT call put_field. Uses the SAME resolve path as TableBuilder
+        // (via ExecutionPlan) so the cost is comparable.
+        struct LocateOnly {
+            plan: rypipe_core::ExecutionPlan,
+        }
+        impl ColumnarSink for LocateOnly {
+            #[inline] fn begin_row(&mut self) {}
+            #[inline] fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
+            #[inline] fn end_row(&mut self) {}
+            #[inline] fn wants(&self, _name: &str) -> bool { true }
+            #[inline] fn needs_value(&self) -> bool { false }
+            #[inline] fn resolve<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+                self.plan.resolve_field(name)
+            }
+            fn finish(&mut self) -> RResult<RecordBatch> {
+                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+            }
+        }
+        let mut loc = LocateOnly { plan: rypipe_core::ExecutionPlan::new() };
+        let t0 = Instant::now();
+        scan_chunk(&xml, b"Details", &mut loc).unwrap();
+        let t_loc = t0.elapsed().as_secs_f64();
+        let loc_mbs = mb / t_loc;
+        println!("locate             {t_loc:8.4}s  {loc_mbs:8.0} MB/s  (wants+resolve, no put_field)");
+
+        // --- Tier 4: full ---
+        // Everything: scan + locate + extract + sink.
         let mut tb = rypipe_core::TableBuilder::with_capacity(90_000);
         let t0 = Instant::now();
         scan_chunk(&xml, b"Details", &mut tb).unwrap();
         let batch = tb.finish().unwrap();
-        println!(
-            "scanner + TableBuilder:     {:.4}s  {:.0} MB/s  ({} cols)",
-            t0.elapsed().as_secs_f64(),
-            mb / t0.elapsed().as_secs_f64(),
-            batch.num_columns()
-        );
+        let t_full = t0.elapsed().as_secs_f64();
+        let full_mbs = mb / t_full;
+        let rows = batch.num_rows();
+        println!("full_parse         {t_full:8.4}s  {full_mbs:8.0} MB/s  ({} rows, {} cols)", rows, batch.num_columns());
 
-        // Everything dropped: measures row machinery + skip-bytes path
-        // (open tags, attr parse, wants(), memmem jump to close tag).
-        struct DropAll;
-        impl ColumnarSink for DropAll {
-            fn begin_row(&mut self) {}
-            fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
-            fn end_row(&mut self) {}
-            fn wants(&self, _name: &str) -> bool {
-                false
+        // --- Cross-tier assertions ---
+        assert!(rows > 0, "full_parse produced zero rows");
+        assert!(batch.num_columns() > 0, "full_parse produced zero columns");
+        assert_eq!(count, rows, "scan_only found {count} rows but full_parse found {rows} — tiers are inconsistent");
+
+        // --- ms/MB decomposition (additive, not ratios) ---
+        println!("\nms/MB decomposition (additive, each rung adds exactly one cost layer):");
+        println!("  scan_only:    {:.2} ms/MB", t_scan / mb * 1000.0);
+        println!("  traverse:     {:.2} ms/MB  (+{:.2} = XML tree walk + field extent scan)", t_trav / mb * 1000.0, (t_trav - t_scan) / mb * 1000.0);
+        println!("  locate:       {:.2} ms/MB  (+{:.2} = field-name resolution)", t_loc / mb * 1000.0, (t_loc - t_trav) / mb * 1000.0);
+        println!("  full_parse:   {:.2} ms/MB  (+{:.2} = value extraction + Arrow sink)", t_full / mb * 1000.0, (t_full - t_loc) / mb * 1000.0);
+        println!("  total:        {:.2} ms/MB", t_full / mb * 1000.0);
+    }
+
+    /// Run four-tier decomposition on a real file using mmap (same path as
+    /// production `read_to_columnar`). Five-tier decomposition with
+    /// median-of-7 and CoV reporting.
+    ///
+    /// Set BENCH_FILE env var to the XML file path, e.g.:
+    /// ```
+    /// BENCH_FILE=bench_data/test_10mb.xml cargo test --release perf_scanner_file -- --nocapture
+    /// ```
+    #[test]
+    fn perf_scanner_file() {
+        let path = match std::env::var("BENCH_FILE") {
+            Ok(p) => p,
+            Err(_) => {
+                let candidate = "bench_data/test_10mb.xml";
+                if std::path::Path::new(candidate).exists() {
+                    candidate.to_string()
+                } else {
+                    eprintln!("perf_scanner_file: BENCH_FILE not set and {candidate} not found, skipping");
+                    return;
+                }
             }
+        };
+        let bytes = std::fs::read(&path).expect("failed to read BENCH_FILE");
+        let mb = bytes.len() as f64 / 1024.0 / 1024.0;
+        let n = 7usize; // median-of-7
+
+        // Warmup all tiers
+        {
+            let mut wf = rypipe_core::TableBuilder::with_capacity(100_000);
+            scan_chunk(&bytes, b"Details", &mut wf).unwrap();
+            let _ = wf.finish();
+        }
+        {
+            let mut wt = TravFile;
+            scan_chunk(&bytes, b"Details", &mut wt).unwrap();
+        }
+        {
+            let mut wl = LocateFile { plan: rypipe_core::ExecutionPlan::new() };
+            scan_chunk(&bytes, b"Details", &mut wl).unwrap();
+        }
+
+        println!("\n=== Six-tier scanner decomposition ({:.1} MB, {} runs, path: {}) ===", mb, n, path);
+
+        // Helper: run a closure n times, return (median, CoV)
+        fn bench(n: usize, mut f: impl FnMut()) -> (f64, f64) {
+            let mut ts: Vec<f64> = (0..n).map(|_| {
+                let t0 = Instant::now();
+                f();
+                t0.elapsed().as_secs_f64()
+            }).collect();
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = ts[n / 2];
+            let mean = ts.iter().sum::<f64>() / n as f64;
+            let var = ts.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n as f64;
+            let cov = var.sqrt() / mean;
+            (med, cov)
+        }
+
+        // --- Tier 1: scan_only ---
+        let (t_scan, cov_scan) = bench(n, || {
+            let mut _pos = 0usize;
+            let mut _count = 0usize;
+            while let Some(rel) = memchr::memmem::find(&bytes[_pos..], b"<Details") {
+                _count += 1;
+                _pos += rel + 8;
+            }
+        });
+        // Count rows once (stable)
+        let mut count = 0usize;
+        let mut pos = 0;
+        while let Some(rel) = memchr::memmem::find(&bytes[pos..], b"<Details") {
+            count += 1;
+            pos += rel + 8;
+        }
+
+        // --- Tier 2: traverse ---
+        let (t_trav, cov_trav) = bench(n, || {
+            let mut trav = TravFile;
+            scan_chunk(&bytes, b"Details", &mut trav).unwrap();
+        });
+
+        // --- Tier 3: locate ---
+        let (t_loc, cov_loc) = bench(n, || {
+            let mut loc = LocateFile { plan: rypipe_core::ExecutionPlan::new() };
+            scan_chunk(&bytes, b"Details", &mut loc).unwrap();
+        });
+
+        // --- Tier 4: push_only (scan + per-field push, no finish_row) ---
+        // end_row calls advance_row() only — skips null-fill, dirty-mask clear,
+        // and filter check.  This isolates per-field push cost from per-row
+        // finalization cost.
+        struct PushOnly {
+            inner: rypipe_core::TableBuilder,
+        }
+        impl ColumnarSink for PushOnly {
+            #[inline] fn begin_row(&mut self) {}
+            #[inline] fn put_field(&mut self, name: &str, value: Value<'_>) {
+                self.inner.put_field(name, value);
+            }
+            #[inline] fn end_row(&mut self) {
+                // Only advance row counter — skip null-fill, dirty mask, filter
+                self.inner.advance_row();
+            }
+            #[inline] fn wants(&self, name: &str) -> bool { self.inner.wants(name) }
+            #[inline] fn resolve<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+                self.inner.resolve(name)
+            }
+            #[inline] fn put_field_resolved(&mut self, name: &str, value: Value<'_>) {
+                self.inner.put_field_resolved(name, value);
+            }
+            #[inline] fn resolve_and_put(&mut self, name: &str, value: Value<'_>) {
+                self.inner.resolve_and_put(name, value);
+            }
+            #[inline] fn needs_value(&self) -> bool { true }
             fn finish(&mut self) -> RResult<RecordBatch> {
-                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+                self.inner.finish()
             }
         }
-        let mut ds = DropAll;
-        let t0 = Instant::now();
-        scan_chunk(&xml, b"Details", &mut ds).unwrap();
-        println!(
-            "scanner, all fields dropped:{:.4}s  {:.0} MB/s",
-            t0.elapsed().as_secs_f64(),
-            mb / t0.elapsed().as_secs_f64()
-        );
+        let (t_push, cov_push) = bench(n, || {
+            let mut pb = PushOnly { inner: rypipe_core::TableBuilder::with_capacity(100_000) };
+            scan_chunk(&bytes, b"Details", &mut pb).unwrap();
+        });
 
-        // Phase ladder summary
-        println!("\nPhase ladder (synthetic 90 MB, 533 MB real is ~2.5x slower due to high-cardinality arena):");
-        println!("  scan + reject (mismatch) ~7738 MB/s (from bench_extended edge row_tag=Row)");
-        println!("  + TableBuilder 514 MB/s shows per-field extract+sink is 10x bottleneck, not memchr (8% profile)");
+        // --- Tier 5: build_only (scan + sink, no Arrow export) ---
+        let (t_build, cov_build) = bench(n, || {
+            let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
+            scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+            // Do NOT call tb.finish() — this isolates scan+push from Arrow export.
+        });
+
+        // --- Tier 6: full_parse (scan + sink + Arrow export) ---
+        let mut last_rows = 0usize;
+        let mut last_cols = 0usize;
+        let (t_full, cov_full) = bench(n, || {
+            let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
+            scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+            let batch = tb.finish().unwrap();
+            last_rows = batch.num_rows();
+            last_cols = batch.num_columns();
+        });
+
+        // --- Cross-tier assertions ---
+        assert!(last_rows > 0, "full_parse produced zero rows");
+        assert!(last_cols > 0, "full_parse produced zero columns");
+        assert_eq!(count, last_rows, "scan_only {count} != full_parse {last_rows}");
+
+        // --- Noise floor: 1.31 × CoV ---
+        fn floor(cov: f64) -> f64 { 1.31 * cov * 100.0 }
+
+        // --- Print results ---
+        println!("\n{:14} {:>8} {:>8} {:>7} {:>7} {:>8}", "Tier", "Time(s)", "MB/s", "ms/MB", "CoV%", "Floor%");
+        println!("{:-<62}", "");
+        let mut prev = 0.0f64;
+        macro_rules! row {
+            ($name:expr, $t:expr, $cov:expr) => {{
+                let ms_mb = $t / mb * 1000.0;
+                let delta = ms_mb - prev;
+                let cov_pct = $cov * 100.0;
+                let fl = floor($cov);
+                if prev > 0.0 {
+                    println!("{:14} {:8.4} {:8.0} {:6.2}+{:5.2} {:6.1}% {:6.1}%", $name, $t, mb/$t, ms_mb, delta, cov_pct, fl);
+                } else {
+                    println!("{:14} {:8.4} {:8.0} {:7.2}    {:6.1}% {:6.1}%", $name, $t, mb/$t, ms_mb, cov_pct, fl);
+                }
+                prev = ms_mb;
+            }};
+        }
+        row!("scan_only", t_scan, cov_scan);
+        row!("traverse", t_trav, cov_trav);
+        row!("locate", t_loc, cov_loc);
+        row!("push_only", t_push, cov_push);
+        row!("build_only", t_build, cov_build);
+        row!("full_parse", t_full, cov_full);
+
+        println!("\nms/MB decomposition (deltas from consecutive tiers):");
+        println!("  scan_only:    {:.3} ± {:.1}% ms/MB", t_scan / mb * 1000.0, cov_scan * 100.0);
+        println!("  traverse:     {:.3} ± {:.1}% ms/MB  (+{:.3})", t_trav / mb * 1000.0, cov_trav * 100.0, (t_trav - t_scan) / mb * 1000.0);
+        println!("  locate:       {:.3} ± {:.1}% ms/MB  (+{:.3})", t_loc / mb * 1000.0, cov_loc * 100.0, (t_loc - t_trav) / mb * 1000.0);
+        println!("  push_only:    {:.3} ± {:.1}% ms/MB  (+{:.3})", t_push / mb * 1000.0, cov_push * 100.0, (t_push - t_loc) / mb * 1000.0);
+        println!("  build_only:   {:.3} ± {:.1}% ms/MB  (+{:.3})", t_build / mb * 1000.0, cov_build * 100.0, (t_build - t_push) / mb * 1000.0);
+        println!("  full_parse:   {:.3} ± {:.1}% ms/MB  (+{:.3})", t_full / mb * 1000.0, cov_full * 100.0, (t_full - t_build) / mb * 1000.0);
+        println!("  total:        {:.3} ms/MB", t_full / mb * 1000.0);
+        println!("  rows={} cols={}", last_rows, last_cols);
+    }
+
+    /// Diagnostic: print per-column memory stats after a push_only run.
+    /// Answers: is StrColumn realloc the source of the 250 unaccounted cycles/field?
+    #[test]
+    fn perf_push_diagnostics() {
+        let path = match std::env::var("BENCH_FILE") {
+            Ok(p) => p,
+            Err(_) => {
+                let candidate = "bench_data/test_1gb.xml";
+                if std::path::Path::new(candidate).exists() {
+                    candidate.to_string()
+                } else {
+                    eprintln!("perf_push_diagnostics: BENCH_FILE not set and {candidate} not found, skipping");
+                    return;
+                }
+            }
+        };
+        let bytes = std::fs::read(&path).expect("failed to read BENCH_FILE");
+        let mb = bytes.len() as f64 / 1024.0 / 1024.0;
+
+        // Run a single push_only pass and inspect the TableBuilder
+        struct PushDiag {
+            inner: rypipe_core::TableBuilder,
+        }
+        impl ColumnarSink for PushDiag {
+            #[inline] fn begin_row(&mut self) {}
+            #[inline] fn put_field(&mut self, name: &str, value: Value<'_>) {
+                self.inner.put_field(name, value);
+            }
+            #[inline] fn end_row(&mut self) {
+                self.inner.advance_row();
+            }
+            #[inline] fn wants(&self, name: &str) -> bool { self.inner.wants(name) }
+            #[inline] fn resolve<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+                self.inner.resolve(name)
+            }
+            #[inline] fn put_field_resolved(&mut self, name: &str, value: Value<'_>) {
+                self.inner.put_field_resolved(name, value);
+            }
+            #[inline] fn resolve_and_put(&mut self, name: &str, value: Value<'_>) {
+                self.inner.resolve_and_put(name, value);
+            }
+            #[inline] fn needs_value(&self) -> bool { true }
+            fn finish(&mut self) -> RResult<RecordBatch> {
+                self.inner.finish()
+            }
+        }
+
+        // Use the production estimate: count <Details in 64 KB sample, then derive row count
+        let sample_end = bytes.len().min(65536);
+        let prefix = b"<Details";
+        let row_count = memchr::memmem::find_iter(&bytes[..sample_end], prefix.as_slice()).count();
+        let bytes_per_row = if row_count > 0 { sample_end / row_count } else { 512 };
+        let est = (bytes.len() / bytes_per_row.max(1)).max(64);
+        println!("\n=== Push diagnostics ({:.1} MB, est_rows={est}, bytes_per_row={bytes_per_row}) ===", mb);
+        let mut sink = PushDiag {
+            inner: rypipe_core::TableBuilder::with_capacity(est.max(64)),
+        };
+        let t0 = Instant::now();
+        scan_chunk(&bytes, b"Details", &mut sink).unwrap();
+        let elapsed = t0.elapsed().as_secs_f64();
+        println!("push_only (cap={est}): {:.4}s  {:.0} MB/s", elapsed, mb / elapsed);
+
+        // Inspect columns
+        let diag = sink.inner.column_diagnostics();
+        let actual_rows = sink.inner.num_rows();
+        println!("\nactual_rows={actual_rows}, est_rows={est}");
+        println!("\n{:>20} {:>12} {:>12} {:>8} {:>8} {:>12}",
+            "column", "bytes_used", "bytes_cap", "util%", "rows", "b/row");
+        println!("{}", "-".repeat(80));
+        let mut total_used = 0usize;
+        let mut total_cap = 0usize;
+        for (name, used, cap) in diag.iter() {
+            let util = if *cap > 0 { *used as f64 / *cap as f64 * 100.0 } else { 0.0 };
+            let bpr = if actual_rows > 0 { *used / actual_rows } else { 0 };
+            println!("{name:>20} {used:>12} {cap:>12} {util:>7.1}% {actual_rows:>8} {bpr:>12}");
+            total_used += used;
+            total_cap += cap;
+        }
+        let total_util = if total_cap > 0 { total_used as f64 / total_cap as f64 * 100.0 } else { 0.0 };
+        println!("{:>20} {:>12} {:>12} {:>7.1}%", "TOTAL", total_used, total_cap, total_util);
+        println!("\noverhead: {:.1} MB allocated but unused", (total_cap - total_used) as f64 / 1048576.0);
+
+        // Estimate realloc count per column:
+        // StrColumn::with_capacity(n) allocates data = n*16 bytes.
+        // If actual > capacity, Vec doubles until it fits.
+        // Number of reallocs = ceil(log2(actual / capacity))
+        println!("\nEstimated reallocs per column (data only, cap * 16 heuristic):");
+        for (name, used, _cap) in diag.iter() {
+            let initial_data_cap = est * 16; // StrColumn::with_capacity(est).data capacity
+            let actual_data = *used; // approx: most bytes_used is data
+            if actual_data > initial_data_cap {
+                let ratio = actual_data as f64 / initial_data_cap as f64;
+                let reallocs = ratio.log2().ceil() as usize;
+                let total_copied: u64 = (0..reallocs).map(|i| (initial_data_cap as u64) << i).sum();
+                println!("  {name:>20}: cap={initial_data_cap:>10}, used={actual_data:>10}, ratio={ratio:.1}x, ~{reallocs} reallocs, ~{:.1} MB copied",
+                    total_copied as f64 / 1048576.0);
+            } else {
+                println!("  {name:>20}: cap={initial_data_cap:>10}, used={actual_data:>10}, no realloc needed");
+            }
+        }
+    }
+
+    /// Column scaling test: push_only with 1, 3, and 10 columns.
+    /// If per-field push cost scales with column count, interleaving is the cause.
+    /// If it stays flat, the 261 cycles/field is per-field work regardless of columns.
+    #[test]
+    fn perf_column_scaling() {
+        let path = match std::env::var("BENCH_FILE") {
+            Ok(p) => p,
+            Err(_) => {
+                let candidate = "bench_data/test_100mb.xml";
+                if std::path::Path::new(candidate).exists() {
+                    candidate.to_string()
+                } else {
+                    eprintln!("perf_column_scaling: BENCH_FILE not set and {candidate} not found, skipping");
+                    return;
+                }
+            }
+        };
+        let bytes = std::fs::read(&path).expect("failed to read BENCH_FILE");
+        let mb = bytes.len() as f64 / 1024.0 / 1024.0;
+        let n = 7usize;
+
+        // Helper: run a closure n times, return (median, CoV)
+        fn bench(n: usize, mut f: impl FnMut()) -> (f64, f64) {
+            let mut ts: Vec<f64> = (0..n).map(|_| {
+                let t0 = Instant::now();
+                f();
+                t0.elapsed().as_secs_f64()
+            }).collect();
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = ts[n / 2];
+            let mean = ts.iter().sum::<f64>() / n as f64;
+            let var = ts.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n as f64;
+            let cov = var.sqrt() / mean;
+            (med, cov)
+        }
+
+        // Known field names from Crystal exports
+        let all_fields = ["Level", "Section", "Field22", "Field23", "Field38",
+                          "Field39", "Field61", "Field73", "FieldG", "Text20"];
+
+        // Configurations: keep 1, 3, or 10 columns
+        let configs: Vec<(usize, Vec<&str>)> = vec![
+            (1, vec!["Level"]),
+            (3, vec!["Level", "Section", "Field22"]),
+            (10, all_fields.to_vec()),
+        ];
+
+        println!("\n=== Column scaling test ({:.1} MB, {} runs) ===", mb, n);
+        println!("{:>6} {:>8} {:>8} {:>8} {:>6}", "cols", "MB/s", "ms/MB", "cyc/f", "CoV%");
+        println!("{}", "-".repeat(42));
+
+        for (keep_count, keep_fields) in &configs {
+            // Build drop list: all fields NOT in keep_fields
+            let drop: Vec<String> = all_fields.iter()
+                .filter(|f| !keep_fields.contains(f))
+                .map(|f| f.to_string())
+                .collect();
+
+            let mut plan = rypipe_core::ExecutionPlan::new();
+            for d in &drop {
+                plan.drop_fields.insert(d.clone());
+            }
+
+            // Warmup
+            {
+                let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
+                let mut plan_w = plan.clone();
+                scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+            }
+
+            let (t_med, t_cov) = bench(n, || {
+                let mut tb = rypipe_core::TableBuilder::with_plan(100_000, plan.clone());
+                scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+            });
+
+            let ms_mb = t_med / mb * 1000.0;
+            // Get row/field count from a single run
+            let mut tb = rypipe_core::TableBuilder::with_plan(100_000, plan.clone());
+            scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+            let rows = tb.num_rows();
+            let cols = tb.num_columns();
+            let fields = rows * cols;
+            let cyc_f = t_med / 1000.0 * 3.8e9 / fields as f64;
+            let mb_s = mb / t_med;
+
+            println!("{:>6} {:>8.0} {:>8.2} {:>8.0} {:>5.1}%", cols, mb_s, ms_mb, cyc_f, t_cov * 100.0);
+        }
+    }
+
+    /// Verify that resolve_and_put fires on the production path.
+    #[test]
+    fn perf_resolve_and_put_counter() {
+        let path = match std::env::var("BENCH_FILE") {
+            Ok(p) => p,
+            Err(_) => {
+                let candidate = "bench_data/test_10mb.xml";
+                if std::path::Path::new(candidate).exists() {
+                    candidate.to_string()
+                } else {
+                    eprintln!("skipping: BENCH_FILE not set and {candidate} not found");
+                    return;
+                }
+            }
+        };
+        let bytes = std::fs::read(&path).expect("failed to read BENCH_FILE");
+        let mb = bytes.len() as f64 / 1024.0 / 1024.0;
+
+        // Reset counter
+        rypipe_core::RESOLVE_AND_PUT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Run full parse (production path)
+        let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
+        scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+        let _ = tb.finish().unwrap();
+
+        let count = rypipe_core::RESOLVE_AND_PUT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let rows = tb.num_rows();
+        let cols = tb.num_columns();
+        println!("\n=== resolve_and_put counter ===");
+        println!("file: {:.1} MB, {} rows, {} cols", mb, rows, cols);
+        println!("resolve_and_put calls: {count}");
+        println!("assertion: count > 0");
+
+        assert!(count > 0, "resolve_and_put was never called! Production may not be using the optimized path.");
+        println!("PASS: resolve_and_put fires on the scanner path");
+    }
+
+    struct TravFile;
+    impl ColumnarSink for TravFile {
+        #[inline] fn begin_row(&mut self) {}
+        #[inline] fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
+        #[inline] fn end_row(&mut self) {}
+        #[inline] fn wants(&self, _name: &str) -> bool { true }
+        #[inline] fn needs_value(&self) -> bool { false }
+        #[inline] fn needs_resolve(&self) -> bool { false }
+        fn finish(&mut self) -> RResult<RecordBatch> {
+            Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+        }
+    }
+
+    struct LocateFile {
+        plan: rypipe_core::ExecutionPlan,
+    }
+    impl ColumnarSink for LocateFile {
+        #[inline] fn begin_row(&mut self) {}
+        #[inline] fn put_field(&mut self, _n: &str, _v: Value<'_>) {}
+        #[inline] fn end_row(&mut self) {}
+        #[inline] fn wants(&self, _name: &str) -> bool { true }
+        #[inline] fn needs_value(&self) -> bool { false }
+        #[inline] fn resolve<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+            self.plan.resolve_field(name)
+        }
+        fn finish(&mut self) -> RResult<RecordBatch> {
+            Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+        }
     }
 }
 

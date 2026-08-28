@@ -37,6 +37,15 @@ impl RecordParser for CrystalXmlDecoder {
     fn parse_chunk(&self, bytes: &[u8], sink: &mut dyn ColumnarSink) -> rypipe_core::Result<()> {
         scanner::scan_chunk(bytes, &self.row_tag, sink)
     }
+
+    #[inline]
+    fn parse_chunk_generic<S: ColumnarSink>(
+        &self,
+        bytes: &[u8],
+        sink: &mut S,
+    ) -> rypipe_core::Result<()> {
+        scanner::scan_chunk(bytes, &self.row_tag, sink)
+    }
 }
 
 use rypipe_core::ColumnarSink;
@@ -50,7 +59,7 @@ mod tests {
     fn parse(xml: &[u8]) -> TableBuilder {
         let mut sink = TableBuilder::with_capacity(4);
         CrystalXmlDecoder::with_row_tag(b"Row")
-            .parse_chunk(xml, &mut sink)
+            .parse_chunk_generic(xml, &mut sink)
             .unwrap();
         sink
     }
@@ -138,7 +147,7 @@ mod tests {
         let mut sink = TableBuilder::with_plan(4, plan);
         let xml = br#"<Row><Field Name="Keep"><Value>1</Value></Field><Field Name="DropMe"><Value>x</Value></Field></Row>"#;
         CrystalXmlDecoder::with_row_tag(b"Row")
-            .parse_chunk(xml, &mut sink)
+            .parse_chunk_generic(xml, &mut sink)
             .unwrap();
         let batch = sink.finish().unwrap();
         assert!(batch.column_by_name("DropMe").is_none());

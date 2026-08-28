@@ -197,6 +197,7 @@ fn record_batch_to_table(batch: RecordBatch, py: Python<'_>) -> PyResult<PyObjec
 }
 
 fn concat_tables(a: PyObject, b: PyObject, py: Python<'_>) -> PyResult<PyObject> {
+    let _q20_start = std::time::Instant::now();
     let pa = PyModule::import(py, "pyarrow")?;
     let tables_list = PyList::new(py, vec![a, b])?;
 
@@ -205,19 +206,32 @@ fn concat_tables(a: PyObject, b: PyObject, py: Python<'_>) -> PyResult<PyObject>
     let b_schema = tables_list.get_item(1)?.getattr("schema")?;
     let schemas_match = a_schema.call_method1("__eq__", (b_schema,))?.is_truthy()?;
 
-    if schemas_match {
-        return Ok(pa.call_method1("concat_tables", (tables_list,))?.into());
+    let res = if schemas_match {
+        pa.call_method1("concat_tables", (tables_list,))?.into()
+    } else {
+        // Schemas differ (column order or auto_dict promotion): use promote.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("promote_options", "default")?;
+        pa.call_method("concat_tables", (tables_list,), Some(&kwargs))?
+            .into()
+    };
+    if std::env::var("CRXML_Q20").is_ok() {
+        eprintln!("[Q20] concat_tables: {:?}", _q20_start.elapsed());
     }
-
-    // Schemas differ (column order or auto_dict promotion): use promote.
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("promote_options", "default")?;
-    Ok(pa
-        .call_method("concat_tables", (tables_list,), Some(&kwargs))?
-        .into())
+    Ok(res)
 }
 
 fn record_batches_to_table(batches: Vec<RecordBatch>, py: Python<'_>) -> PyResult<PyObject> {
+    record_batches_to_table_inner(batches, py, false)
+}
+
+fn record_batches_to_table_inner(
+    batches: Vec<RecordBatch>,
+    py: Python<'_>,
+    combine: bool,
+) -> PyResult<PyObject> {
+    let _q20_combine_start = std::time::Instant::now();
+    let num_batches = batches.len();
     let table = if batches.is_empty() {
         let pa = PyModule::import(py, "pyarrow")?;
         pa.call_method1("table", (PyDict::new(py),))?.into()
@@ -232,9 +246,20 @@ fn record_batches_to_table(batches: Vec<RecordBatch>, py: Python<'_>) -> PyResul
         }
         result_table.unwrap()
     };
-    // Flatten chunked tables so that parallel/bounded outputs compare equal
-    // to single-batch tables produced by the single-chunk path.
-    Ok(table.call_method0(py, "combine_chunks")?.into())
+    let res = if combine {
+        table.call_method0(py, "combine_chunks")?.into()
+    } else {
+        table
+    };
+    if std::env::var("CRXML_Q20").is_ok() {
+        eprintln!(
+            "[Q20] combine_chunks: {:?} (total batches {} + concat loop, combine={})",
+            _q20_combine_start.elapsed(),
+            num_batches,
+            combine
+        );
+    }
+    Ok(res)
 }
 
 #[pyfunction]
@@ -279,7 +304,7 @@ pub fn read_to_columnar(
     let mut table_builder = rypipe_core::TableBuilder::with_plan(cap, plan.clone());
     decoder.validate(bytes).map_err(map_rypipe_err)?;
     decoder
-        .parse_chunk(bytes, &mut table_builder)
+        .parse_chunk_generic(bytes, &mut table_builder)
         .map_err(map_rypipe_err)?;
 
     if table_builder.num_columns() == 0 {
@@ -346,7 +371,7 @@ pub fn read_to_columnar_multi(
             XmlError::new_err(format!("Columnar parse error in chunk {:?}: {}", range, e))
         })?;
         decoder
-            .parse_chunk(&bytes[range.clone()], &mut sink)
+            .parse_chunk_generic(&bytes[range.clone()], &mut sink)
             .map_err(|e| {
                 XmlError::new_err(format!("Columnar parse error in chunk {:?}: {}", range, e))
             })?;
@@ -468,7 +493,7 @@ fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(row_tag);
     decoder.validate(bytes).map_err(map_rypipe_err)?;
     decoder
-        .parse_chunk(bytes, &mut sink)
+        .parse_chunk_generic(bytes, &mut sink)
         .map_err(map_rypipe_err)?;
     let batch = sink.finish().map_err(map_rypipe_err)?;
     Python::with_gil(|py| record_batch_to_table(batch, py))
@@ -566,9 +591,11 @@ struct RowSink<'a> {
 }
 
 impl<'a> rypipe_core::ColumnarSink for RowSink<'a> {
+    #[inline]
     fn begin_row(&mut self) {
         self.row.clear();
     }
+    #[inline]
     fn put_field(&mut self, name: &str, value: rypipe_core::Value<'_>) {
         // `scanner` only emits `Value::Str`; other variants are coerced via `to_string`.
         let v = match value {
@@ -580,6 +607,7 @@ impl<'a> rypipe_core::ColumnarSink for RowSink<'a> {
         };
         self.row.push((name.to_string(), v));
     }
+    #[inline]
     fn end_row(&mut self) {}
     fn finish(&mut self) -> rypipe_core::Result<RecordBatch> {
         Ok(RecordBatch::new_empty(std::sync::Arc::new(arrow::datatypes::Schema::empty())))

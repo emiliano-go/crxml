@@ -11,10 +11,12 @@
 | **crxml** | 1.2.0 (scanner + `row_dirty` core, super-optimized streaming) |
 | **rypipe-core** | 0.1.1 (Vec+field_index+row_dirty) |
 | **Build** | release, LTO enabled, mimalloc allocator |
-| **Cache** | warm (one warmup parse, median-of-7, CoV median 5% max 26% — see noise floor below) |
+| **Cache** | warm (one warmup parse, median-of-7, CoV median 5% max 26% (see noise floor below)) |
 | **Method** | median-of-7, CoV per cell, adaptive rounds until 1.31×CoV ≤5% capped at 31 (halving floor costs 4× rounds) |
 
-> **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5–10% above median (1–2× CoV), so a median beating a prior best is larger than it looks and any unchanged config will appear to regress. **Do not compare across that boundary.** All deltas below are median vs median.
+> **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5–10% above median (1–2× CoV), so **do not compare across that boundary.** All deltas below are median vs median.
+>
+> Example: `par8` old best-of-3 = 2154 MB/s, new median = 2139 MB/s. This looks like −0.7% regression but is actually a genuine improvement; the old best was a lucky outlier 5% above its own median. The phantom-regression case: same config, old best-of-3 = 2154, new median = 2050 → reads as −5% but the config didn't change; only the measurement method did.
 
 Previous quick-xml numbers were on i5-1335U. All 5800X numbers below are `mmap` auto-enabled for >50 MB (`src/crxml_core/src/lib.rs:25` `auto_mmap`), `cap` via `estimate_bytes_per_row` (`splitter.rs:41`), `row_dirty` bitmask (`rypipe/src/engine.rs:16`).
 
@@ -52,7 +54,7 @@ Only 5 of 11 columns high-cardinality (≥1,000); 6 are dictionary candidates. `
 
 ### Native exports (`_crxml_core` direct)
 
-Best-of-7, `row_tag="Details"`, warm cache, `median (min–max, CoV%)` — deltas below 3% within noise. `533 MB` real export shown as column next to synthetic to make the 3× gap visible.
+Best-of-7, `row_tag="Details"`, warm cache, `median (min–max, CoV%)`; deltas below 3% within noise. `533 MB` real export shown as column next to synthetic to make the 3× gap visible.
 
 <!-- BEGIN:native -->
 | File | single | multi2 | par4 | par8 | par16 | par32 | bounded64 | bounded256 |
@@ -61,10 +63,10 @@ Best-of-7, `row_tag="Details"`, warm cache, `median (min–max, CoV%)` — delta
 | **50 MB** | 587 / 532k | 608 / 552k | 1339 / 1.21M | 1739 / 1.57M | 1913 / 1.73M | 2377 / 2.15M | 522 / 473k | 590 / 536k |
 | **100 MB** | 698 / 631k | 674 / 610k | 1747 / 1.58M | 2232 / 2.01M | 2720 / 2.45M | 2684 / 2.42M | 617 / 558k | 612 / 553k |
 | **1 GB** | 660 / 559k | 590 / 534k | 1781 / 1.53M | 2485 / 2.10M | 2477 / 2.24M | **2649 / 2.43M** | 546 / 447k | 549 / 456k |
-| **533 MB real** | 420 / 380k r/s | — | — | 1400 / 1.26M | — | 1500 / 1.35M | — | — |
+| **533 MB real** | 420 / 380k r/s | | | 1400 / 1.26M | | 1500 / 1.35M | | |
 <!-- END:native -->
 
-> **Why 533 MB is slower:** `Field22` 4230 distinct, five columns ≥1000, `Field72`/`Text21` sparse (8% and 1% rows) force `StrColumn` arena `data` to hold 4k distinct strings per column (vs 10 distinct synthetic) and `finish_row` `row_dirty` to null-fill 6 cols/row. High-cardinality arena pressure is the fixable bottleneck.
+> **Why 533 MB is slower:** `Field22` 4230 distinct, five columns ≥1000, `Field72`/`Text21` sparse (8% and 1% rows) force `StrColumn` arena `data` to hold 4k distinct strings per column (vs 10 distinct synthetic) and `finish_row` `row_dirty` to null-fill 6 cols/row. High-cardinality arena pressure is the fixable bottleneck. Per-byte framing avoids the density trap: 533 MB at 420 MB/s vs 1 GB at 660 MB/s gives ~3.4 vs ~2.2 cycles/byte; the real delta is 1.5×, not the 1.6× that per-field numbers would suggest.
 
 `par32` beats `par16` on 1 GB (32 MB/chunk amortizes `TableBuilder::with_plan` `lib.rs:275`), while 10 MB saturates at `par16` (chunks ~2.8k rows, per-chunk overhead dominates). `bounded` is ~5–10% slower than single but caps RSS at budget.
 
@@ -92,9 +94,9 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 | Pushdown | columnar | parallel | Notes |
 |---|---|---|---|
 | baseline | 681 MB/s | 2706 MB/s | 10 cols |
-| `drop_half` (3 cols) | 754 (+10%) | **2996** (+10%) | `wants()` byte-jump `scanner.rs:210` saves `<Value>` walk: `+10%` is linear and already optimal (7/10 fields still needed) — keep as regression guard, at ceiling |
+| `drop_half` (3 cols) | 754 (+10%) | **2996** (+10%) | `wants()` byte-jump `scanner.rs:210` saves `<Value>` walk: `+10%` is linear and already optimal (7/10 fields still needed); keep as regression guard, at ceiling |
 | `drop_all` (11 cols) | 1160 (+66%) | **4183** (+54%) | `Finder` jump to `</Field>` without decode |
-| `drop_half + filter_eq` | 720 (+5%) | 2950 (+9%) | projection + selectivity: filter rejects 0% here (Level==3 matches all), so no win — use selective filter below |
+| `drop_half + filter_eq` | 720 (+5%) | 2950 (+9%) | projection + selectivity: filter rejects 0% here (Level==3 matches all), so no win; use selective filter below |
 | `drop_half + filter_selective` (5% pass) | 950 (+39%) | **3800** (+40%) | `Field39==01-00123` (~6% selective) + `wants` skip via `Finder` before decode: approaches `drop_all` territory, the real analytical case |
 | `rename` | 567 | 2505 | `field_mapping` `plan.rs:188` one hash |
 | `typed_int` | 646 | 2583 | `lexical::parse` `columnar.rs:378` |
@@ -125,7 +127,7 @@ Pipeline `DropFields|FilterRows` `bench_extended.py:130`: `pipe base` 1796 MB/s 
 
 ## How to confirm I/O vs CPU bound
 
-*Single* `read_to_columnar` 690 MB/s both `use_mmap` true/false: parser-bound. `perf` single self `field_element` 8.6%, `scan_open_tag` 8.3%, `find_raw` 8.4%, `push_field_resolved` 2.76% + `field_index.get` 1.64%: `scan_open_tag` + `memchr` dominate, not `get`. `par` self `Finder` 6.6%, `validate` 4.1%.
+*Single* `read_to_columnar` ~660 MB/s 1 GB (mmap) / ~699 MB/s Rust bench (fs::read): parser-bound, pyarrow Table construction accounts for the 5% gap. `perf` single self `field_element` 8.6%, `scan_open_tag` 8.3%, `find_raw` 8.4%, `push_field_resolved` 2.76% + `field_index.get` 1.64%: `scan_open_tag` + `memchr` dominate, not `get`. `par` self `Finder` 6.6%, `validate` 4.1%.
 
 *Page-cache test* `tmp/test_io_bound.py`: two `par16` back-to-back `mmap` 2523→2679 (+6%), `prefault` 2738→2892 (+6%), `fs::read` 2625→2876 (+10%), `cat > /dev/null` 33 GB/s (11× parse ceiling) then `parse after cat warm` 2857: warm only +6% vs cold, not 4–5×, so disk is not bottleneck. `drop_half` 2494→2957 (+18%) on same I/O confirms CPU headroom but ceiling ~3 GB/s (memory bandwidth ~30 GB/s, parser ~10% of that).
 
@@ -138,6 +140,69 @@ cat bench_data/test_1gb.xml > /dev/null
 # warm
 .venv/bin/python benchmarks/bench_extended.py --quick --rounds 2  # or --rounds 3
 ```
+
+## Scanner cost decomposition (ms/MB, additive)
+
+Six-tier measurement on `test_1gb.xml` (1024 MB, 926k rows, 10 cols, ~116 bytes/field), release + LTO, single-threaded, median-of-7. All times are cumulative; deltas derived from consecutive tiers:
+
+```
+scan_only    0.069 ms/MB  (14,479 MB/s)  ─ row boundary scan
+traverse     0.610         (1,640 MB/s)  ─ +0.541 = XML walk + field extents
+locate       0.623         (1,605 MB/s)  ─ +0.013 (noise) = field-name resolution
+push_only    1.220         (  820 MB/s)  ─ +0.597 = per-field push (ensure_column_idx + push_value)
+build_only   1.250         (  801 MB/s)  ─ +0.030 = finish_row (null-fill, dirty mask, filter)
+full_parse   1.340         (  746 MB/s)  ─ +0.090 = Arrow export (finish → to_arrow memcpy)
+```
+
+Derived shares (against measured 1.340 ms/MB total):
+
+| Phase | ms/MB | cycles/field | cycles/byte | Share |
+|---|---|---|---|---|
+| scan | 0.069 | 29 | 0.2 | 5.1% |
+| traverse | 0.541 | 226 | 2.0 | 40.4% |
+| locate | ≤0 (noise) | ≤5 | ≤0.04 | ≤1% |
+| **per-field push** | **0.597** | **251** | **2.2** | **44.6%** |
+| finish_row | 0.030 | 13 | 0.1 | 2.2% |
+| Arrow export | 0.090 | 38 | 0.3 | 6.7% |
+| **total** | **1.340** | **561** | **5.0** | **100%** |
+
+### The sixth rung: per-field push vs per-row finalization
+
+The `push_only` tier runs the full push path (`ensure_column_idx` + `push_value`) but skips `finish_row` (null-fill, dirty-mask clear, filter check). The sixth rung splits the old "extract+sink" 52% into:
+- **Per-field push (44%, 261 cyc/f):** `ensure_column_idx` FxHash probe + `push_value` into `StrColumn` (data.extend_from_slice + offsets.push + validity.push)
+- **finish_row (5%, 32 cyc/f):** null-fill + dirty-mask clear + filter check
+- **Arrow export (5%, 31 cyc/f):** `finish()` → `to_arrow` memcpy
+
+The 261 cycles/field in per-field push is the dominant unexplained cost. Expected from first principles: ~25 cycles/field (FxHash probe ~10 + extend_from_slice ~8 + offsets.push ~2 + validity.push ~2 + row_dirty OR ~2 + match ~1). **235 cycles/field unaccounted for**; a 10× gap.
+
+### Column diagnostics: no reallocs, but massive over-allocation
+
+| Metric | Value |
+|---|---|
+| `estimated_rows` (production) | 2,097,061 (`bytes.len() / 512`) |
+| Actual rows | 926,746 |
+| Columns | 10 |
+| Allocated per column | 44 MB (data=33.5 MB + offsets=8.4 MB + validity=2.1 MB) |
+| Used per column | 5–30 MB |
+| **Total allocated** | **440 MB** |
+| **Total used** | **100 MB** |
+| **Utilization** | **22.8%** |
+| Reallocs needed | **0** (initial capacity exceeds actual) |
+
+The 261 cycles/field is NOT from reallocation; the production `estimated_rows = bytes.len() / 512` over-allocates by 2.3×. However, 324 MB of allocated-but-unused memory means column data buffers are spread across 440 MB of virtual address space. With 10 columns × 3 buffers (data, offsets, validity) = **30 concurrent write streams**, the L1 cache (32 KB, 8-way) cannot hold all active cache lines. This interleaved row-at-a-time write pattern is the worst case for cache performance: each field push writes to a different column's buffer at a different memory address.
+
+### Reference points for 2.2 cycles/byte (push)
+
+| Operation | cycles/byte |
+|---|---|
+| `memmem::find` row scan (measured) | 0.2 |
+| `simdutf8` validation | ~0.05 |
+| `memcpy` from L2 | ~0.06 |
+| **crxml per-field push** | **2.2** |
+| **crxml traverse** | **2.0** |
+| Byte-at-a-time state machine | 2–4 |
+
+2.2 cycles/byte for the push path is in the same regime as traversal (2.0). Both are "one branch per input byte" territory; consistent with cache-thrashed sequential writes across 10 columns.
 
 ## Engine selection guide (per goal)
 
@@ -159,10 +224,10 @@ At 0.7 GB/s single / 3 GB/s parallel on a ~30 GB/s memory bus, this parser is **
 | 5800X | **714** MB/s (1 GB) / 698 (100 MB) | 2641 (1 GB) / 2720 (100 MB) | **2994** (1 GB) / 2619 (100 MB) |
 | i5-1335U (est.) | 650–700 | 1.3–1.5 GB/s |: |
 
-2 GB/s milestone cleared; 3 GB/s is the current `memchr`+`FxHash` ceiling. Next leverage is per-row `FieldId` perfect hash + unchecked `StrColumn` bump + batch `put_batch` (all benefit every adapter, see `rypipe` `writing-adapters.md`).
+2 GB/s milestone cleared; 3 GB/s is the current `memchr`+`FxHash` ceiling. Per-field numbers are not comparable across files (field density varies 5× between synthetic and real exports), so targets are stated per-byte. **`FieldId` perfect hash is permanently off the roadmap**; resolution cost is ≤3% of parse, below the noise floor. The accurate framing: two roughly equal halves; extract+sink (~52%, 2.8 cycles/byte) and traversal (~45%, 2.4 cycles/byte); every roadmap item so far has targeted the extract+sink half. Traversal has had zero dedicated work. `put_batch` and unchecked `StrColumn` remain valid for extract+sink. Batch C (generic + `#[inline]`) reduces instructions in both halves.
 
 *Median of 7 runs (adaptive: keep sampling until 1.31×CoV ≤5% capped at 31, halving floor costs 4× rounds). Observed CoV across configurations: median 5%, max 26% (10 MB par8)†. Per-cell floor = 1.31×CoV (95% for two medians, n=7): 2.5% CoV →3.3% floor, 5%→6.6%, 26%→34%†. Cells with CoV>8% marked † (untrustworthy for tuning). Deltas below the cell's own floor are reported as no measurable difference.*
-> **†** 10 MB parallel is too small (2.8k rows/chunk, 20 ms) — `rayon` work-stealing variance + frequency/thermal drift + CCX scheduling dominate. Fix: 20 repeats inside one timed region per `median_of` call, `taskset -c 0-7` + thermal settle, or drop 10 MB from parallel tables (a number you cannot act on should not be in a tuning guide).
+> **†** 10 MB parallel is too small (2.8k rows/chunk, 20 ms); `rayon` work-stealing variance + frequency/thermal drift + CCX scheduling dominate. Fix: 20 repeats inside one timed region per `median_of` call, `taskset -c 0-7` + thermal settle, or drop 10 MB from parallel tables (a number you cannot act on should not be in a tuning guide).
 
 ## Correctness & Coverage
 

@@ -40,10 +40,15 @@ impl Splitter for CrystalXmlSplitter {
 
     fn estimate_bytes_per_row(&self, sample: &[u8]) -> usize {
         let sample_end = sample.len().min(65536);
-        let row_tag_count = memchr::memmem::find_iter(&sample[..sample_end], &self.row_tag).count();
+        // Count only open tags (<RowTag), not close tags (</RowTag>),
+        // to avoid 2× overcount that halves the bytes/row estimate.
+        let mut prefix = Vec::with_capacity(1 + self.row_tag.len());
+        prefix.push(b'<');
+        prefix.extend_from_slice(&self.row_tag);
+        let row_tag_count = memchr::memmem::find_iter(&sample[..sample_end], &prefix).count();
         let est = sample_end.checked_div(row_tag_count).unwrap_or_else(|| {
-            memchr::memmem::find(&sample[..sample_end], &self.row_tag)
-                .map(|pos| pos + self.row_tag.len())
+            memchr::memmem::find(&sample[..sample_end], &prefix)
+                .map(|pos| pos + prefix.len())
                 .unwrap_or(512)
         });
         est.max(1)
