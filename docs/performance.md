@@ -14,7 +14,7 @@
 | **Cache** | warm (one warmup parse, median-of-7, CoV median 5% max 26% (see noise floor below)) |
 | **Method** | median-of-7, CoV per cell, adaptive rounds until 1.31×CoV ≤5% capped at 31 (halving floor costs 4× rounds) |
 
-> **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5–10% above median (1–2× CoV), so **do not compare across that boundary.** All deltas below are median vs median.
+> **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5-10% above median (1-2× CoV), so **do not compare across that boundary.** All deltas below are median vs median.
 >
 > Example: `par8` old best-of-3 = 2154 MB/s, new median = 2139 MB/s. This looks like −0.7% regression but is actually a genuine improvement; the old best was a lucky outlier 5% above its own median. The phantom-regression case: same config, old best-of-3 = 2154, new median = 2050 → reads as −5% but the config didn't change; only the measurement method did.
 
@@ -64,7 +64,7 @@ Median-of-7 with adaptive sampling, `row_tag="Details"`, warm cache, per-config 
 | **1 GB** | 734 / 664k | 3418 / 3.10M* | **4278 / 3.88M** | 546 / 447k |
 <!-- END:native -->
 
-\* Re-measured Aug 28 with rebuilt SO (median-of-7, CoV 2–7%): par16 0.135s 3939 MB/s, par128 0.120s 4417 MB/s on 533 MB (was 4074/4198). 1 GB par16 dropped due to thermal variance; par128 stable at 4278 vs 4284 earlier within noise.
+\* Re-measured Aug 28 with rebuilt SO (median-of-7, CoV 2-7%): par16 0.135s 3939 MB/s, par128 0.120s 4417 MB/s on 533 MB (was 4074/4198). 1 GB par16 dropped due to thermal variance; par128 stable at 4278 vs 4284 earlier within noise.
 
 > **Auto-tune rule (split by path, raised cap):** Full-RAM `par` uses `max(threads, min(16×threads, file_bytes/4 MB))` - peaks at 4 MB (par133 4450 vs par266 4328 at 2 MB, −3%; 1 MB collapses to 3553). Raised from 8×threads=128 to 16×threads=256 so 533 MB now hits its ideal 133 (was capped at 128, −5% off peak). Streaming `budget/(threads×2)` peaks at 2 MB (2 MB 3942 Vec / 3828 Table auto, 4980 explicit vs 4 MB 3851/3742; 1 MB 3812/3671). Source `src/crxml/source.py:155` keeps 4 MB for `par`; streaming's 2 MB comes from its own budget (64 MB/16t = 2 MB). 100 MB → par 25 (100/4) capped at 16×16=256 → 25, 533 MB → 133, 1 GB → 256.
 
@@ -153,7 +153,7 @@ Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, ful
 | **parallel → to_arrow** | 1888 / 1.70M | 2620 / 2.36M | 2620 / 2.36M | **3072 / 2.78M** |
 | **auto → to_arrow** | 1857 / 1.68M | 2691 / 2.43M | 2691 / 2.43M | 2874 / 2.60M |
 
-`stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:542` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:546` (`auto_mmap`) + `RowSink` `lib.rs:564` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:81` (`next_row_start` `splitter.rs:107` + `parse_row` `scanner.rs:73`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234): within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1–2% self, not Rust: GIL floor.
+`stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:542` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:546` (`auto_mmap`) + `RowSink` `lib.rs:564` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:81` (`next_row_start` `splitter.rs:107` + `parse_row` `scanner.rs:73`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234): within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1-2% self, not Rust: GIL floor.
 
 `columnar → iter` is slower than `stream → iter` (400 vs 501) because it builds `TableBuilder` then iterates via `_arrow_iter` `source.py:38` (`to_batches().to_pylist()`), while `stream` yields `Cow::Borrowed` directly via `RowSink`.
 
@@ -176,7 +176,7 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 | `filter_eq` `Level==3` | 665 | 2552 | per-row `check` `plan.rs:280` then `row_dirty` |
 | `filter_compare` `Field22>Field23` | 642 (45k rows) | 2346 (45k) | `compare` + `apply_compare_filter` `arrow_export.rs:29` fast path |
 | `schema` ordering | 653 | 2525 | `sort_columns` `engine.rs:152` |
-| `mmap` on/off | 647/656 | 2771/2590 | `auto_mmap` 2–4% single, warm-cache `rep_movs` 3% perf |
+| `mmap` on/off | 647/656 | 2771/2590 | `auto_mmap` 2-4% single, warm-cache `rep_movs` 3% perf |
 
 `drop_all` shows the engine is **CPU-bound**, not I/O: reducing copied fields from 10→0 gives 1.66×, yet ceiling stays ~3 GB/s.
 
@@ -221,7 +221,7 @@ Thread scaling is monotonic when chunk is fixed but absolute numbers dropped ~12
 | **533 MB real** | 3939 | 2912* | 2901* | 2922* | 4169 | **4417** | 4099 |
 | **1 GB** | 3418 | 3036* | 2926* | 3064* | 4063 | 4278 | 3913 |
 
-\* Old numbers before rebuild; new par48/64/80 not re-measured after split-scan fix - left as stale. Use par16/par128/par266 from Aug 28 rebuild (median-of-7, CoV 2–7%) for tuning. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB): peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
+\* Old numbers before rebuild; new par48/64/80 not re-measured after split-scan fix - left as stale. Use par16/par128/par266 from Aug 28 rebuild (median-of-7, CoV 2-7%) for tuning. `bounded` `64/256/512 MB` holds 586/663/614 (10 MB) and 560/555/633 (1 GB): peak RSS independent of file size (`bounded.rs:52` `plan_chunks`).
 
 Streaming `batch_size` 256/1024/4096/8192: 508/504/482/493 MB/s (10 MB) and 513/510/488/512 (1 GB): batch amortizes `PyDict::new` + `key_cache` `lib.rs:599` double hash, but `next_batch(1024)` already `allow_threads` `lib.rs:919`.
 
@@ -231,7 +231,7 @@ Pipeline `DropFields|FilterRows` `bench_extended.py:130`: `pipe base` 1796 MB/s 
 
 *Single* `read_to_columnar` ~660 MB/s 1 GB (mmap) / ~699 MB/s Rust bench (fs::read): parser-bound, pyarrow Table construction accounts for the 5% gap. `perf` single self `field_element` 8.6%, `scan_open_tag` 8.3%, `find_raw` 8.4%, `push_field_resolved` 2.76% + `field_index.get` 1.64%: `scan_open_tag` + `memchr` dominate, not `get`. `par` self `Finder` 6.6%, `validate` 4.1%.
 
-*Page-cache test* `tmp/test_io_bound.py`: two `par16` back-to-back `mmap` 2523→2679 (+6%), `prefault` 2738→2892 (+6%), `fs::read` 2625→2876 (+10%), `cat > /dev/null` 33 GB/s (11× parse ceiling) then `parse after cat warm` 2857: warm only +6% vs cold, not 4–5×, so disk is not bottleneck. `drop_half` 2494→2957 (+18%) on same I/O confirms CPU headroom but ceiling ~3 GB/s (memory bandwidth ~30 GB/s, parser ~10% of that).
+*Page-cache test* `tmp/test_io_bound.py`: two `par16` back-to-back `mmap` 2523→2679 (+6%), `prefault` 2738→2892 (+6%), `fs::read` 2625→2876 (+10%), `cat > /dev/null` 33 GB/s (11× parse ceiling) then `parse after cat warm` 2857: warm only +6% vs cold, not 4-5×, so disk is not bottleneck. `drop_half` 2494→2957 (+18%) on same I/O confirms CPU headroom but ceiling ~3 GB/s (memory bandwidth ~30 GB/s, parser ~10% of that).
 
 Run yourself:
 
@@ -240,34 +240,46 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches
 .venv/bin/python -c "import time,os; from crxml import _crxml_core as m; p='bench_data/test_1gb.xml'; s=os.path.getsize(p); t0=time.perf_counter(); m.read_to_columnar_par(p,row_tag='Details',num_chunks=16,use_mmap=True,prefault=False); print(f'cold {s/(time.perf_counter()-t0)/1e6:.1f} MB/s')"
 cat bench_data/test_1gb.xml > /dev/null
 # warm
-.venv/bin/python benchmarks/bench_extended.py --quick --rounds 2  # or --rounds 3
+.venv/bin/python benchmarks/bench_extended.py -quick -rounds 2  # or -rounds 3
 ```
 
 ## Scanner cost decomposition (ms/MB, additive)
 
-Six-tier measurement on `test_533mb.xml` (533 MB, 482k rows, 10 cols), release + LTO, single-threaded, median-of-7. All times are cumulative; deltas derived from consecutive tiers:
+Six-tier measurement on `test_533mb.xml` (533 MB, 482k rows, 10 cols) and `test_1gb.xml` (1024 MB, 926k rows), release + LTO, single-threaded, median-of-7, CoV 0.3-3.4% (fresh at locked baseline `5328fbe`/`5e3d958`):
 
 ```
-scan_only    0.066 ms/MB  (15,152 MB/s)  ─ +0.066 = row boundary scan
-traverse     0.601         (1,664 MB/s)  ─ +0.535 = XML walk + field extents
-locate       0.608         (1,644 MB/s)  ─ +0.007 = field-name resolution (one FxHash probe/field)
-push_only    1.220         (  820 MB/s)  ─ +0.612 = per-field push (ensure_column_idx + push_value)
-build_only   1.250         (  800 MB/s)  ─ +0.030 = finish_row (null-fill, dirty mask, filter)
-full_parse   1.297         (  771 MB/s)  ─ +0.047 = Arrow export (finish → to_arrow memcpy)
-total        1.297                                deltas sum: 0.066+0.535+0.007+0.612+0.030+0.047 = 1.297 ✓
+# 533 MB
+scan_only    0.063 ms/MB  (15908 MB/s)  - +0.063 = row boundary scan
+traverse     0.587         (1704 MB/s)  - +0.524 = XML walk + field extents
+locate       0.585         (1710 MB/s)  - +-0.002 = field-name resolution (one FxHash probe/field, now 0.036 ms/MB not 0.007 - old 0.007 was noise, 0.036 is correct 15cyc/field)
+push_only    1.256         ( 796 MB/s)  - +0.671 = per-field push (ensure_column_idx + push_value, now with predicate-first buffering)
+build_only   1.202         ( 832 MB/s)  - +-0.054 = finish_row (null-fill, dirty mask, filter) - predicate-first buffered path
+full_parse   1.259         ( 794 MB/s)  - +0.057 = Arrow export (finish -> to_arrow memcpy)
+total        1.259                                deltas sum: 0.063+0.524-0.002+0.671-0.054+0.057 = 1.259
+
+# 1 GB
+scan_only    0.063 ms/MB  (15805 MB/s)  - +0.063
+traverse     0.582         (1718 MB/s)  - +0.519
+locate       0.592         (1688 MB/s)  - +0.010
+push_only    1.256         ( 796 MB/s)  - +0.664
+build_only   1.204         ( 831 MB/s)  - +-0.053
+full_parse   1.276         ( 783 MB/s)  - +0.073
+total        1.276
 ```
 
-Derived shares (deltas against measured 1.297 ms/MB total):
+Previous ladder (1.297 ms/MB) was pre frozen-schema/split-scan/chunk-rules; new total 1.259/1.276 is within CoV (stable baseline). BlockMasks P2 `next_lt` via `BlockMasks` measured **-68% on traverse** (0.574->0.968 ms/MB, total 1.275->1.959) - short 50B spans don't amortize, `memchr` already optimal, so BlockMasks not wired for crxml (kept as engine asset for CSV/JSONL 1KB rows, `MAX_DELIMS=8`).
+
+Derived shares (deltas against measured 1.259 ms/MB total, 533 MB):
 
 | Phase | delta ms/MB | cycles/field | cycles/byte | Share |
 |---|---|---|---|---|
-| scan | 0.066 | 28 | 0.2 | 5.1% |
-| traverse | 0.535 | 224 | 2.0 | 41.2% |
-| locate | 0.007 | 3 | 0.03 | 0.5% |
-| **per-field push** | **0.612** | **256** | **2.3** | **47.2%** |
-| finish_row | 0.030 | 13 | 0.1 | 2.3% |
-| Arrow export | 0.047 | 20 | 0.2 | 3.6% |
-| **total** | **1.297** | **543** | **4.9** | **100%** |
+| scan | 0.063 | 27 | 0.2 | 5.0% |
+| traverse | 0.524 | 219 | 2.0 | 41.6% |
+| locate | -0.002 | -1 | -0.01 | -0.2% (noise, now 0.036 for locate alone is correct) |
+| **per-field push** | **0.671** | **281** | **2.5** | **53.3%** |
+| finish_row | -0.054 | -23 | -0.2 | -4.3% (buffered path) |
+| Arrow export | 0.057 | 24 | 0.2 | 4.5% |
+| **total** | **1.259** | **527** | **4.8** | **100%** |
 
 ### The sixth rung: per-field push vs per-row finalization
 
@@ -284,7 +296,7 @@ The `push_only` tier runs the full push path (`ensure_column_idx` + `push_value`
 
 | Function | % | cyc/field | Notes |
 |---|---|---|---|
-| **memchr family + Searcher::new** | **37.1%** | **121** | 5–7 searches/field on ~50B haystacks |
+| **memchr family + Searcher::new** | **37.1%** | **121** | 5-7 searches/field on ~50B haystacks |
 | field_element::\<PushOnly\> | 9.7% | 31 | loop control |
 | AttrIter::next | 6.4% | 21 | attribute parsing |
 | raw_text_until | 4.1% | 13 | value extraction |
@@ -292,7 +304,7 @@ The `push_only` tier runs the full push path (`ensure_column_idx` + `push_value`
 | assign_text | 2.2% | 7 | text copy |
 | HashMap::get | 1.9% | 6 | field lookup |
 
-**Root cause: memchr/memmem AVX2 searcher setup on short haystacks.** Each field does 5–7 separate `memchr`/`memmem` calls on ~50–100 byte segments. AVX2 pattern setup (~15–20 cycles) dominates the actual scan (~3 cycles). The `Searcher::new` alone is 2.04% of push cycles. Estimated fix: scalar byte loops for haystacks <128 bytes → ~100–140 cyc/field savings → 30–40% push reduction → ~17% end-to-end throughput.
+**Root cause: memchr/memmem AVX2 searcher setup on short haystacks.** Each field does 5-7 separate `memchr`/`memmem` calls on ~50-100 byte segments. AVX2 pattern setup (~15-20 cycles) dominates the actual scan (~3 cycles). The `Searcher::new` alone is 2.04% of push cycles. Estimated fix: scalar byte loops for haystacks <128 bytes → ~100-140 cyc/field savings → 30-40% push reduction → ~17% end-to-end throughput.
 
 ### Reference points for 2.2 cycles/byte (push)
 
@@ -303,7 +315,7 @@ The `push_only` tier runs the full push path (`ensure_column_idx` + `push_value`
 | `memcpy` from L2 | ~0.06 |
 | **crxml per-field push** | **2.2** |
 | **crxml traverse** | **2.0** |
-| Byte-at-a-time state machine | 2–4 |
+| Byte-at-a-time state machine | 2-4 |
 
 2.2 cycles/byte for the push path is in the same regime as traversal (2.0). Both are "one branch per input byte" territory; consistent with cache-thrashed sequential writes across 10 columns.
 
@@ -342,7 +354,7 @@ Attempted to replace `memchr` byte searches with scalar loops for haystacks <128
 | scalar <128 | 297 | 1,040 | within noise |
 | scalar <16 | 310 | 1,011 | within noise |
 
-**Root cause:** memchr's internal thresholds (16B SSE2, 32B AVX2) are already optimal. Scalar loops are5–7× slower than AVX2 on50-byte haystacks. `assign_text` tripled (2.2%→7.3%) at threshold=128 because `decode_text` and `decode_bytes` each called `scan_byte` - two scalar loops replacing two AVX2 calls. **Do not retry scalar loops; the win is structural indexing, not per-search tuning.**
+**Root cause:** memchr's internal thresholds (16B SSE2, 32B AVX2) are already optimal. Scalar loops are5-7× slower than AVX2 on50-byte haystacks. `assign_text` tripled (2.2%→7.3%) at threshold=128 because `decode_text` and `decode_bytes` each called `scan_byte` - two scalar loops replacing two AVX2 calls. **Do not retry scalar loops; the win is structural indexing, not per-search tuning.**
 
 ## Chunk-count sweep (post split-scan fix, 533 MB, median-of-7)
 
@@ -371,7 +383,7 @@ Peak at **par128** (4470 MB/s, 4.16 MB chunks, CoV 3.0%). par192 marginally 4214
 | **traverse** | **59%** | **41%** | **24.3%** |
 | **total** | - | - | **36.5%** |
 
-Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr on short haystacks. **Halving memchr → ~18% end-to-end throughput.** Structural indexing (one-pass SIMD mask computation replacing 5–7 sequential searches) is the only remaining lever and targets both tiers.
+Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr on short haystacks. **Halving memchr → ~18% end-to-end throughput.** Structural indexing (one-pass SIMD mask computation replacing 5-7 sequential searches) is the only remaining lever and targets both tiers.
 
 ## Engine selection guide (per goal) - after parallel Discovery (auto now unblocked)
 
@@ -392,7 +404,7 @@ Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr
 
 At 0.7 GB/s single / 4.2 GB/s parallel on a ~30 GB/s memory bus, this parser is **CPU-bound** (tokenizing + `FxHash` + `memchr` on short haystacks + `StrColumn::push` arena). The `memchr` scanner removed the 69% `quick-xml` slice, `row_dirty:Vec<bool>` cut `finish_row` 34%→<1%, `field_index:Vec+HashMap` cut double-probe, and the split-scan fix eliminated the 49.7 ms `find_special_regions` full-file scan.
 
-**Measured ceilings (5800X, warm, median-of-7, CoV 2–7%, frozen schema, parallel Discovery 5.3 ms):**
+**Measured ceilings (5800X, warm, median-of-7, CoV 2-7%, frozen schema, parallel Discovery 5.3 ms):**
 
 | Config | Artifact | 100 MB | 533 MB real | 1 GB | Chunk |
 |---|---|---|---|---|---|
