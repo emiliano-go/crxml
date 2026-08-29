@@ -132,9 +132,12 @@ pub(crate) fn next_row_start(
         return None;
     }
 
-    let mut full_tag = Vec::with_capacity(1 + tag.len());
-    full_tag.push(b'<');
-    full_tag.extend_from_slice(tag);
+    // Stack-allocate the full tag to avoid per-row heap allocation.
+    // `<` + tag fits in 32 bytes for all realistic row tags.
+    let mut tag_buf = [0u8; 32];
+    tag_buf[0] = b'<';
+    tag_buf[1..1 + tag.len()].copy_from_slice(tag);
+    let full_tag = &tag_buf[..1 + tag.len()];
 
     let mut p = from;
     while let Some(rel) = memchr::memmem::find(&bytes[p..], &full_tag) {
@@ -199,9 +202,12 @@ pub(crate) fn next_row_start_fast(bytes: &[u8], from: usize, tag: &[u8]) -> Opti
     if from >= bytes.len() {
         return None;
     }
-    let mut full_tag = Vec::with_capacity(1 + tag.len());
-    full_tag.push(b'<');
-    full_tag.extend_from_slice(tag);
+    // Stack-allocate the full tag to avoid per-row heap allocation.
+    // `<` + tag fits in 32 bytes for all realistic row tags.
+    let mut tag_buf = [0u8; 32];
+    tag_buf[0] = b'<';
+    tag_buf[1..1 + tag.len()].copy_from_slice(tag);
+    let full_tag = &tag_buf[..1 + tag.len()];
     let mut p = from;
     while let Some(rel) = memchr::memmem::find(&bytes[p..], &full_tag) {
         let at = p + rel;

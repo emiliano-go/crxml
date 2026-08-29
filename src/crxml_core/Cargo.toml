@@ -14,8 +14,9 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-profile = []
+profile = ["rypipe-core/profile"]
 testing = []
+alloc-stats = ["rypipe-core/alloc-stats"]
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }

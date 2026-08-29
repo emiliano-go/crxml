@@ -52,8 +52,15 @@ pub mod xml;
 
 // Fast allocator: replaces the system heap for all Rust-side
 // allocations (profiling showed ~27% of CPU in malloc/free).
+// When alloc-stats feature is enabled, wrap mimalloc with the counting
+// allocator so every allocation is tracked.
+#[cfg(not(feature = "alloc-stats"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static GLOBAL: rypipe_core::alloc_stats::Counting<mimalloc::MiMalloc> =
+    rypipe_core::alloc_stats::Counting(mimalloc::MiMalloc);
 
 // Typed exceptions so callers can distinguish failure classes:
 // XmlError: malformed/unparseable XML input; PlanError: invalid pushdown
@@ -85,7 +92,7 @@ fn build_plan_from_kwargs(
     dictionary_columns: Option<Vec<String>>,
     schema: Option<Vec<String>>,
     auto_dict: bool,
-) -> PyResult<rypipe_core::ExecutionPlan> {
+) -> PyResult<std::sync::Arc<rypipe_core::ExecutionPlan>> {
     let mut plan = rypipe_core::ExecutionPlan::new();
 
     if let Some(map) = field_mapping {
@@ -157,7 +164,7 @@ fn build_plan_from_kwargs(
         }
     }
 
-    Ok(plan)
+    Ok(std::sync::Arc::new(plan))
 }
 
 fn split_points_to_ranges(points: &[usize], len: usize) -> Vec<Range<usize>> {
@@ -509,11 +516,11 @@ fn get_par_profile(py: Python<'_>) -> PyResult<PyObject> {
 
 #[cfg(feature = "testing")]
 fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
-    let plan = rypipe_core::ExecutionPlan::new();
+    let plan = std::sync::Arc::new(rypipe_core::ExecutionPlan::new());
     let est_row = crate::xml::CrystalXmlSplitter::with_row_tag(row_tag)
         .estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
     let est = (bytes.len() / est_row.max(512)).max(64);
-    let mut sink = rypipe_core::TableBuilder::with_plan(est, plan);
+    let mut sink = rypipe_core::TableBuilder::with_plan(est, std::sync::Arc::clone(&plan));
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(row_tag);
     decoder.validate(bytes).map_err(map_rypipe_err)?;
     decoder

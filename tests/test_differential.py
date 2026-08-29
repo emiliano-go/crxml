@@ -290,3 +290,115 @@ def test_sparse_disjoint_columns_all_engines(tmp_path):
     assert col == expected, "columnar diverged on sparse disjoint columns"
     assert par == expected, "parallel diverged on sparse disjoint columns"
     assert bounded == expected, "bounded diverged on sparse disjoint columns"
+
+
+# ===========================================================================
+# Filtered differential tests — exercises the predicate-first path.
+# Bugs 3 & 4 (silent value loss via normalize) would be caught here.
+# ===========================================================================
+
+def _gen_filtered_xml(rng: random.Random, n_rows: int) -> bytes:
+    """Generate CR XML with 11 fields per row.
+
+    - Level attribute (0/1/2) — position 0
+    - alpha..kappa (11 fields) — positions 1-11
+    - kappa (Field11) appears in only ~30% of rows (sparse)
+    - Row 0 has no alpha field (predicate column absent)
+    """
+    parts = [b'<?xml version="1.0"?>\n<Report>']
+    for i in range(n_rows):
+        attrs = f' Level="{i % 3}"'
+        fields = []
+        # alpha is absent in row 0 (predicate column missing)
+        if i != 0:
+            fields.append(f"<Field FieldName=\"alpha\"><FormattedValue>{i % 10}</FormattedValue></Field>")
+        for name in ["beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota"]:
+            fields.append(f"<Field FieldName=\"{name}\"><FormattedValue>{rng.randint(0, 9)}</FormattedValue></Field>")
+        # kappa (sparse): only ~30% of rows
+        if rng.random() < 0.3:
+            fields.append(f"<Field FieldName=\"kappa\"><FormattedValue>{rng.randint(0, 5)}</FormattedValue></Field>")
+        parts.append((f"<Row{attrs}>" + "".join(fields) + "</Row>").encode())
+    parts.append(b"</Report>")
+    return b"".join(parts)
+
+
+def _oracle_filter(data: bytes, field: str, op: str, value: str) -> list[dict]:
+    """Reference: parse with ET, apply filter, null-fill."""
+    rows = _oracle_rows(data)
+    filtered = []
+    for r in rows:
+        actual = r.get(field)
+        if op == "==":
+            if actual == value:
+                filtered.append(r)
+        elif op == "!=":
+            if actual != value:
+                filtered.append(r)
+    return _null_fill(filtered)
+
+
+ENGINES = ["stream", "columnar", "parallel", "bounded"]
+FILTERS = [
+    # (field, op, value, position, selectivity)
+    ("alpha", "==", "5", "first", "~50%"),    # alpha present ~50% of rows, value 5 in ~10%
+    ("alpha", "!=", "x", "first", "100%"),     # 100% pass
+    ("alpha", "==", "NONEXISTENT", "first", "0%"),  # 0% pass
+    ("delta", "==", "5", "middle", "~50%"),
+    ("delta", "!=", "x", "middle", "100%"),
+    ("delta", "==", "NONEXISTENT", "middle", "0%"),
+    ("kappa", "==", "3", "last", "~30%"),      # sparse column
+    ("kappa", "!=", "x", "last", "~30%"),      # keep rows where kappa != x
+    ("kappa", "==", "NONEXISTENT", "last", "0%"),
+]
+
+
+@pytest.mark.parametrize("field,op,value,position,sel", FILTERS)
+@pytest.mark.parametrize("engine", ENGINES)
+def test_filtered_output_matches_reference(tmp_path, field, op, value, position, sel, engine):
+    """Filtered output must match an independent ET oracle.
+
+    Covers the three predicate positions (first/middle/last), three
+    selectivities (0%/~50%/100%), four engines, plus a sparse column
+    (kappa) and a row where the predicate column is absent (row 0).
+    """
+    rng = random.Random(42)
+    data = _gen_filtered_xml(rng, n_rows=60)
+    path = _write(tmp_path, data, f"filter_{field}_{op}_{sel}.xml")
+    expected = _oracle_filter(data, field, op, value)
+
+    filt = {"field": field, "op": op, "value": value}
+    if engine == "stream":
+        # Stream iterates dicts; filter manually to avoid to_arrow on sparse cols
+        all_rows = list(CrystalXMLSource(path, row_tag="Row", engine="stream"))
+        if op == "==":
+            filtered = [r for r in all_rows if r.get(field) == value]
+        else:
+            filtered = [r for r in all_rows if r.get(field) != value]
+        got = _null_fill(filtered)
+    elif engine == "columnar":
+        got = _null_fill(
+            CrystalXMLSource(path, row_tag="Row", engine="columnar", filter=filt)
+            .to_arrow().to_pylist()
+        )
+    elif engine == "parallel":
+        got = _null_fill(
+            CrystalXMLSource(path, row_tag="Row", engine="parallel", threads=2, filter=filt)
+            .to_arrow().to_pylist()
+        )
+    elif engine == "bounded":
+        got = _null_fill(
+            CrystalXMLSource(path, row_tag="Row", engine="columnar", memory="1KB", filter=filt)
+            .to_arrow().to_pylist()
+        )
+
+    assert len(got) == len(expected), (
+        f"{engine} {field} {op} {value}: got {len(got)} rows, expected {len(expected)}"
+    )
+    # Compare values — the check that would have caught Bugs 3 & 4
+    for i, (g, e) in enumerate(zip(got, expected)):
+        for k in set(list(g.keys()) + list(e.keys())):
+            gv = g.get(k)
+            ev = e.get(k)
+        assert g == e, (
+            f"{engine} {field} {op} {value} row {i}:\n  got:      {g}\n  expected: {e}"
+        )

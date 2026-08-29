@@ -26,11 +26,50 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::LazyLock;
 
+#[cfg(feature = "profile")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use memchr::{memchr, memchr3, memmem};
 
 use rypipe_core::{ColumnarSink, Value};
 
 use crate::xml::splitter::{find_special_regions, next_row_start};
+
+// --- Predicate-first profiling counters ---
+// Counts rows where row_rejected() fired and find_close_details skipped the rest.
+#[cfg(feature = "profile")]
+pub static REJECTED_ROWS: AtomicU64 = AtomicU64::new(0);
+// Counts individual fields that were skipped (i.e. never visited) because the
+// row was already rejected. Measured by counting <Field occurrences between the
+// current scan position and the </Details> close tag.
+#[cfg(feature = "profile")]
+pub static SKIPPED_FIELDS: AtomicU64 = AtomicU64::new(0);
+// Counts fields where the predicate was evaluated (incremented on each
+// evaluate_predicate_state call).
+#[cfg(feature = "profile")]
+pub static PREDICATE_CHECKS: AtomicU64 = AtomicU64::new(0);
+// Counts total rows scanned (incremented at start of each parse_row).
+#[cfg(feature = "profile")]
+pub static ROWS_SCANNED: AtomicU64 = AtomicU64::new(0);
+// Counts how many times row_rejected() is called (before the if-check).
+#[cfg(feature = "profile")]
+pub static REJECTED_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+/// Reset all profiling counters (for benchmark isolation).
+#[cfg(feature = "profile")]
+pub fn reset_profile_counters() {
+    REJECTED_ROWS.store(0, Ordering::Relaxed);
+    SKIPPED_FIELDS.store(0, Ordering::Relaxed);
+    PREDICATE_CHECKS.store(0, Ordering::Relaxed);
+    ROWS_SCANNED.store(0, Ordering::Relaxed);
+    REJECTED_CHECKS.store(0, Ordering::Relaxed);
+    rypipe_core::PREDICATE_EVALUATIONS.store(0, Ordering::Relaxed);
+    rypipe_core::PREDICATE_FAILS.store(0, Ordering::Relaxed);
+    rypipe_core::PREDICATE_UNDECIDED.store(0, Ordering::Relaxed);
+    rypipe_core::IS_PRED_TRUE.store(0, Ordering::Relaxed);
+    rypipe_core::IS_PRED_FALSE.store(0, Ordering::Relaxed);
+    rypipe_core::RESOLVE_AND_PUT_COUNT.store(0, Ordering::Relaxed);
+}
 
 /// Bytes are chunk-validated UTF-8 (see `RecordParser::validate`); skip
 /// std's per-call revalidation.
@@ -103,6 +142,9 @@ fn parse_row<S: ColumnarSink + ?Sized>(
         None => return Flow::Truncated,
     };
 
+    #[cfg(feature = "profile")]
+    ROWS_SCANNED.fetch_add(1, Ordering::Relaxed);
+
     sink.begin_row();
 
     if emit_all_attrs(bytes, &open, sink) {
@@ -125,8 +167,20 @@ fn parse_row<S: ColumnarSink + ?Sized>(
             ChildFlow::Truncated => return Flow::Truncated,
             ChildFlow::Recover => return Flow::Recover,
         };
+        #[cfg(feature = "profile")]
+        REJECTED_CHECKS.fetch_add(1, Ordering::Relaxed);
         if sink.row_rejected() {
-            if let Some(after) = find_close_details(bytes, cur, regions) {
+            #[cfg(feature = "profile")]
+            {
+                REJECTED_ROWS.fetch_add(1, Ordering::Relaxed);
+            }
+            let after = find_close_details(bytes, cur, regions);
+            if let Some(after) = after {
+                #[cfg(feature = "profile")]
+                {
+                    let skipped = count_field_openings(&bytes[cur..after.min(bytes.len())]);
+                    SKIPPED_FIELDS.fetch_add(skipped, Ordering::Relaxed);
+                }
                 sink.end_row();
                 return Flow::At(after);
             } else {
@@ -664,7 +718,7 @@ static DETAILS_OPEN: LazyLock<memmem::Finder> =
 /// Pattern lengths (`</` + name) for advancing past a found close tag.
 const PAT_FIELD: usize = 7;
 const PAT_TEXT: usize = 6;
-const PAT_DETAILS: usize = 10;
+const PAT_DETAILS: usize = 9;
 const PAT_FORMATTED_VALUE: usize = 16;
 const PAT_VALUE: usize = 7;
 const PAT_TEXT_VALUE: usize = 11;
@@ -704,6 +758,25 @@ fn find_close_after(
 
 fn find_close_details(bytes: &[u8], from: usize, regions: &[Range<usize>]) -> Option<usize> {
     find_close_after(bytes, from, &CLOSE_DETAILS, PAT_DETAILS, regions)
+}
+
+/// Count `<Field` occurrences in a byte slice (for profiling: how many fields
+/// were skipped when a row was rejected).
+#[cfg(feature = "profile")]
+fn count_field_openings(region: &[u8]) -> u64 {
+    static FIELD_OPEN: LazyLock<memmem::Finder<'static>> =
+        LazyLock::new(|| memmem::Finder::new(b"<Field"));
+    let mut count = 0u64;
+    let mut pos = 0;
+    while pos < region.len() {
+        if let Some(rel) = FIELD_OPEN.find(&region[pos..]) {
+            count += 1;
+            pos += rel + 6; // len("<Field")
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 /// Raw text between an already-scanned open tag and its matching close tag.
@@ -1106,6 +1179,32 @@ mod tests {
                 let _ = scan_chunk(seed, tag, &mut sink);
             }
         }
+    }
+
+    /// Regression: PAT_DETAILS was 10 instead of 9, causing
+    /// find_close_details to check the byte PAST the '>' and fail.
+    /// This test ensures the close tag is found on well-formed data.
+    #[test]
+    fn regression_pat_details_close_tag_found() {
+        let xml = b"<Row><Details><Field Name=\"A\"><Value>1</Value></Field></Details></Row>";
+        let regions = &[];
+        // find_close_details should find the end of </Details>
+        let result = find_close_details(xml, 0, regions);
+        assert!(result.is_some(), "find_close_details must find </Details> on well-formed XML");
+        let pos = result.unwrap();
+        // After </Details> the remaining bytes should be </Row>
+        assert_eq!(&xml[pos..], b"</Row>", "cursor should be right after </Details>");
+    }
+
+    /// Same regression check: ensure close_boundary_ok is called at the
+    /// right byte — the '>' of '</Details>', not the byte past it.
+    #[test]
+    fn regression_pat_details_boundary_check_position() {
+        // Minimal case: </Details> immediately followed by EOF
+        let xml = b"</Details>";
+        let result = find_close_details(xml, 0, &[]);
+        assert!(result.is_some(), "</Details> at EOF must be found");
+        assert_eq!(result.unwrap(), xml.len(), "cursor should be at EOF");
     }
 }
 
@@ -1656,13 +1755,13 @@ mod perf {
             }
 
             let (t_med, t_cov) = bench(n, || {
-                let mut tb = rypipe_core::TableBuilder::with_plan(100_000, plan.clone());
+                let mut tb = rypipe_core::TableBuilder::with_plan(100_000, std::sync::Arc::new(plan.clone()));
                 scan_chunk(&bytes, b"Details", &mut tb).unwrap();
             });
 
             let ms_mb = t_med / mb * 1000.0;
             // Get row/field count from a single run
-            let mut tb = rypipe_core::TableBuilder::with_plan(100_000, plan.clone());
+            let mut tb = rypipe_core::TableBuilder::with_plan(100_000, std::sync::Arc::new(plan.clone()));
             scan_chunk(&bytes, b"Details", &mut tb).unwrap();
             let rows = tb.num_rows();
             let cols = tb.num_columns();
@@ -1745,6 +1844,367 @@ mod perf {
         }
         fn finish(&mut self) -> RResult<RecordBatch> {
             Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+        }
+    }
+
+    /// Regression test: asserts that the predicate skip fires correctly.
+    /// Without this, the next refactor breaks predicate-first silently.
+    ///
+    /// ```
+    /// cargo test --features profile predicate_skip_assertions -- --nocapture
+    /// ```
+    #[test]
+    #[cfg(feature = "profile")]
+    fn predicate_skip_assertions() {
+        use rypipe_core::{ExecutionPlan, FilterPredicate, TableBuilder};
+
+        // Generate 11-field rows (Level + Field1..Field11)
+        let n_rows = 5_000usize;
+        let mut xml = String::from("<?xml version=\"1.0\"?>\n<CrystalReport>");
+        for i in 0..n_rows {
+            use std::fmt::Write;
+            write!(
+                xml,
+                "<Details Level=\"{}\"><Field Name=\"Field1\"><Value>val{}</Value></Field>\n",
+                i % 3,
+                i % 100,
+            ).unwrap();
+            xml.push_str("<Field Name=\"Field2\"><Value>v</Value></Field>\n");
+            xml.push_str("<Field Name=\"Field3\"><Value>v</Value></Field>\n");
+            xml.push_str("<Field Name=\"Field4\"><Value>v</Value></Field>\n");
+            xml.push_str("<Field Name=\"Field5\"><Value>v</Value></Field>\n");
+            write!(xml, "<Field Name=\"Field6\"><Value>val{}</Value></Field>\n", i % 100).unwrap();
+            xml.push_str("<Field Name=\"Field7\"><Value>v</Value></Field>\n");
+            xml.push_str("<Field Name=\"Field8\"><Value>v</Value></Field>\n");
+            xml.push_str("<Field Name=\"Field9\"><Value>v</Value></Field>\n");
+            xml.push_str("<Field Name=\"Field10\"><Value>v</Value></Field>\n");
+            write!(xml, "<Field Name=\"Field11\"><Value>val{}</Value></Field>\n", i % 100).unwrap();
+            xml.push_str("</Details>");
+        }
+        xml.push_str("</CrystalReport>");
+        let bytes = xml.as_bytes();
+
+        // Helper: run a filter and return (rejected, skipped)
+        let run_with_filter = |filter: FilterPredicate| -> (u64, u64) {
+            reset_profile_counters();
+            let mut plan = ExecutionPlan::new();
+            plan.filter = Some(filter);
+            let mut tb = TableBuilder::with_plan(n_rows, std::sync::Arc::new(plan));
+            scan_chunk(bytes, b"Details", &mut tb).unwrap();
+            let _ = tb.finish();
+            let rej = REJECTED_ROWS.load(Ordering::Relaxed);
+            let skp = SKIPPED_FIELDS.load(Ordering::Relaxed);
+            (rej, skp)
+        };
+
+        // first/0%: predicate on Field1, value "999" (doesn't exist)
+        // All rows rejected, skip ratio = 10 fields per rejection
+        let (rej, skp) = run_with_filter(FilterPredicate::Equal {
+            field: "Field1".to_string(),
+            value: "999".to_string(),
+        });
+        assert!(rej > 0, "first/0%: no rows rejected — filter not firing");
+        assert_eq!(rej, n_rows as u64, "first/0%: should reject all {} rows, got {}", n_rows, rej);
+        assert_eq!(skp / rej, 10, "first/0%: skip ratio should be 10, got {}", skp / rej);
+
+        // middle/0%: predicate on Field6, value "999"
+        let (rej, skp) = run_with_filter(FilterPredicate::Equal {
+            field: "Field6".to_string(),
+            value: "999".to_string(),
+        });
+        assert!(rej > 0, "middle/0%: no rows rejected");
+        assert_eq!(rej, n_rows as u64, "middle/0%: should reject all {} rows, got {}", n_rows, rej);
+        assert_eq!(skp / rej, 5, "middle/0%: skip ratio should be 5 (skip after Field6), got {}", skp / rej);
+
+        // last/0%: predicate on Field11, value "999"
+        let (rej, skp) = run_with_filter(FilterPredicate::Equal {
+            field: "Field11".to_string(),
+            value: "999".to_string(),
+        });
+        assert!(rej > 0, "last/0%: no rows rejected");
+        assert_eq!(rej, n_rows as u64, "last/0%: should reject all {} rows, got {}", n_rows, rej);
+        assert_eq!(skp / rej, 0, "last/0%: skip ratio should be 0 (late predicate, no skip), got {}", skp / rej);
+    }
+
+    /// Predicate-first diagnostic: generates synthetic CR XML, runs three
+    /// filter configurations, and reports the profiling counter ratio.
+    ///
+    /// ```
+    /// cargo test --features profile perf_predicate_first -- --nocapture
+    /// ```
+    #[test]
+    fn perf_predicate_first() {
+        use rypipe_core::{ExecutionPlan, FilterPredicate, TableBuilder};
+        use std::time::Instant;
+
+        // --- Generate synthetic data: 11 fields per row (matches real export) ---
+        let n_rows = 20_000usize;
+        let mut xml = Vec::with_capacity(n_rows * 1100);
+        xml.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><CrystalReport>");
+        for i in 0..n_rows {
+            xml.extend_from_slice(
+                format!(
+                    "<Details Level=\"{}\">\
+<Field Name=\"Field1\" FieldName=\"{{a.F1}}\"><Value>{}</Value></Field>\
+<Field Name=\"Field2\" FieldName=\"{{a.F2}}\"><Value>{}</Value></Field>\
+<Field Name=\"Field3\" FieldName=\"{{a.F3}}\"><Value>text3</Value></Field>\
+<Field Name=\"Field4\" FieldName=\"{{a.F4}}\"><Value>text4</Value></Field>\
+<Field Name=\"Field5\" FieldName=\"{{a.F5}}\"><Value>{}</Value></Field>\
+<Field Name=\"Field6\" FieldName=\"{{a.F6}}\"><Value>text6</Value></Field>\
+<Field Name=\"Field7\" FieldName=\"{{a.F7}}\"><Value>text7</Value></Field>\
+<Field Name=\"Field8\" FieldName=\"{{a.F8}}\"><Value>text8</Value></Field>\
+<Field Name=\"Field9\" FieldName=\"{{a.F9}}\"><Value>text9</Value></Field>\
+<Field Name=\"Field10\" FieldName=\"{{a.F10}}\"><Value>text10</Value></Field>\
+<Field Name=\"Field11\" FieldName=\"{{a.F11}}\"><Value>{}</Value></Field>\
+</Details>",
+                    i % 3,       // Level
+                    i % 100,     // Field1: varies
+                    i % 100,     // Field2: varies (same as Field1)
+                    i % 200,     // Field5: varies
+                    i % 100,     // Field11: varies
+                )
+                .as_bytes(),
+            );
+        }
+        xml.extend_from_slice(b"</CrystalReport>");
+        let mb = xml.len() as f64 / 1024.0 / 1024.0;
+
+        // --- Helper: median-of-3 ---
+        fn bench3(mut f: impl FnMut()) -> f64 {
+            let mut ts: Vec<f64> = (0..3)
+                .map(|_| {
+                    let t0 = Instant::now();
+                    f();
+                    t0.elapsed().as_secs_f64()
+                })
+                .collect();
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ts[1]
+        }
+
+        // --- Unfiltered baseline ---
+        let t_unfiltered = bench3(|| {
+            let mut tb = TableBuilder::with_plan(n_rows, std::sync::Arc::new(ExecutionPlan::new()));
+            scan_chunk(&xml, b"Details", &mut tb).unwrap();
+            let _ = tb.finish();
+        });
+        let unfiltered_rows = {
+            let mut tb = TableBuilder::with_plan(n_rows, std::sync::Arc::new(ExecutionPlan::new()));
+            scan_chunk(&xml, b"Details", &mut tb).unwrap();
+            tb.finish().unwrap().num_rows()
+        };
+        println!("\n=== Position sweep ({:.1} MB, {} rows, 11 fields) ===", mb, unfiltered_rows);
+        println!("unfiltered        {:8.4}s  ratio 1.00", t_unfiltered);
+
+        // Helper to run a filter case and report.
+        #[cfg(feature = "profile")]
+        let run_filter_case = |label: &str, filter: FilterPredicate, expect_rows: usize| {
+            reset_profile_counters();
+            let mut plan = ExecutionPlan::new();
+            plan.filter = Some(filter);
+            let t = bench3(|| {
+                let mut tb = TableBuilder::with_plan(n_rows, std::sync::Arc::new(plan.clone()));
+                scan_chunk(&xml, b"Details", &mut tb).unwrap();
+                let _ = tb.finish();
+            });
+            let rows = {
+                let mut tb = TableBuilder::with_plan(n_rows, std::sync::Arc::new(plan.clone()));
+                scan_chunk(&xml, b"Details", &mut tb).unwrap();
+                tb.finish().unwrap().num_rows()
+            };
+            let rejected = REJECTED_ROWS.load(Ordering::Relaxed);
+            let skipped = SKIPPED_FIELDS.load(Ordering::Relaxed);
+            let scanned = ROWS_SCANNED.load(Ordering::Relaxed);
+            let checks = REJECTED_CHECKS.load(Ordering::Relaxed);
+            let evals = rypipe_core::PREDICATE_EVALUATIONS.load(Ordering::Relaxed);
+            let fails = rypipe_core::PREDICATE_FAILS.load(Ordering::Relaxed);
+            let undecided = rypipe_core::PREDICATE_UNDECIDED.load(Ordering::Relaxed);
+            let is_pred_t = rypipe_core::IS_PRED_TRUE.load(Ordering::Relaxed);
+            let is_pred_f = rypipe_core::IS_PRED_FALSE.load(Ordering::Relaxed);
+            let rpc = rypipe_core::RESOLVE_AND_PUT_COUNT.load(Ordering::Relaxed);
+            let ratio = t_unfiltered / t;
+            println!("  {:40} {:6.2}x  rows={:<6} expect={}  rej={:<6} skp={:<6} scan={:<6} chk={:<8} eval={:<5} fail={:<5} und={:<5} T={:<6} F={:<6} rpc={}", label, ratio, rows, expect_rows, rejected, skipped, scanned, checks, evals, fails, undecided, is_pred_t, is_pred_f, rpc);
+        };
+        #[cfg(not(feature = "profile"))]
+        let run_filter_case = |label: &str, filter: FilterPredicate, expect_rows: usize| {
+            let mut plan = ExecutionPlan::new();
+            plan.filter = Some(filter);
+            let t = bench3(|| {
+                let mut tb = TableBuilder::with_plan(n_rows, std::sync::Arc::new(plan.clone()));
+                scan_chunk(&xml, b"Details", &mut tb).unwrap();
+                let _ = tb.finish();
+            });
+            let rows = {
+                let mut tb = TableBuilder::with_plan(n_rows, std::sync::Arc::new(plan.clone()));
+                scan_chunk(&xml, b"Details", &mut tb).unwrap();
+                tb.finish().unwrap().num_rows()
+            };
+            let ratio = t_unfiltered / t;
+            println!("  {:40} {:6.2}x  rows={:<6} expect={}", label, ratio, rows, expect_rows);
+        };
+
+        // Position sweep: first / middle / last field
+        // 0% selectivity: value "999" doesn't exist → reject all
+        // 100% selectivity: NotEqual with nonexistent → keep all
+        // ~50% selectivity: Field == "0" → keeps ~1/3 (i%100==0 or i%200==0)
+        let positions = [
+            ("Field1",  "first ", n_rows / 100),  // i%100==0
+            ("Field6",  "middle", n_rows / 3),     // Level field (i%3==0)
+            ("Field11", "last  ", n_rows / 100),  // i%100==0
+        ];
+        for (field, pos_label, expect_0) in &positions {
+            println!("\n--- {} (predicate on {}) ---", pos_label, field);
+            run_filter_case(
+                &format!("{}/0%%  (== nonexistent)", pos_label),
+                FilterPredicate::Equal { field: field.to_string(), value: "999".to_string() },
+                0,
+            );
+            run_filter_case(
+                &format!("{}/100%% (!= nonexistent)", pos_label),
+                FilterPredicate::NotEqual { field: field.to_string(), value: "999".to_string() },
+                *expect_0,
+            );
+            // ~50%: use a value that actually exists
+            let half_val = if *field == "Field6" { "0" } else { "0" };
+            run_filter_case(
+                &format!("{}/~50%%  (== \"{}\")", pos_label, half_val),
+                FilterPredicate::Equal { field: field.to_string(), value: half_val.to_string() },
+                *expect_0,
+            );
+        }
+
+        println!("\n=== Acceptance ===");
+        println!("1. 0% rows=0, 100% rows=unfiltered_rows (correctness)");
+        println!("2. last/100% should be >=0.95x (C1 adaptive: no buffering overhead)");
+        println!("3. first/0% should be >1x (C1 adaptive: skip fields)");
+    }
+
+    /// Allocation baseline: counts every malloc/free during a parse, reports
+    /// per-field and per-row allocation pressure.
+    ///
+    /// ```
+    /// BENCH_FILE=test_533mb.xml cargo test --features alloc-stats alloc_baseline -- --nocapture
+    /// ```
+    #[test]
+    fn alloc_baseline() {
+        #[cfg(not(feature = "alloc-stats"))]
+        {
+            eprintln!("skipping: requires --features alloc-stats");
+            return;
+        }
+
+        #[cfg(feature = "alloc-stats")]
+        {
+            use rypipe_core::alloc_stats;
+            use rypipe_core::{ExecutionPlan, FilterPredicate, TableBuilder, FieldType};
+            use rypipe_core::Splitter;
+            use std::time::Instant;
+
+            let path = match std::env::var("BENCH_FILE") {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("skipping: BENCH_FILE not set");
+                    return;
+                }
+            };
+            let bytes = std::fs::read(&path).expect("failed to read BENCH_FILE");
+            let mb = bytes.len() as f64 / 1024.0 / 1024.0;
+
+            let est_row = crate::xml::CrystalXmlSplitter::with_row_tag("Details")
+                .estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
+            let cap = (bytes.len() / est_row.max(512)).max(64);
+
+            // --- Single-thread unfiltered ---
+            alloc_stats::reset();
+            let before = alloc_stats::snapshot();
+            let t0 = Instant::now();
+            let mut tb = TableBuilder::with_plan(cap, std::sync::Arc::new(ExecutionPlan::new()));
+            scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+            let batch = tb.finish().unwrap();
+            let elapsed = t0.elapsed().as_secs_f64();
+            let after = alloc_stats::snapshot();
+            let delta = after.delta(&before);
+            let rows = batch.num_rows();
+            let ncols = batch.num_columns();
+
+            alloc_stats::print_stats(&format!("UNFILTERED single ({:.1} MB, {} rows, {} cols, {:.2}s, {:.0} MB/s)",
+                mb, rows, ncols, elapsed, mb / elapsed), &delta);
+            println!("  allocs/row:  {:>10}", delta.allocs / rows.max(1) as u64);
+            println!("  allocs/field: {:>9}", delta.allocs / (rows as u64 * ncols.max(1) as u64).max(1));
+            println!("  bytes/row:  {:>10}", delta.bytes / rows.max(1) as u64);
+            drop(batch);
+
+            // --- Single-thread with filter (0% selectivity) ---
+            {
+                let mut plan = ExecutionPlan::new();
+                // Filter on a late column to measure buffered path overhead.
+                plan.filter = Some(FilterPredicate::Equal {
+                    field: "Field61".to_string(),
+                    value: "nonexistent".to_string(),
+                });
+                alloc_stats::reset();
+                let before = alloc_stats::snapshot();
+                let t0 = Instant::now();
+                let mut tb = TableBuilder::with_plan(cap, std::sync::Arc::new(plan));
+                scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+                let batch = tb.finish().unwrap();
+                let elapsed = t0.elapsed().as_secs_f64();
+                let after = alloc_stats::snapshot();
+                let delta = after.delta(&before);
+                let rows_out = batch.num_rows();
+                alloc_stats::print_stats(&format!("FILTERED 0%% ({:.1} MB, {} rows out, {:.2}s, {:.0} MB/s)",
+                    mb, rows_out, elapsed, mb / elapsed), &delta);
+                println!("  allocs/row_in: {:>9}", delta.allocs / (rows as u64).max(1));
+                drop(batch);
+            }
+
+            // --- Single-thread with typed columns ---
+            {
+                let mut plan = ExecutionPlan::new();
+                for name in ["Field2", "Field5", "Field8", "Field11"] {
+                    plan.field_types.insert(name.to_string(), FieldType::Int64);
+                }
+                alloc_stats::reset();
+                let before = alloc_stats::snapshot();
+                let t0 = Instant::now();
+                let mut tb = TableBuilder::with_plan(cap, std::sync::Arc::new(plan));
+                scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+                let batch = tb.finish().unwrap();
+                let elapsed = t0.elapsed().as_secs_f64();
+                let after = alloc_stats::snapshot();
+                let delta = after.delta(&before);
+                alloc_stats::print_stats(&format!("TYPED int64 ({:.1} MB, {} rows, {:.2}s, {:.0} MB/s)",
+                    mb, batch.num_rows(), elapsed, mb / elapsed), &delta);
+                println!("  allocs/row:  {:>10}", delta.allocs / batch.num_rows().max(1) as u64);
+                // Verify field_types were applied
+                for (i, name) in batch.schema().fields().iter().enumerate() {
+                    println!("    col[{}] {}: {:?}", i, name.name(), name.data_type());
+                }
+                drop(batch);
+            }
+
+            // --- Determinism check: run twice, counts must match ---
+            {
+                let mut results = Vec::new();
+                for run in 0..2 {
+                    alloc_stats::reset();
+                    let before = alloc_stats::snapshot();
+                    let mut tb = TableBuilder::with_plan(cap, std::sync::Arc::new(ExecutionPlan::new()));
+                    scan_chunk(&bytes, b"Details", &mut tb).unwrap();
+                    let _ = tb.finish().unwrap();
+                    let after = alloc_stats::snapshot();
+                    let delta = after.delta(&before);
+                    results.push(delta.allocs);
+                    println!("  determinism run {}: allocs={}", run, delta.allocs);
+                }
+                if results[0] != results[1] {
+                    eprintln!("  WARNING: allocs differ across runs ({} vs {}) — non-deterministic!",
+                        results[0], results[1]);
+                    eprintln!("  This means a HashMap iteration order or size-dependent branch affects a code path.");
+                } else {
+                    println!("  PASS: allocation counts identical across runs ({})", results[0]);
+                }
+            }
         }
     }
 }

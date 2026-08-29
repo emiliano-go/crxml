@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_dropped_field_not_in_output() {
         let plan = rypipe_core::ExecutionPlan::new().drop("DropMe");
-        let mut sink = TableBuilder::with_plan(4, plan);
+        let mut sink = TableBuilder::with_plan(4, std::sync::Arc::new(plan));
         let xml = br#"<Row><Field Name="Keep"><Value>1</Value></Field><Field Name="DropMe"><Value>x</Value></Field></Row>"#;
         CrystalXmlDecoder::with_row_tag(b"Row")
             .parse_chunk_generic(xml, &mut sink)
