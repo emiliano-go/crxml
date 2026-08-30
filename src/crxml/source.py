@@ -123,6 +123,7 @@ class CrystalXMLSource:
         "_dictionary_columns",
         "_use_mmap",
         "_schema",
+        "_schema_discovered",
         "_auto_dict",
         "_batch_size",
         "_cached_arrow",
@@ -170,6 +171,7 @@ class CrystalXMLSource:
         self._dictionary_columns = dictionary_columns or []
         self._use_mmap = use_mmap
         self._schema = schema or []
+        self._schema_discovered = bool(self._schema)
         self._auto_dict = auto_dict
         self._batch_size = batch_size
         self._cached_arrow = None
@@ -411,6 +413,20 @@ class CrystalXMLSource:
                 DeprecationWarning,
                 stacklevel=2,
             )
+        # Auto-discover schema on first call so repeat parses skip discovery.
+        # This makes auto match explicit-schema performance after the first call.
+        if not self._schema_discovered:
+            self._schema = _core.discover_schema(
+                str(self._filepath),
+                row_tag=self._row_tag,
+                field_mapping=self._field_mapping or None,
+                drop_fields=self._drop_fields or None,
+                filter=self._filter or None,
+                field_types=self._field_types or None,
+                dictionary_columns=self._dictionary_columns or None,
+                auto_dict=self._auto_dict,
+            )
+            self._schema_discovered = True
         yield from _core.iter_record_batches(
             str(self._filepath),
             row_tag=self._row_tag,
