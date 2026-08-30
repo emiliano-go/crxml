@@ -163,4 +163,23 @@ mod tests {
         let e = batch.column_by_name("E").unwrap().as_string::<i32>();
         assert_eq!(e.value(0), "A & B");
     }
+
+    #[test]
+    fn test_filter_eq_keep_rows() {
+        let plan = rypipe_core::ExecutionPlan::new().filter_eq("S", "keep");
+        let mut sink = TableBuilder::with_plan(4, std::sync::Arc::new(plan));
+        let xml = br#"<Rows>
+<Row><Field Name="S"><Value>keep</Value></Field><Field Name="I"><Value>1</Value></Field></Row>
+<Row><Field Name="S"><Value>drop</Value></Field><Field Name="I"><Value>2</Value></Field></Row>
+<Row><Field Name="S"><Value>keep</Value></Field><Field Name="I"><Value>3</Value></Field></Row>
+<Row><Field Name="S"><Value>keep</Value></Field><Field Name="I"><Value>4</Value></Field></Row>
+<Row><Field Name="S"><Value>drop</Value></Field><Field Name="I"><Value>5</Value></Field></Row>
+<Row><Field Name="S"><Value>keep</Value></Field><Field Name="I"><Value>6</Value></Field></Row>
+</Rows>"#;
+        CrystalXmlDecoder::with_row_tag(b"Row")
+            .parse_chunk_generic(xml, &mut sink)
+            .unwrap();
+        let batch = sink.finish().unwrap();
+        assert_eq!(batch.num_rows(), 4, "expected 4 keep rows");
+    }
 }
