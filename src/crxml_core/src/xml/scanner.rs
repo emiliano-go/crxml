@@ -243,7 +243,7 @@ fn scan_child<S: ColumnarSink + ?Sized>(
         b"Section" => lift(section_element(bytes, &child, sink)),
         other => {
             let name = utf8_unchecked(other);
-            sink.resolve_and_put(name, Value::Str(""));
+            sink.resolve_and_put(name, Value::Str(Cow::Borrowed("")));
             ChildFlow::Continue(child.after())
         }
     }
@@ -266,7 +266,7 @@ fn emit_all_attrs<S: ColumnarSink + ?Sized>(bytes: &[u8], open: &OpenTag<'_>, si
             Ok((key_raw, val_raw)) => {
                 let key = decode_attr(key_raw);
                 let val = decode_attr(val_raw);
-                sink.resolve_and_put(&key, Value::Str(&val));
+                sink.resolve_and_put(&key, Value::Str(val));
             }
             Err(()) => return true,
         }
@@ -340,7 +340,7 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
                 None => return Flow::Truncated,
             };
             if name == b"Field" {
-                sink.resolve_and_put(&key, Value::Str(text.as_ref()));
+                sink.resolve_and_put(&key, Value::Str(text));
                 return Flow::At(after);
             }
             cur = after;
@@ -439,7 +439,7 @@ fn text_element<'a, S: ColumnarSink + ?Sized>(
                 None => return Flow::Truncated,
             };
             if name == b"Text" {
-                sink.resolve_and_put(&key, Value::Str(text.as_ref()));
+                sink.resolve_and_put(&key, Value::Str(text));
                 return Flow::At(after);
             }
             cur = after;
@@ -478,7 +478,7 @@ fn section_element<S: ColumnarSink + ?Sized>(bytes: &[u8], open: &OpenTag<'_>, s
         Ok(None) => Cow::Borrowed(""),
         Err(()) => return Flow::Recover,
     };
-    sink.resolve_and_put("Section", Value::Str(sn.as_ref()));
+    sink.resolve_and_put("Section", Value::Str(sn));
     Flow::At(open.after())
 }
 
