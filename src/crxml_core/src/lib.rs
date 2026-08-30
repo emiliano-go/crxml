@@ -140,10 +140,29 @@ fn build_plan_from_kwargs(
                 PlanError::new_err(format!("unsupported compare op {op:?}; valid: {valid}"))
             })?;
             plan.filter = Some(rypipe_core::FilterPredicate::Compare {
-                field_a,
+                field_a: field_a.clone(),
                 op: cop,
-                field_b,
+                field_b: field_b.clone(),
             });
+            // Validate: both fields must have compatible types or both untyped.
+            // A typed field vs untyped (or vice versa) would silently drop rows
+            // because the buffered per-row path cannot compare across domains.
+            let resolved_a = plan.resolve_field(&field_a).unwrap_or(&field_a);
+            let resolved_b = plan.resolve_field(&field_b).unwrap_or(&field_b);
+            let ta = plan.field_types.get(resolved_a);
+            let tb = plan.field_types.get(resolved_b);
+            match (ta, tb) {
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(PlanError::new_err(format!(
+                        "Compare filter {field_a} {op} {field_b}: one field is typed \
+                         ({}) and the other is untyped. Both must be typed or both \
+                         untyped. Add the missing field to field_types, or remove \
+                         the typed one.",
+                        if ta.is_some() { &field_a } else { &field_b }
+                    )));
+                }
+                _ => {}
+            }
         } else {
             let field = f
                 .get("field")
