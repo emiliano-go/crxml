@@ -41,7 +41,7 @@ use crate::xml::splitter::{find_special_regions, next_row_start};
 pub static REJECTED_ROWS: AtomicU64 = AtomicU64::new(0);
 // Counts individual fields that were skipped (i.e. never visited) because the
 // row was already rejected. Measured by counting <Field occurrences between the
-// current scan position and the </Details> close tag.
+// current scan position and the row close tag.
 #[cfg(feature = "profile")]
 pub static SKIPPED_FIELDS: AtomicU64 = AtomicU64::new(0);
 // Counts fields where the predicate was evaluated (incremented on each
