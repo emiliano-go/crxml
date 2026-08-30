@@ -572,6 +572,32 @@ def run_batch_size_matrix(path: Path, rounds=3):
             return sum(1 for _ in src)
         report(path, f"stream batch={bs}", fn, rounds=rounds, batch=bs)
 
+def run_par_stream_matrix(path: Path, rounds=3):
+    print(f"\n-- Parallel Streaming {path.name} --")
+    file_mb = path.stat().st_size / (1024 * 1024)
+    print(f"  File: {path.name} ({file_mb:.0f} MB)")
+    # Memory scaling: bounded at different memory budgets
+    for mem_mb in [32, 64, 128, 256]:
+        def fn(m=mem_mb, p=path):
+            return _core.read_to_columnar_bounded(
+                str(p), row_tag="Details", memory=m*1024*1024
+            ).num_rows
+        report(path, f"bounded {mem_mb:3d}MB", fn, rounds=rounds, mem=f"{mem_mb}MB")
+    # iter_record_batches: streaming with different memory budgets
+    for mem_mb in [16, 64, 256]:
+        def fn(m=mem_mb, p=path):
+            src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel",
+                                   memory=f"{m}MB")
+            return sum(len(b) for b in src.iter_record_batches(memory=f"{m}MB"))
+        report(path, f"iter-batch {mem_mb:3d}MB", fn, rounds=rounds, mem=f"{mem_mb}MB")
+    # iter_record_batches with thread scaling at 64MB
+    for threads in [4, 8, 16]:
+        def fn(t=threads, p=path):
+            src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel",
+                                   memory="64MB", threads=t)
+            return sum(len(b) for b in src.iter_record_batches(memory="64MB", threads=t))
+        report(path, f"iter-batch 64MB t={threads:2d}", fn, rounds=rounds, threads=threads)
+
 def run_pipeline_matrix(path: Path, rounds=2):
     print(f"\n-- Pipeline / Fusion {path.name} --")
     try:
@@ -620,7 +646,7 @@ def main():
     ap.add_argument("--skip-1gb", action="store_true", help="Skip 1 GB file even in full mode")
     ap.add_argument("--gen-only", action="store_true", help="Only generate files")
     ap.add_argument("--rounds", type=int, default=7, help="Rounds median-of-N (default 7, was best-of-3)")
-    ap.add_argument("--include", type=str, default="all", help="Comma list of sections: native,source,pushdown,chunk,bounded,batch,pipeline or all")
+    ap.add_argument("--include", type=str, default="all", help="Comma list of sections: native,source,pushdown,chunk,bounded,batch,par_stream,pipeline,edge or all")
     ap.add_argument("--output", type=str, default=None, help="Write JSON results to dir (e.g. .benchmarks/crxml-1gb.json) for docs rendering")
     ap.add_argument("--only-config", type=str, default=None,
                     help="Run only this native config (e.g. single, par16). For per-config subprocess isolation.")
@@ -692,7 +718,7 @@ def main():
         print(f"\nNote: {BENCH_DATA / 'test_533mb.xml'} missing — synthetic mimic would be generated on demand")
         print("      Label will be '533 MB (synthetic mimic)' not 'real export' to avoid ambiguity")
 
-    include = set(args.include.split(",")) if args.include != "all" else {"native","source","pushdown","chunk","bounded","batch","pipeline","edge"}
+    include = set(args.include.split(",")) if args.include != "all" else {"native","source","pushdown","chunk","bounded","batch","par_stream","pipeline","edge"}
     rounds = args.rounds
 
     for mb, p in targets:
@@ -720,6 +746,8 @@ def main():
             run_bounded_scaling(p, rounds=2 if mb>100 else 2)
         if "batch" in include and not args.quick:
             run_batch_size_matrix(p, rounds=rounds)
+        if "par_stream" in include and not args.quick:
+            run_par_stream_matrix(p, rounds=rounds)
         if "pipeline" in include:
             run_pipeline_matrix(p, rounds=2 if args.quick else 2)
     # Edge cases: empty, single row, ragged, late debut, entities, unicode, comments
