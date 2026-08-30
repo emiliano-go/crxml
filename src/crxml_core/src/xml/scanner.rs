@@ -36,7 +36,7 @@ use rypipe_core::{ColumnarSink, Value};
 use crate::xml::splitter::{find_special_regions, next_row_start};
 
 // --- Predicate-first profiling counters ---
-// Counts rows where row_rejected() fired and find_close_details skipped the rest.
+// Counts rows where row_rejected() fired and the row close tag was found.
 #[cfg(feature = "profile")]
 pub static REJECTED_ROWS: AtomicU64 = AtomicU64::new(0);
 // Counts individual fields that were skipped (i.e. never visited) because the
@@ -174,7 +174,7 @@ fn parse_row<S: ColumnarSink + ?Sized>(
             {
                 REJECTED_ROWS.fetch_add(1, Ordering::Relaxed);
             }
-            let after = find_close_details(bytes, cur, regions);
+            let after = find_row_close(bytes, cur, row_tag, regions);
             if let Some(after) = after {
                 #[cfg(feature = "profile")]
                 {
@@ -703,7 +703,6 @@ static CLOSE_FORMATTED: LazyLock<memmem::Finder> =
     LazyLock::new(|| memmem::Finder::new("</FormattedValue"));
 static CLOSE_TEXTVALUE: LazyLock<memmem::Finder> =
     LazyLock::new(|| memmem::Finder::new("</TextValue"));
-static CLOSE_DETAILS: LazyLock<memmem::Finder> = LazyLock::new(|| memmem::Finder::new("</Details"));
 
 // Searchers for skip_construct (comments / CDATA end markers).
 static COMMENT_END: LazyLock<memmem::Finder> =
@@ -718,7 +717,6 @@ static DETAILS_OPEN: LazyLock<memmem::Finder> =
 /// Pattern lengths (`</` + name) for advancing past a found close tag.
 const PAT_FIELD: usize = 7;
 const PAT_TEXT: usize = 6;
-const PAT_DETAILS: usize = 9;
 const PAT_FORMATTED_VALUE: usize = 16;
 const PAT_VALUE: usize = 7;
 const PAT_TEXT_VALUE: usize = 11;
@@ -756,8 +754,14 @@ fn find_close_after(
     None
 }
 
-fn find_close_details(bytes: &[u8], from: usize, regions: &[Range<usize>]) -> Option<usize> {
-    find_close_after(bytes, from, &CLOSE_DETAILS, PAT_DETAILS, regions)
+/// Find the matching `</row_tag>` close tag for a rejected row.
+/// Returns the offset just past its `>`.
+fn find_row_close(bytes: &[u8], from: usize, row_tag: &[u8], regions: &[Range<usize>]) -> Option<usize> {
+    let mut pat = Vec::with_capacity(2 + row_tag.len());
+    pat.extend_from_slice(b"</");
+    pat.extend_from_slice(row_tag);
+    let finder = memchr::memmem::Finder::new(&pat);
+    find_close_after(bytes, from, &finder, pat.len(), regions)
 }
 
 /// Count `<Field` occurrences in a byte slice (for profiling: how many fields
@@ -1181,28 +1185,34 @@ mod tests {
         }
     }
 
-    /// Regression: PAT_DETAILS was 10 instead of 9, causing
-    /// find_close_details to check the byte PAST the '>' and fail.
-    /// This test ensures the close tag is found on well-formed data.
+    /// Regression: close-tag search used a hard-coded "</Details" pattern.
+    /// The finder must use the configured row tag so rejection works for
+    /// any row element (Row, Item, Details, ...).
     #[test]
-    fn regression_pat_details_close_tag_found() {
+    fn regression_row_close_tag_found_for_details() {
         let xml = b"<Row><Details><Field Name=\"A\"><Value>1</Value></Field></Details></Row>";
         let regions = &[];
-        // find_close_details should find the end of </Details>
-        let result = find_close_details(xml, 0, regions);
-        assert!(result.is_some(), "find_close_details must find </Details> on well-formed XML");
+        let result = find_row_close(xml, 0, b"Details", regions);
+        assert!(result.is_some(), "find_row_close must find </Details> on well-formed XML");
         let pos = result.unwrap();
-        // After </Details> the remaining bytes should be </Row>
         assert_eq!(&xml[pos..], b"</Row>", "cursor should be right after </Details>");
+    }
+
+    #[test]
+    fn regression_row_close_tag_found_for_row() {
+        let xml = b"<Row><Field Name=\"A\"><Value>1</Value></Field></Row>";
+        let regions = &[];
+        let result = find_row_close(xml, 0, b"Row", regions);
+        assert!(result.is_some(), "find_row_close must find </Row>");
+        assert_eq!(result.unwrap(), xml.len(), "cursor should be at EOF");
     }
 
     /// Same regression check: ensure close_boundary_ok is called at the
     /// right byte — the '>' of '</Details>', not the byte past it.
     #[test]
-    fn regression_pat_details_boundary_check_position() {
-        // Minimal case: </Details> immediately followed by EOF
+    fn regression_row_close_boundary_check_position() {
         let xml = b"</Details>";
-        let result = find_close_details(xml, 0, &[]);
+        let result = find_row_close(xml, 0, b"Details", &[]);
         assert!(result.is_some(), "</Details> at EOF must be found");
         assert_eq!(result.unwrap(), xml.len(), "cursor should be at EOF");
     }
