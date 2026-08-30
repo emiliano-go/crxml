@@ -29,7 +29,7 @@ use std::sync::LazyLock;
 #[cfg(feature = "profile")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use memchr::{memchr, memchr3, memmem};
+use memchr::{memchr, memchr2, memchr3, memmem};
 
 use rypipe_core::{ColumnarSink, Value};
 
@@ -334,7 +334,19 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
             cur = region_end(regions, l);
             continue;
         }
-        if bytes[l + 1] == b'/' {
+        // --- Speculative literal matching (fixed grammar) ---
+        // Inside <Field>, only three children appear: <FormattedValue>, <Value>,
+        // and </Field>.  None have attributes.  Try fixed-size compares before
+        // falling back to generic tag scanning.
+        let after_lt = l + 1;
+        if bytes[after_lt] == b'/' {
+            // Close tag: try </Field> (8 bytes)
+            if bytes.len() - after_lt >= 7 && &bytes[after_lt..after_lt + 7] == b"/Field>" {
+                let after = after_lt + 7; // past '>'
+                sink.resolve_and_put(&key, Value::Str(text));
+                return Flow::At(after);
+            }
+            // Unknown close tag — fall back to generic scan
             let (name, after) = match scan_close_tag(bytes, l) {
                 Some(x) => x,
                 None => return Flow::Truncated,
@@ -346,31 +358,36 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
             cur = after;
             continue;
         }
-        if bytes[l + 1] == b'!' || bytes[l + 1] == b'?' {
+        if bytes[after_lt] == b'!' || bytes[after_lt] == b'?' {
             cur = match skip_construct(bytes, l) {
                 Some(p) => p,
                 None => return Flow::Truncated,
             };
             continue;
         }
-        let inner = match scan_open_tag(bytes, l) {
-            Some(c) => c,
-            None => return Flow::Truncated,
-        };
-        if (inner.name == b"FormattedValue" || inner.name == b"Value") && !inner.self_closing {
-            let (finder, pat_len) = if inner.name == b"FormattedValue" {
-                (&CLOSE_FORMATTED, PAT_FORMATTED_VALUE)
-            } else {
-                (&CLOSE_VALUE, PAT_VALUE)
-            };
-            match raw_text_until(bytes, inner.after(), finder, pat_len, regions) {
-                Some((raw, after)) => {
-                    assign_text(&mut text, raw);
+        // Open tag: try <FormattedValue> (16 bytes), <Value> (7 bytes)
+        if bytes.len() - l >= 16 && &bytes[l..l + 16] == b"<FormattedValue>" {
+            match raw_text_until_fast(bytes, l + 16, CLOSE_FORMATTED_NAME, regions) {
+                Some((raw, after, has_entity)) => {
+                    assign_text(&mut text, raw, has_entity);
+                    cur = after;
+                }
+                None => return Flow::Truncated,
+            }
+        } else if bytes.len() - l >= 7 && &bytes[l..l + 7] == b"<Value>" {
+            match raw_text_until_fast(bytes, l + 7, CLOSE_VALUE_NAME, regions) {
+                Some((raw, after, has_entity)) => {
+                    assign_text(&mut text, raw, has_entity);
                     cur = after;
                 }
                 None => return Flow::Truncated,
             }
         } else {
+            // Unknown tag — fall back to generic scan_open_tag
+            let inner = match scan_open_tag(bytes, l) {
+                Some(c) => c,
+                None => return Flow::Truncated,
+            };
             cur = inner.after();
         }
     }
@@ -433,7 +450,16 @@ fn text_element<'a, S: ColumnarSink + ?Sized>(
             cur = region_end(regions, l);
             continue;
         }
-        if bytes[l + 1] == b'/' {
+        // --- Speculative literal matching (fixed grammar) ---
+        // Inside <Text>, only <TextValue> and </Text> appear.
+        let after_lt = l + 1;
+        if bytes[after_lt] == b'/' {
+            // Close tag: try </Text> (6 bytes)
+            if bytes.len() - after_lt >= 6 && &bytes[after_lt..after_lt + 6] == b"/Text>" {
+                let after = after_lt + 6;
+                sink.resolve_and_put(&key, Value::Str(text));
+                return Flow::At(after);
+            }
             let (name, after) = match scan_close_tag(bytes, l) {
                 Some(x) => x,
                 None => return Flow::Truncated,
@@ -445,26 +471,27 @@ fn text_element<'a, S: ColumnarSink + ?Sized>(
             cur = after;
             continue;
         }
-        if bytes[l + 1] == b'!' || bytes[l + 1] == b'?' {
+        if bytes[after_lt] == b'!' || bytes[after_lt] == b'?' {
             cur = match skip_construct(bytes, l) {
                 Some(p) => p,
                 None => return Flow::Truncated,
             };
             continue;
         }
-        let inner = match scan_open_tag(bytes, l) {
-            Some(c) => c,
-            None => return Flow::Truncated,
-        };
-        if inner.name == b"TextValue" && !inner.self_closing {
-            match raw_text_until(bytes, inner.after(), &CLOSE_TEXTVALUE, PAT_TEXT_VALUE, regions) {
-                Some((raw, after)) => {
-                    assign_text(&mut text, raw);
+        // Open tag: try <TextValue> (11 bytes)
+        if bytes.len() - l >= 11 && &bytes[l..l + 11] == b"<TextValue>" {
+            match raw_text_until_fast(bytes, l + 11, CLOSE_TEXTVALUE_NAME, regions) {
+                Some((raw, after, has_entity)) => {
+                    assign_text(&mut text, raw, has_entity);
                     cur = after;
                 }
                 None => return Flow::Truncated,
             }
         } else {
+            let inner = match scan_open_tag(bytes, l) {
+                Some(c) => c,
+                None => return Flow::Truncated,
+            };
             cur = inner.after();
         }
     }
@@ -524,6 +551,12 @@ fn scan_byte(haystack: &[u8], needle: u8) -> Option<usize> {
 /// Offset of the next `<` at or after `from`.
 #[inline(always)]
 fn next_lt(bytes: &[u8], from: usize) -> Option<usize> {
+    // Fast path: contiguous XML has no whitespace between tags, so the byte
+    // at `from` is `<` on two of three calls per <Field>.  Avoids the AVX2
+    // prologue cost of memchr for the common case.
+    if from < bytes.len() && bytes[from] == b'<' {
+        return Some(from);
+    }
     scan_byte(&bytes[from..], b'<').map(|rel| from + rel)
 }
 
@@ -693,16 +726,25 @@ fn find_attr_value<'a>(interior: &'a [u8], keys: &[&[u8]]) -> Result<Option<&'a 
     Ok(None)
 }
 
-/// Cached searchers for the fixed CR close tags. `memmem::find` would
-/// rebuild per-call state for every one of the ~1.4M close-tag searches in a
-/// 100 MB file; the Finder is precomputed once instead.
+/// Cached searchers for container close tags (`</Field>`, `</Text>`).
+/// These tags enclose children, so `memmem` on the full close-tag pattern
+/// is faster than scanning for `<` and verifying: the body contains real
+/// `<` characters (e.g. `<FormattedValue>`) that would become false
+/// candidates for a candidate-plus-verify loop.
 static CLOSE_FIELD: LazyLock<memmem::Finder> = LazyLock::new(|| memmem::Finder::new("</Field"));
 static CLOSE_TEXT: LazyLock<memmem::Finder> = LazyLock::new(|| memmem::Finder::new("</Text"));
-static CLOSE_VALUE: LazyLock<memmem::Finder> = LazyLock::new(|| memmem::Finder::new("</Value"));
-static CLOSE_FORMATTED: LazyLock<memmem::Finder> =
-    LazyLock::new(|| memmem::Finder::new("</FormattedValue"));
-static CLOSE_TEXTVALUE: LazyLock<memmem::Finder> =
-    LazyLock::new(|| memmem::Finder::new("</TextValue"));
+
+/// Name suffixes for leaf close tags (after the leading `<`).
+/// These elements contain only text, so `<` never appears unescaped inside
+/// them. Scanning for `<` with memchr and verifying `/name` is cheaper than
+/// a multi-byte `memmem` search.
+const CLOSE_VALUE_NAME: &[u8] = b"/Value";
+const CLOSE_FORMATTED_NAME: &[u8] = b"/FormattedValue";
+const CLOSE_TEXTVALUE_NAME: &[u8] = b"/TextValue";
+
+/// Pattern lengths (`</` + name) for advancing past a found close tag.
+const PAT_FIELD: usize = 7;
+const PAT_TEXT: usize = 6;
 
 // Searchers for skip_construct (comments / CDATA end markers).
 static COMMENT_END: LazyLock<memmem::Finder> =
@@ -713,13 +755,6 @@ static CDATA_END: LazyLock<memmem::Finder> =
 // Searchers for estimate_bytes_per_row (row-tag prefix).
 static DETAILS_OPEN: LazyLock<memmem::Finder> =
     LazyLock::new(|| memmem::Finder::new("<Details"));
-
-/// Pattern lengths (`</` + name) for advancing past a found close tag.
-const PAT_FIELD: usize = 7;
-const PAT_TEXT: usize = 6;
-const PAT_FORMATTED_VALUE: usize = 16;
-const PAT_VALUE: usize = 7;
-const PAT_TEXT_VALUE: usize = 11;
 
 #[inline]
 fn close_boundary_ok(bytes: &[u8], after_pat: usize) -> bool {
@@ -732,6 +767,10 @@ fn close_boundary_ok(bytes: &[u8], after_pat: usize) -> bool {
 
 /// Find the first valid `</name ...>` close tag at or after `from`,
 /// skipping comment/CDATA regions. Returns the offset just past its `>`.
+/// Used for dynamic names (row close tags) and for static container close
+/// tags (`</Field>`, `</Text>`) whose bodies contain real `<` characters.
+/// Leaf close tags use the `_fast` variants below, which scan for `<` with
+/// memchr and verify only the fixed suffix.
 fn find_close_after(
     bytes: &[u8],
     from: usize,
@@ -764,6 +803,58 @@ fn find_row_close(bytes: &[u8], from: usize, row_tag: &[u8], regions: &[Range<us
     find_close_after(bytes, from, &finder, pat.len(), regions)
 }
 
+/// Fast variant of `find_close_start` for static close-tag names.
+/// Also detects `&` entities in the scanned range to avoid a second pass.
+#[inline]
+fn find_close_start_fast(
+    bytes: &[u8],
+    from: usize,
+    name: &[u8],
+    regions: &[Range<usize>],
+) -> Option<(usize, bool)> {
+    let mut search = from;
+    let mut has_entity = false;
+    // Use memchr2 to find both `<` (close tag) and `&` (entity) in one pass.
+    while let Some(rel) = memchr2(b'<', b'&', &bytes[search..]) {
+        let byte = bytes[search + rel];
+        if byte == b'&' {
+            has_entity = true;
+            search = search + rel + 1;
+            continue;
+        }
+        // byte == b'<'
+        let at = search + rel;
+        let after_name = at + 1 + name.len();
+        if after_name > bytes.len() {
+            return None;
+        }
+        if bytes[at + 1..].starts_with(name)
+            && close_boundary_ok(bytes, after_name)
+            && !in_region(regions, at)
+        {
+            return Some((at, has_entity));
+        }
+        search = at + 1;
+    }
+    None
+}
+
+/// Fast variant of `raw_text_until` for static close-tag names.
+/// Returns `(raw_text, offset_after_close_gt, has_entity)`.
+#[inline]
+fn raw_text_until_fast<'a>(
+    bytes: &'a [u8],
+    content_start: usize,
+    name: &[u8],
+    regions: &[Range<usize>],
+) -> Option<(&'a [u8], usize, bool)> {
+    let (close_lt, has_entity) = find_close_start_fast(bytes, content_start, name, regions)?;
+    let after_name = close_lt + 1 + name.len();
+    let gt_rel = scan_byte(&bytes[after_name..], b'>')?;
+    let after = after_name + gt_rel + 1;
+    Some((&bytes[content_start..close_lt], after, has_entity))
+}
+
 /// Count `<Field` occurrences in a byte slice (for profiling: how many fields
 /// were skipped when a row was rejected).
 #[cfg(feature = "profile")]
@@ -783,67 +874,27 @@ fn count_field_openings(region: &[u8]) -> u64 {
     count
 }
 
-/// Raw text between an already-scanned open tag and its matching close tag.
-/// Returns the raw byte slice and the offset just past the close tag.
-fn raw_text_until<'a>(
-    bytes: &'a [u8],
-    content_start: usize,
-    finder: &memmem::Finder,
-    pat_len: usize,
-    regions: &[Range<usize>],
-) -> Option<(&'a [u8], usize)> {
-    let close_lt = find_close_start(bytes, content_start, finder, pat_len, regions)?;
-    let after_name = close_lt + pat_len;
-    let gt_rel = scan_byte(&bytes[after_name..], b'>')?;
-    let after = after_name + gt_rel + 1;
-    Some((&bytes[content_start..close_lt], after))
-}
-
-fn find_close_start(
-    bytes: &[u8],
-    from: usize,
-    finder: &memmem::Finder,
-    pat_len: usize,
-    regions: &[Range<usize>],
-) -> Option<usize> {
-    let hay = &bytes[from..];
-    let mut search = 0usize;
-    while let Some(rel) = finder.find(&hay[search..]) {
-        let at = from + search + rel;
-        let after_pat = at + pat_len;
-        if !close_boundary_ok(bytes, after_pat) || in_region(regions, at) {
-            search = search + rel + 1;
-            continue;
-        }
-        return Some(at);
-    }
-    None
-}
-
 /// Decode an attribute value: unescape only when an entity is present.
+/// Decode an attribute value: unescape only when an entity is present.
+/// Attribute values aren't covered by the fused `&` scan, so scan here.
 fn decode_attr(raw: &[u8]) -> Cow<'_, str> {
-    decode_bytes(raw)
+    let has_entity = scan_byte(raw, b'&').is_some();
+    decode_bytes(raw, has_entity)
 }
 
 /// Assign captured text following quick-xml semantics: only a non-empty body
 /// not starting with markup corresponds to a Text event.
-fn assign_text<'a>(slot: &mut Cow<'a, str>, raw: &'a [u8]) {
+#[inline]
+fn assign_text<'a>(slot: &mut Cow<'a, str>, raw: &'a [u8], has_entity: bool) {
     if raw.is_empty() || raw[0] == b'<' {
         return;
     }
-    *slot = decode_text(raw);
+    *slot = decode_bytes(raw, has_entity);
 }
 
-/// Text content: cut at the first `<` (quick-xml reads a single Text event),
-/// then unescape when an entity is present.
-fn decode_text(raw: &[u8]) -> Cow<'_, str> {
-    let cut = scan_byte(raw, b'<').unwrap_or(raw.len());
-    decode_bytes(&raw[..cut])
-}
-
-fn decode_bytes(raw: &[u8]) -> Cow<'_, str> {
+fn decode_bytes(raw: &[u8], has_entity: bool) -> Cow<'_, str> {
     let s = utf8_unchecked(raw);
-    if scan_byte(raw, b'&').is_none() {
+    if !has_entity {
         Cow::Borrowed(s)
     } else {
         quick_xml::escape::unescape(s).unwrap_or(Cow::Borrowed(s))
@@ -854,6 +905,7 @@ fn decode_bytes(raw: &[u8]) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use rypipe_core::Splitter;
 
     use std::sync::Arc;
 
@@ -1222,6 +1274,7 @@ mod tests {
 mod perf {
     use super::*;
     use rypipe_core::Result as RResult;
+    use rypipe_core::Splitter;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -1416,6 +1469,14 @@ mod perf {
         let mb = bytes.len() as f64 / 1024.0 / 1024.0;
         let n = 7usize; // median-of-7
 
+        // Capacity hint matching the production paths: estimate bytes/row from
+        // the first 64 KiB, then reserve for the expected row count. Without
+        // this the benchmark's TableBuilder reallocates heavily on large files,
+        // inflating push/build tiers and their variance.
+        let est_row = crate::xml::CrystalXmlSplitter::with_row_tag("Details")
+            .estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
+        let cap = (bytes.len() / est_row.max(512)).max(64);
+
         // BENCH_TIER env var: run only the named tier (for isolated perf stat).
         // Empty or unset = run all tiers.
         let bench_tier = std::env::var("BENCH_TIER").unwrap_or_default();
@@ -1423,7 +1484,7 @@ mod perf {
         // Warmup all tiers (skip when running single tier for perf stat)
         if bench_tier.is_empty() {
             {
-                let mut wf = rypipe_core::TableBuilder::with_capacity(100_000);
+                let mut wf = rypipe_core::TableBuilder::with_capacity(cap);
                 scan_chunk(&bytes, b"Details", &mut wf).unwrap();
                 let _ = wf.finish();
             }
@@ -1487,7 +1548,30 @@ mod perf {
             scan_chunk(&bytes, b"Details", &mut loc).unwrap();
         }) } else { (0.0, 0.0) };
 
-        // --- Tier 4: push_only (scan + per-field push, no finish_row) ---
+        // --- Tier 4: extract_only (scan + value extraction, no sink call) ---
+        // needs_value=true forces the scanner to extract text/unescape, but the
+        // sink discards it.  This isolates adapter-side extraction cost from
+        // engine-side push cost.
+        struct ExtractOnly;
+        impl ColumnarSink for ExtractOnly {
+            #[inline] fn begin_row(&mut self) {}
+            #[inline] fn put_field(&mut self, _name: &str, _value: Value<'_>) {}
+            #[inline] fn end_row(&mut self) {}
+            #[inline] fn wants(&self, _name: &str) -> bool { true }
+            #[inline] fn resolve<'a>(&'a self, name: &'a str) -> Option<&'a str> { Some(name) }
+            #[inline] fn put_field_resolved(&mut self, _name: &str, _value: Value<'_>) {}
+            #[inline] fn resolve_and_put(&mut self, _name: &str, _value: Value<'_>) {}
+            #[inline] fn needs_value(&self) -> bool { true }
+            fn finish(&mut self) -> RResult<RecordBatch> {
+                Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+            }
+        }
+        let (t_extract, cov_extract) = if run("extract") { bench(n, || {
+            let mut ex = ExtractOnly;
+            scan_chunk(&bytes, b"Details", &mut ex).unwrap();
+        }) } else { (0.0, 0.0) };
+
+        // --- Tier 5: push_only (scan + per-field push, no finish_row) ---
         // end_row calls advance_row() only — skips null-fill, dirty-mask clear,
         // and filter check.  This isolates per-field push cost from per-row
         // finalization cost.
@@ -1519,22 +1603,22 @@ mod perf {
             }
         }
         let (t_push, cov_push) = if run("push") { bench(n, || {
-            let mut pb = PushOnly { inner: rypipe_core::TableBuilder::with_capacity(100_000) };
+            let mut pb = PushOnly { inner: rypipe_core::TableBuilder::with_capacity(cap) };
             scan_chunk(&bytes, b"Details", &mut pb).unwrap();
         }) } else { (0.0, 0.0) };
 
-        // --- Tier 5: build_only (scan + sink, no Arrow export) ---
+        // --- Tier 6: build_only (scan + sink, no Arrow export) ---
         let (t_build, cov_build) = if run("build") { bench(n, || {
-            let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
+            let mut tb = rypipe_core::TableBuilder::with_capacity(cap);
             scan_chunk(&bytes, b"Details", &mut tb).unwrap();
             // Do NOT call tb.finish() — this isolates scan+push from Arrow export.
         }) } else { (0.0, 0.0) };
 
-        // --- Tier 6: full_parse (scan + sink + Arrow export) ---
+        // --- Tier 7: full_parse (scan + sink + Arrow export) ---
         let mut last_rows = 0usize;
         let mut last_cols = 0usize;
         let (t_full, cov_full) = if run("full") { bench(n, || {
-            let mut tb = rypipe_core::TableBuilder::with_capacity(100_000);
+            let mut tb = rypipe_core::TableBuilder::with_capacity(cap);
             scan_chunk(&bytes, b"Details", &mut tb).unwrap();
             let batch = tb.finish().unwrap();
             last_rows = batch.num_rows();
@@ -1568,6 +1652,7 @@ mod perf {
         row!("scan_only", t_scan, cov_scan);
         row!("traverse", t_trav, cov_trav);
         row!("locate", t_loc, cov_loc);
+        row!("extract_only", t_extract, cov_extract);
         row!("push_only", t_push, cov_push);
         row!("build_only", t_build, cov_build);
         row!("full_parse", t_full, cov_full);
@@ -1575,7 +1660,8 @@ mod perf {
         // Sanity: deltas must sum to total (skip when running single tier)
         if bench_tier.is_empty() {
             let delta_sum = (t_scan + (t_trav - t_scan) + (t_loc - t_trav)
-                + (t_push - t_loc) + (t_build - t_push) + (t_full - t_build)) / mb * 1000.0;
+                + (t_extract - t_loc) + (t_push - t_extract)
+                + (t_build - t_push) + (t_full - t_build)) / mb * 1000.0;
             let total_ms = t_full / mb * 1000.0;
             assert!((delta_sum - total_ms).abs() < 0.001,
                 "ladder reconciliation failed: deltas sum to {delta_sum:.3} but total is {total_ms:.3}");
@@ -1585,7 +1671,8 @@ mod perf {
         println!("  scan_only:    {:.3} ± {:.1}% ms/MB", t_scan / mb * 1000.0, cov_scan * 100.0);
         println!("  traverse:     {:.3} ± {:.1}% ms/MB  (+{:.3})", t_trav / mb * 1000.0, cov_trav * 100.0, (t_trav - t_scan) / mb * 1000.0);
         println!("  locate:       {:.3} ± {:.1}% ms/MB  (+{:.3})", t_loc / mb * 1000.0, cov_loc * 100.0, (t_loc - t_trav) / mb * 1000.0);
-        println!("  push_only:    {:.3} ± {:.1}% ms/MB  (+{:.3})", t_push / mb * 1000.0, cov_push * 100.0, (t_push - t_loc) / mb * 1000.0);
+        println!("  extract_only: {:.3} ± {:.1}% ms/MB  (+{:.3})", t_extract / mb * 1000.0, cov_extract * 100.0, (t_extract - t_loc) / mb * 1000.0);
+        println!("  push_only:    {:.3} ± {:.1}% ms/MB  (+{:.3})", t_push / mb * 1000.0, cov_push * 100.0, (t_push - t_extract) / mb * 1000.0);
         println!("  build_only:   {:.3} ± {:.1}% ms/MB  (+{:.3})", t_build / mb * 1000.0, cov_build * 100.0, (t_build - t_push) / mb * 1000.0);
         println!("  full_parse:   {:.3} ± {:.1}% ms/MB  (+{:.3})", t_full / mb * 1000.0, cov_full * 100.0, (t_full - t_build) / mb * 1000.0);
         println!("  total:        {:.3} ms/MB", t_full / mb * 1000.0);
