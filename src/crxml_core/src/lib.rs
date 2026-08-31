@@ -391,8 +391,10 @@ pub fn read_to_columnar_multi(
     let cap = (bytes.len() / est_row.max(512)).max(64);
     let mut merged = rypipe_core::TableBuilder::with_plan(cap, plan.clone());
     for range in ranges {
-        let mut sink =
-            rypipe_core::TableBuilder::with_plan((range.len() / est_row.max(512)).max(64), plan.clone());
+        let mut sink = rypipe_core::TableBuilder::with_plan(
+            (range.len() / est_row.max(512)).max(64),
+            plan.clone(),
+        );
         decoder.validate(&bytes[range.clone()]).map_err(|e| {
             XmlError::new_err(format!("Columnar parse error in chunk {:?}: {}", range, e))
         })?;
@@ -660,7 +662,9 @@ impl<'a> rypipe_core::ColumnarSink for RowSink<'a> {
     #[inline]
     fn end_row(&mut self) {}
     fn finish(&mut self) -> rypipe_core::Result<RecordBatch> {
-        Ok(RecordBatch::new_empty(std::sync::Arc::new(arrow::datatypes::Schema::empty())))
+        Ok(RecordBatch::new_empty(std::sync::Arc::new(
+            arrow::datatypes::Schema::empty(),
+        )))
     }
 }
 
@@ -696,7 +700,13 @@ impl RowParser {
         self.row.clear();
         let bytes = self.input.as_slice();
         let mut sink = RowSink { row: &mut self.row };
-        match crate::xml::scanner::scan_one_row(bytes, self.pos, &self.row_tag, &self.regions, &mut sink) {
+        match crate::xml::scanner::scan_one_row(
+            bytes,
+            self.pos,
+            &self.row_tag,
+            &self.regions,
+            &mut sink,
+        ) {
             Some(next) => {
                 self.pos = next;
                 Ok(Some(self.row.len()))
@@ -851,7 +861,9 @@ enum StreamingIter {
 }
 
 impl StreamingIter {
-    fn next_batch(&mut self) -> Option<Result<arrow::record_batch::RecordBatch, rypipe_core::Error>> {
+    fn next_batch(
+        &mut self,
+    ) -> Option<Result<arrow::record_batch::RecordBatch, rypipe_core::Error>> {
         match self {
             StreamingIter::Single(it) => it.next(),
             StreamingIter::Parallel(it) => it.next(),
@@ -873,18 +885,26 @@ impl PyStreamingBatchIterator {
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         // Take the iterator out without holding the lock while blocking
         let mut iter_opt = {
-            let mut guard = self.inner.lock().map_err(|_| PyException::new_err("iterator poisoned"))?;
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| PyException::new_err("iterator poisoned"))?;
             guard.take()
         };
         if iter_opt.is_none() {
             return Ok(None);
         }
         let next = py.allow_threads(|| iter_opt.as_mut().unwrap().next_batch());
-        let mut guard = self.inner.lock().map_err(|_| PyException::new_err("iterator poisoned"))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| PyException::new_err("iterator poisoned"))?;
         match next {
             Some(Ok(batch)) => {
                 *guard = iter_opt;
-                let obj = batch.to_pyarrow(py).map_err(|e| PyException::new_err(e.to_string()))?;
+                let obj = batch
+                    .to_pyarrow(py)
+                    .map_err(|e| PyException::new_err(e.to_string()))?;
                 Ok(Some(obj.into()))
             }
             Some(Err(e)) => {
@@ -932,34 +952,41 @@ pub fn iter_record_batches(
         Python::with_gil(|py| -> PyResult<rypipe_core::MemoryBudget> {
             let mem_obj = match &memory {
                 Some(o) => o,
-                None => return Ok(rypipe_core::MemoryBudget::new(64*1024*1024)),
+                None => return Ok(rypipe_core::MemoryBudget::new(64 * 1024 * 1024)),
             };
             if let Ok(val) = mem_obj.extract::<usize>(py) {
                 Ok(rypipe_core::MemoryBudget::new(val.max(1)))
             } else if let Ok(s) = mem_obj.extract::<String>(py) {
                 let s = s.trim().to_string();
                 let (num_str, unit) = if s.to_lowercase().ends_with("kb") {
-                    (s[..s.len()-2].to_string(), "KB")
+                    (s[..s.len() - 2].to_string(), "KB")
                 } else if s.to_lowercase().ends_with("mb") {
-                    (s[..s.len()-2].to_string(), "MB")
+                    (s[..s.len() - 2].to_string(), "MB")
                 } else if s.to_lowercase().ends_with("gb") {
-                    (s[..s.len()-2].to_string(), "GB")
+                    (s[..s.len() - 2].to_string(), "GB")
                 } else if s.to_lowercase().ends_with("b") {
-                    (s[..s.len()-1].to_string(), "B")
+                    (s[..s.len() - 1].to_string(), "B")
                 } else {
                     (s.clone(), "B")
                 };
-                let num: f64 = num_str.parse().map_err(|_| PyException::new_err(format!("invalid memory {:?}", s)))?;
+                let num: f64 = num_str
+                    .parse()
+                    .map_err(|_| PyException::new_err(format!("invalid memory {:?}", s)))?;
                 let mult = match unit {
                     "B" => 1,
                     "KB" => 1024,
-                    "MB" => 1024*1024,
-                    "GB" => 1024*1024*1024,
+                    "MB" => 1024 * 1024,
+                    "GB" => 1024 * 1024 * 1024,
                     _ => 1,
                 };
-                Ok(rypipe_core::MemoryBudget::new(((num * mult as f64) as usize).max(1)))
+                Ok(rypipe_core::MemoryBudget::new(
+                    ((num * mult as f64) as usize).max(1),
+                ))
             } else {
-                Err(PyException::new_err(format!("invalid memory {:?}", mem_obj)))
+                Err(PyException::new_err(format!(
+                    "invalid memory {:?}",
+                    mem_obj
+                )))
             }
         })?
     };
@@ -971,7 +998,9 @@ pub fn iter_record_batches(
     let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
     let parser = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let num_threads = threads.unwrap_or_else(|| {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     });
     let iter = if num_threads > 1 {
         let opts = rypipe_core::ParallelStreamOpts {
@@ -999,7 +1028,9 @@ pub fn iter_record_batches(
             prefault,
         ))
     };
-    Ok(PyStreamingBatchIterator { inner: std::sync::Mutex::new(Some(iter)) })
+    Ok(PyStreamingBatchIterator {
+        inner: std::sync::Mutex::new(Some(iter)),
+    })
 }
 
 #[pyfunction]
@@ -1036,10 +1067,13 @@ pub fn discover_schema(
     let parser = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let input = rypipe_core::InputBuffer::open(p, true, false).map_err(map_rypipe_err)?;
     let bytes = input.as_slice();
-    let frozen = rypipe_core::parallel_stream::discover_schema_for_bytes(
-        bytes, &splitter, &parser, &plan,
-    );
-    Ok(frozen.column_names().iter().map(|s| s.to_string()).collect())
+    let frozen =
+        rypipe_core::parallel_stream::discover_schema_for_bytes(bytes, &splitter, &parser, &plan);
+    Ok(frozen
+        .column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect())
 }
 
 #[pymodule]

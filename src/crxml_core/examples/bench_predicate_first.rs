@@ -5,7 +5,7 @@
 //!   cargo run --release --features profile --example bench_predicate_first
 
 use _crxml_core::xml::scanner::scan_chunk;
-use rypipe_core::{ExecutionPlan, FilterPredicate, FieldType, TableBuilder};
+use rypipe_core::{ExecutionPlan, FieldType, FilterPredicate, TableBuilder};
 
 // Profile counters from crxml-core (behind feature gate)
 #[cfg(feature = "profile")]
@@ -40,7 +40,10 @@ fn reset_counters() {}
 #[cfg(feature = "profile")]
 fn load_counters() -> (u64, u64) {
     use std::sync::atomic::Ordering;
-    (REJECTED_ROWS.load(Ordering::Relaxed), SKIPPED_FIELDS.load(Ordering::Relaxed))
+    (
+        REJECTED_ROWS.load(Ordering::Relaxed),
+        SKIPPED_FIELDS.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(not(feature = "profile"))]
@@ -102,7 +105,10 @@ fn main() {
         let _ = tb.finish();
     });
     println!("\n{:=<78}", "");
-    println!("UNFILTERED  {t_unfiltered:.4}s  {:.0} MB/s", mb / t_unfiltered);
+    println!(
+        "UNFILTERED  {t_unfiltered:.4}s  {:.0} MB/s",
+        mb / t_unfiltered
+    );
     println!("{:=<78}", "");
 
     // ── (B) Sweep: predicate column position × selectivity ──────────
@@ -120,23 +126,16 @@ fn main() {
     ];
 
     let selectivities: &[(&str, Box<dyn Fn(&str) -> FilterPredicate>)] = &[
-        (
-            "0% (reject all)",
-            Box::new(|f| eq_pred(f, "nonexistent")),
-        ),
-        (
-            "~6% (accept ~6%)",
-            Box::new(|f| eq_pred(f, "01-00123")),
-        ),
-        (
-            "100% (accept all)",
-            Box::new(|f| ne_pred(f, "nonexistent")),
-        ),
+        ("0% (reject all)", Box::new(|f| eq_pred(f, "nonexistent"))),
+        ("~6% (accept ~6%)", Box::new(|f| eq_pred(f, "01-00123"))),
+        ("100% (accept all)", Box::new(|f| ne_pred(f, "nonexistent"))),
     ];
 
     println!("\n{:=<78}", "");
-    println!("{:<12} {:<22} {:>8} {:>10} {:>6} {:>8}", 
-             "Position", "Selectivity", "Time(s)", "MB/s", "vs Base", "Rows");
+    println!(
+        "{:<12} {:<22} {:>8} {:>10} {:>6} {:>8}",
+        "Position", "Selectivity", "Time(s)", "MB/s", "vs Base", "Rows"
+    );
     println!("{:-<78}", "");
 
     for (field_name, pos_label) in &positions {

@@ -13,6 +13,19 @@ The suite generates its own synthetic files (10/50/100 MB) into
 `bench_data/` on first run; the 533 MB real-export number requires a file
 that is not distributed with the repo.
 
+To generate an anonymized corpus matching the structural shape of a local XML
+file, without copying its values or identifiers:
+
+```bash
+python scripts/generate_synthetic_benchmark.py \
+  --source ~/Downloads/base-data.xml \
+  --output bench_data/synthetic_533mb.xml \
+  --target-mib 533
+```
+
+The generator inspects only row/child-element counts and emits generic field
+names and deterministic synthetic values.
+
 ## Run
 
 ```bash
