@@ -10,7 +10,18 @@ PAGE: https://crxml.emiliano-go.com/api/
 ## CrystalXMLSource
 
 ```python
-CrystalXMLSource(source: str | Path, *, row_tag: str = "Row")
+CrystalXMLSource(source: str | Path, *, row_tag: str = "Row",
+                 engine: str = "auto", threads: int = 0,
+                 memory: str | int | None = None,
+                 field_mapping: dict[str, str] | None = None,
+                 drop_fields: list[str] | None = None,
+                 filter: dict | None = None,
+                 field_types: dict[str, str] | None = None,
+                 dictionary_columns: list[str] | None = None,
+                 schema: list[str] | None = None,
+                 auto_dict: bool = False,
+                 use_mmap: bool = True,
+                 batch_size: int = 1024)
 ```
 
 | Param     | Type               | Default   | Description                   |
@@ -63,6 +74,8 @@ DropFields(fields: list[str])
 
 ```python
 FilterRows(predicate: Callable[[dict], bool])
+FilterRows(field=, op=, value=)
+FilterRows(field_a=, op=, field_b=)
 ```
 
 | Param      | Type                       | Description                      |
@@ -74,7 +87,8 @@ FilterRows(predicate: Callable[[dict], bool])
 ## Pipeline
 
 ```python
-Pipeline(source: Iterable[dict], *stages: Stage)
+Pipeline(source: Iterable[dict], stages: list[Stage] | None = None,
+         *, batch_size: int = 1000, workers: int | None = None)
 ```
 
 Created implicitly via `|`. Not typically constructed directly.
@@ -348,7 +362,7 @@ All public symbols are lazily imported via `__getattr__`. `import crxml` is inst
 Wraps the Rust engines. Constructor parameters map one-to-one to `ExecutionPlan` fields plus engine selection:
 
 - `engine`: `"auto"` (default), `"stream"`, `"columnar"`, `"parallel"`
-- `threads`: multiplied by **4** to get `num_chunks`. The 4x multiplier exists because finer chunks give better load balancing; VTune showed 3-4x optimal on 24 cores (beyond 4x, rayon join/spin overhead dominates).
+- `threads`: multiplied by **16** to get `num_chunks`. The 16x multiplier exists because finer chunks give better load balancing; VTune showed 3-4x optimal on 24 cores (beyond 4x, rayon join/spin overhead dominates).
 - `memory`: optional string (`"8GB"`) or int bytes; enables bounded mode.
 - `use_mmap`: memory-map the file (Unix only).
 - `batch_size`: rows per Rust→Python batch call (default 1024).
@@ -390,7 +404,7 @@ The 8 MB threshold exists because parallel overhead (chunking + rayon + merge) d
 
 ```python
 class Pipeline:
-    __slots__ = ("_source", "_stages", "_batch_size", "_prefetch", "_workers")
+    __slots__ = ("_source", "_stages", "_batch_size", "_workers")
 ```
 
 **`__or__(stage)`**: creates a new `Pipeline` with the stage appended. The original is unchanged:
@@ -640,7 +654,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 
 | Optimization | Location | Impact |
 |-------------|----------|--------|
-| `mimalloc` global allocator | `lib.rs:22` | ~27% CPU reduction in malloc/free |
+| `mimalloc` global allocator | `lib.rs:58` | ~27% CPU reduction in malloc/free |
 | `PyDict::new` (no presize) | `src/crxml_core/src/lib.rs` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
 | Key interning (`FxHashMap`) | `src/crxml_core/src/lib.rs` | Reuses `PyString` objects across rows |
 | SIMD UTF-8 validation | `rypipe_xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
@@ -829,6 +843,9 @@ a preview table:
 
 ```python
 # yourapp/views.py
+import os
+import tempfile
+
 from django.shortcuts import render
 from django.http import HttpResponseRedirect
 from django.urls import reverse
@@ -841,13 +858,19 @@ def preview_report(request):
     if request.method == "POST":
         form = ReportUploadForm(request.POST, request.FILES)
         if form.is_valid():
-            src = CrystalXMLSource(request.FILES["file"], row_tag="Details")
-            rows = [row for row in src]
-            return render(request, "preview.html", {
-                "fields": list(rows[0].keys()) if rows else [],
-                "rows": rows[:100],
-                "total": len(rows),
-            })
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                tmp.write(request.FILES["file"].read())
+                tmp_path = tmp.name
+            try:
+                source = CrystalXMLSource(tmp_path, row_tag="Details")
+                rows = [row for row in source]
+                return render(request, "preview.html", {
+                    "fields": list(rows[0].keys()) if rows else [],
+                    "rows": rows[:100],
+                    "total": len(rows),
+                })
+            finally:
+                os.unlink(tmp_path)
     else:
         form = ReportUploadForm()
 
@@ -886,6 +909,9 @@ a model:
 
 ```python
 # yourapp/admin.py
+import os
+import tempfile
+
 from django.contrib import admin, messages
 from django import forms
 from django.shortcuts import render
@@ -904,15 +930,21 @@ def import_from_xml(modeladmin, request, queryset):
         if request.method == "POST":
             form = UploadXMLForm(request.POST, request.FILES)
             if form.is_valid():
-                uploaded = request.FILES["file"]
-                rows = collect(CrystalXMLSource(uploaded.read(), row_tag="Details"))
-                for row in rows:
-                    Invoice.objects.create(
-                        number=row.get("{Report.InvoiceNo}", ""),
-                        customer=row.get("{Report.Customer}", ""),
-                        amount=row.get("{Report.Amount", 0),
-                    )
-                modeladmin.message_user(request, f"Imported {len(rows)} invoices")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                    tmp.write(request.FILES["file"].read())
+                    tmp_path = tmp.name
+                try:
+                    source = CrystalXMLSource(tmp_path, row_tag="Details")
+                    rows = collect(source)
+                    for row in rows:
+                        Invoice.objects.create(
+                            number=row.get("{Report.InvoiceNo}", ""),
+                            customer=row.get("{Report.Customer}", ""),
+                            amount=row.get("{Report.Amount}", 0),
+                        )
+                    modeladmin.message_user(request, f"Imported {len(rows)} invoices")
+                finally:
+                    os.unlink(tmp_path)
                 return
         else:
             form = UploadXMLForm()
@@ -1367,7 +1399,7 @@ def parse_mapped():
 Register an error handler for crxml-specific errors:
 
 ```python
-from crxml import UnpicklableStageError
+from crxml._crxml_core import UnpicklableStageError
 
 
 @app.errorhandler(UnpicklableStageError)
@@ -1488,7 +1520,7 @@ processing, and automatic query fusion.
 ## Features
 
 - Streaming: never loads the full file into memory
-- Fast: Rust parser via PyO3 + quick-xml
+- Fast: Rust parser via PyO3 + memchr scanner
 - Pipeline API: compose transformations with `|`
 - Parallel mode: multi-core batch processing
 - Pandas-native: direct to DataFrame or CSV
@@ -1543,9 +1575,10 @@ This requires the Rust toolchain.
 - Python ≥ 3.10
 - [Rust](https://rustup.rs) (stable)
 
-The Rust core fetches its engine dependency (`rypipe-core`) from crates.io, so
-no other repositories are needed: `pip install .` and maturin work from a
-plain checkout of crxml alone.
+The Rust core depends on `rypipe-core` via a **path dependency** on the
+sibling [rypipe](https://github.com/emiliano-go/rypipe) repository, so
+`rypipe` must be checked out next to `crxml` (i.e. `../rypipe` relative to
+the `crxml` root) for `pip install .` or `maturin develop` to succeed.
 
 ### Build the Rust core
 
@@ -2167,7 +2200,7 @@ pip install crxml prefect
 ```python
 from pathlib import Path
 from prefect import flow, task
-from crxml import CrystalXMLSource, RenameFields, CastTypes, to_csv
+from crxml import CrystalXMLSource, Pipeline, RenameFields, CastTypes, to_csv
 
 
 @task
@@ -2179,7 +2212,7 @@ def parse_report(path: str) -> list[dict]:
 @task
 def transform_rows(rows: list[dict]) -> list[dict]:
     pipe = (
-        rows
+        Pipeline(rows)
         | RenameFields({
             "{Report.InvoiceNo}": "invoice",
             "{Report.Customer}": "customer",
@@ -2383,16 +2416,17 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | `simdutf8`   | SIMD UTF-8 validation for the XML decoder |
 | `thiserror`  | Adapter error derives            |
 
-The `rypipe-core` crate is a versioned dependency resolved from crates.io
+The `rypipe-core` crate is a path dependency on the sibling
+[rypipe](https://github.com/emiliano-go/rypipe) repository
 (see `src/crxml_core/Cargo.toml`):
 
 ```toml
-rypipe-core = { version = "0.1", features = ["mmap"] }
+rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
 ```
 
-No sibling checkout is required to build crxml. To hack on the engine itself,
-clone [rypipe](https://github.com/emiliano-go/rypipe) separately and point the
-dependency at your checkout with a cargo `[patch]` entry.
+The `rypipe` checkout must sit next to the `crxml` checkout (i.e.
+`../rypipe/crates/rypipe-core` relative to the `crxml` root) for the path
+resolution to work.
 
 ## Building
 
@@ -2459,7 +2493,7 @@ grep -o '<[A-Za-z][A-Za-z0-9]*' report.xml | sort | uniq -c | sort -rn | head -1
 The most frequent non-wrapper tag is usually the row tag. Pass it explicitly:
 
 ```python
-src = CrystalXMLSource("report.xml", row_tag="Detail")
+src = CrystalXMLSource("report.xml", row_tag="Details")
 ```
 
 ### ValueError on bad CR XML
@@ -2474,11 +2508,10 @@ Crystal Reports schema. Check that:
 ### TypeError from CastTypes
 
 ```python
-CastTypes({"amount": float}, errors="raise")  # raises on uncastable values
+CastTypes({"amount": float})
 ```
 
-Use `errors="coerce"` to replace uncastable values with `None`, or
-`errors="skip"` to leave them unchanged.
+Raises `TypeError` if a value cannot be cast to the target type.
 
 ### UnpicklableStageError
 
@@ -2577,15 +2610,6 @@ Ensure you have the Rust toolchain installed:
 ```bash
 rustup install stable
 ```
-
-If building with the `columnar` feature, additional dependencies may be
-required (Arrow, Parquet). On Linux, install:
-
-```bash
-sudo apt-get install libarrow-dev libparquet-dev
-```
-
-For other platforms, see the Apache Arrow C++ install guide.
 
 ### How do I process files larger than RAM?
 
@@ -3012,7 +3036,7 @@ base = CrystalXMLSource("report.xml") | RenameFields(mapping)
 
 # These are independent, each re-reads the source
 pipe_a = base | CastTypes({"amount": float})
-pipe_b = base | DropFields("tax_rate")
+pipe_b = base | DropFields(["tax_rate"])
 ```
 
 ## Pipeline object
@@ -3065,8 +3089,9 @@ to_dataframe(pipeline, chunksize: int | None = None) -> pd.DataFrame
 
 Collects all rows into a pandas DataFrame.
 
-- `chunksize=None` (default): builds a list of dicts, then constructs the
-  DataFrame. Simple but memory-intensive for large outputs.
+- `chunksize=None` (default): tries the fast Arrow path first (`pipeline._to_arrow()`
+  → single `pyarrow.Table` → `table.to_pandas()`); falls back to a list-of-dicts
+  construction if the fast path is unavailable.
 - `chunksize=N`: incrementally builds the DataFrame in chunks of N rows,
   then concatenates. Lower peak memory.
 
@@ -3080,11 +3105,12 @@ df = to_dataframe(pipe, chunksize=10000)
 ## to_csv
 
 ```python
-to_csv(pipeline, path: str | Path, **csv_writer_kwargs) -> None
+to_csv(pipeline, path: str | Path, encoding: str = "utf-8",
+       delimiter: str = ",", fieldnames: list[str] | None = None) -> None
 ```
 
-Streams rows directly to CSV. Supports all `csv.writer` kwargs via
-`**csv_writer_kwargs`:
+Streams rows directly to CSV with the given `encoding`, `delimiter`, and
+optional explicit `fieldnames`:
 
 ```python
 from crxml import CrystalXMLSource, to_csv
@@ -3158,16 +3184,11 @@ RenameFields({"{Report.Vendor}": "supplier", "{Report.Price}": "cost"})
 ## CastTypes
 
 ```python
-CastTypes(types: dict[str, type], errors: str = "raise")
+CastTypes(types: dict[str, type])
 ```
 
-Casts specified fields to the given types.
-
-**`errors` modes:**
-
-- `"raise"` (default), raises `TypeError` on conversion failure
-- `"coerce"`, replaces uncastable values with `None`
-- `"skip"`, leaves uncastable values as-is
+Casts specified fields to the given types. Raises `TypeError` on conversion
+failure.
 
 **Example:**
 
@@ -3216,7 +3237,6 @@ FilterRows(lambda r: float(r.get("amt", 0)) > 100)
 
 - **RenameFields:** If a mapping key does not exist in the row, it is silently
   ignored. Duplicate target names are not checked, the last mapping wins.
-- **CastTypes:** When `errors="coerce"`, the coerced value is `None`. The
-  original key is always preserved in the output dict.
+- **CastTypes:** Raises `TypeError` if a value cannot be cast to the target type.
 - **DropFields:** Dropping a non-existent key is a no-op.
 - **FilterRows:** The predicate receives the row *after* all prior stages.

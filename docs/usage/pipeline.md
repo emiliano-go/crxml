@@ -32,7 +32,7 @@ base = CrystalXMLSource("report.xml") | RenameFields(mapping)
 
 # These are independent, each re-reads the source
 pipe_a = base | CastTypes({"amount": float})
-pipe_b = base | DropFields("tax_rate")
+pipe_b = base | DropFields(["tax_rate"])
 ```
 
 ## Pipeline object

@@ -14,7 +14,7 @@ pip install crxml prefect
 ```python
 from pathlib import Path
 from prefect import flow, task
-from crxml import CrystalXMLSource, RenameFields, CastTypes, to_csv
+from crxml import CrystalXMLSource, Pipeline, RenameFields, CastTypes, to_csv
 
 
 @task
@@ -26,7 +26,7 @@ def parse_report(path: str) -> list[dict]:
 @task
 def transform_rows(rows: list[dict]) -> list[dict]:
     pipe = (
-        rows
+        Pipeline(rows)
         | RenameFields({
             "{Report.InvoiceNo}": "invoice",
             "{Report.Customer}": "customer",

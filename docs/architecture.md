@@ -174,7 +174,7 @@ All public symbols are lazily imported via `__getattr__`. `import crxml` is inst
 Wraps the Rust engines. Constructor parameters map one-to-one to `ExecutionPlan` fields plus engine selection:
 
 - `engine`: `"auto"` (default), `"stream"`, `"columnar"`, `"parallel"`
-- `threads`: multiplied by **4** to get `num_chunks`. The 4x multiplier exists because finer chunks give better load balancing; VTune showed 3-4x optimal on 24 cores (beyond 4x, rayon join/spin overhead dominates).
+- `threads`: multiplied by **16** to get `num_chunks`. The 16x multiplier exists because finer chunks give better load balancing; VTune showed 3-4x optimal on 24 cores (beyond 4x, rayon join/spin overhead dominates).
 - `memory`: optional string (`"8GB"`) or int bytes; enables bounded mode.
 - `use_mmap`: memory-map the file (Unix only).
 - `batch_size`: rows per Rust→Python batch call (default 1024).
@@ -216,7 +216,7 @@ The 8 MB threshold exists because parallel overhead (chunking + rayon + merge) d
 
 ```python
 class Pipeline:
-    __slots__ = ("_source", "_stages", "_batch_size", "_prefetch", "_workers")
+    __slots__ = ("_source", "_stages", "_batch_size", "_workers")
 ```
 
 **`__or__(stage)`**: creates a new `Pipeline` with the stage appended. The original is unchanged:
@@ -466,7 +466,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 
 | Optimization | Location | Impact |
 |-------------|----------|--------|
-| `mimalloc` global allocator | `lib.rs:22` | ~27% CPU reduction in malloc/free |
+| `mimalloc` global allocator | `lib.rs:58` | ~27% CPU reduction in malloc/free |
 | `PyDict::new` (no presize) | `src/crxml_core/src/lib.rs` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
 | Key interning (`FxHashMap`) | `src/crxml_core/src/lib.rs` | Reuses `PyString` objects across rows |
 | SIMD UTF-8 validation | `rypipe_xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |

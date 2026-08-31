@@ -156,7 +156,7 @@ def parse_mapped():
 Register an error handler for crxml-specific errors:
 
 ```python
-from crxml import UnpicklableStageError
+from crxml._crxml_core import UnpicklableStageError
 
 
 @app.errorhandler(UnpicklableStageError)

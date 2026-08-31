@@ -1,7 +1,18 @@
 ## CrystalXMLSource
 
 ```python
-CrystalXMLSource(source: str | Path, *, row_tag: str = "Row")
+CrystalXMLSource(source: str | Path, *, row_tag: str = "Row",
+                 engine: str = "auto", threads: int = 0,
+                 memory: str | int | None = None,
+                 field_mapping: dict[str, str] | None = None,
+                 drop_fields: list[str] | None = None,
+                 filter: dict | None = None,
+                 field_types: dict[str, str] | None = None,
+                 dictionary_columns: list[str] | None = None,
+                 schema: list[str] | None = None,
+                 auto_dict: bool = False,
+                 use_mmap: bool = True,
+                 batch_size: int = 1024)
 ```
 
 | Param     | Type               | Default   | Description                   |
@@ -54,6 +65,8 @@ DropFields(fields: list[str])
 
 ```python
 FilterRows(predicate: Callable[[dict], bool])
+FilterRows(field=, op=, value=)
+FilterRows(field_a=, op=, field_b=)
 ```
 
 | Param      | Type                       | Description                      |
@@ -65,7 +78,8 @@ FilterRows(predicate: Callable[[dict], bool])
 ## Pipeline
 
 ```python
-Pipeline(source: Iterable[dict], *stages: Stage)
+Pipeline(source: Iterable[dict], stages: list[Stage] | None = None,
+         *, batch_size: int = 1000, workers: int | None = None)
 ```
 
 Created implicitly via `|`. Not typically constructed directly.

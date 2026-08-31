@@ -59,16 +59,17 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | `simdutf8`   | SIMD UTF-8 validation for the XML decoder |
 | `thiserror`  | Adapter error derives            |
 
-The `rypipe-core` crate is a versioned dependency resolved from crates.io
+The `rypipe-core` crate is a path dependency on the sibling
+[rypipe](https://github.com/emiliano-go/rypipe) repository
 (see `src/crxml_core/Cargo.toml`):
 
 ```toml
-rypipe-core = { version = "0.1", features = ["mmap"] }
+rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
 ```
 
-No sibling checkout is required to build crxml. To hack on the engine itself,
-clone [rypipe](https://github.com/emiliano-go/rypipe) separately and point the
-dependency at your checkout with a cargo `[patch]` entry.
+The `rypipe` checkout must sit next to the `crxml` checkout (i.e.
+`../rypipe/crates/rypipe-core` relative to the `crxml` root) for the path
+resolution to work.
 
 ## Building
 

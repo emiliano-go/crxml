@@ -24,7 +24,7 @@ grep -o '<[A-Za-z][A-Za-z0-9]*' report.xml | sort | uniq -c | sort -rn | head -1
 The most frequent non-wrapper tag is usually the row tag. Pass it explicitly:
 
 ```python
-src = CrystalXMLSource("report.xml", row_tag="Detail")
+src = CrystalXMLSource("report.xml", row_tag="Details")
 ```
 
 ### ValueError on bad CR XML
@@ -39,11 +39,10 @@ Crystal Reports schema. Check that:
 ### TypeError from CastTypes
 
 ```python
-CastTypes({"amount": float}, errors="raise")  # raises on uncastable values
+CastTypes({"amount": float})
 ```
 
-Use `errors="coerce"` to replace uncastable values with `None`, or
-`errors="skip"` to leave them unchanged.
+Raises `TypeError` if a value cannot be cast to the target type.
 
 ### UnpicklableStageError
 
@@ -142,15 +141,6 @@ Ensure you have the Rust toolchain installed:
 ```bash
 rustup install stable
 ```
-
-If building with the `columnar` feature, additional dependencies may be
-required (Arrow, Parquet). On Linux, install:
-
-```bash
-sudo apt-get install libarrow-dev libparquet-dev
-```
-
-For other platforms, see the Apache Arrow C++ install guide.
 
 ### How do I process files larger than RAM?
 

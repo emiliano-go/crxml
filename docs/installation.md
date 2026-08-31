@@ -27,9 +27,10 @@ This requires the Rust toolchain.
 - Python ≥ 3.10
 - [Rust](https://rustup.rs) (stable)
 
-The Rust core fetches its engine dependency (`rypipe-core`) from crates.io, so
-no other repositories are needed: `pip install .` and maturin work from a
-plain checkout of crxml alone.
+The Rust core depends on `rypipe-core` via a **path dependency** on the
+sibling [rypipe](https://github.com/emiliano-go/rypipe) repository, so
+`rypipe` must be checked out next to `crxml` (i.e. `../rypipe` relative to
+the `crxml` root) for `pip install .` or `maturin develop` to succeed.
 
 ### Build the Rust core
 

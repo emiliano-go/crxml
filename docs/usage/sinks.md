@@ -10,8 +10,9 @@ to_dataframe(pipeline, chunksize: int | None = None) -> pd.DataFrame
 
 Collects all rows into a pandas DataFrame.
 
-- `chunksize=None` (default): builds a list of dicts, then constructs the
-  DataFrame. Simple but memory-intensive for large outputs.
+- `chunksize=None` (default): tries the fast Arrow path first (`pipeline._to_arrow()`
+  → single `pyarrow.Table` → `table.to_pandas()`); falls back to a list-of-dicts
+  construction if the fast path is unavailable.
 - `chunksize=N`: incrementally builds the DataFrame in chunks of N rows,
   then concatenates. Lower peak memory.
 
@@ -25,11 +26,12 @@ df = to_dataframe(pipe, chunksize=10000)
 ## to_csv
 
 ```python
-to_csv(pipeline, path: str | Path, **csv_writer_kwargs) -> None
+to_csv(pipeline, path: str | Path, encoding: str = "utf-8",
+       delimiter: str = ",", fieldnames: list[str] | None = None) -> None
 ```
 
-Streams rows directly to CSV. Supports all `csv.writer` kwargs via
-`**csv_writer_kwargs`:
+Streams rows directly to CSV with the given `encoding`, `delimiter`, and
+optional explicit `fieldnames`:
 
 ```python
 from crxml import CrystalXMLSource, to_csv

@@ -63,6 +63,9 @@ a preview table:
 
 ```python
 # yourapp/views.py
+import os
+import tempfile
+
 from django.shortcuts import render
 from django.http import HttpResponseRedirect
 from django.urls import reverse
@@ -75,13 +78,19 @@ def preview_report(request):
     if request.method == "POST":
         form = ReportUploadForm(request.POST, request.FILES)
         if form.is_valid():
-            src = CrystalXMLSource(request.FILES["file"], row_tag="Details")
-            rows = [row for row in src]
-            return render(request, "preview.html", {
-                "fields": list(rows[0].keys()) if rows else [],
-                "rows": rows[:100],
-                "total": len(rows),
-            })
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                tmp.write(request.FILES["file"].read())
+                tmp_path = tmp.name
+            try:
+                source = CrystalXMLSource(tmp_path, row_tag="Details")
+                rows = [row for row in source]
+                return render(request, "preview.html", {
+                    "fields": list(rows[0].keys()) if rows else [],
+                    "rows": rows[:100],
+                    "total": len(rows),
+                })
+            finally:
+                os.unlink(tmp_path)
     else:
         form = ReportUploadForm()
 
@@ -120,6 +129,9 @@ a model:
 
 ```python
 # yourapp/admin.py
+import os
+import tempfile
+
 from django.contrib import admin, messages
 from django import forms
 from django.shortcuts import render
@@ -138,15 +150,21 @@ def import_from_xml(modeladmin, request, queryset):
         if request.method == "POST":
             form = UploadXMLForm(request.POST, request.FILES)
             if form.is_valid():
-                uploaded = request.FILES["file"]
-                rows = collect(CrystalXMLSource(uploaded.read(), row_tag="Details"))
-                for row in rows:
-                    Invoice.objects.create(
-                        number=row.get("{Report.InvoiceNo}", ""),
-                        customer=row.get("{Report.Customer}", ""),
-                        amount=row.get("{Report.Amount", 0),
-                    )
-                modeladmin.message_user(request, f"Imported {len(rows)} invoices")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                    tmp.write(request.FILES["file"].read())
+                    tmp_path = tmp.name
+                try:
+                    source = CrystalXMLSource(tmp_path, row_tag="Details")
+                    rows = collect(source)
+                    for row in rows:
+                        Invoice.objects.create(
+                            number=row.get("{Report.InvoiceNo}", ""),
+                            customer=row.get("{Report.Customer}", ""),
+                            amount=row.get("{Report.Amount}", 0),
+                        )
+                    modeladmin.message_user(request, f"Imported {len(rows)} invoices")
+                finally:
+                    os.unlink(tmp_path)
                 return
         else:
             form = UploadXMLForm()

@@ -20,16 +20,11 @@ RenameFields({"{Report.Vendor}": "supplier", "{Report.Price}": "cost"})
 ## CastTypes
 
 ```python
-CastTypes(types: dict[str, type], errors: str = "raise")
+CastTypes(types: dict[str, type])
 ```
 
-Casts specified fields to the given types.
-
-**`errors` modes:**
-
-- `"raise"` (default), raises `TypeError` on conversion failure
-- `"coerce"`, replaces uncastable values with `None`
-- `"skip"`, leaves uncastable values as-is
+Casts specified fields to the given types. Raises `TypeError` on conversion
+failure.
 
 **Example:**
 
@@ -78,7 +73,6 @@ FilterRows(lambda r: float(r.get("amt", 0)) > 100)
 
 - **RenameFields:** If a mapping key does not exist in the row, it is silently
   ignored. Duplicate target names are not checked, the last mapping wins.
-- **CastTypes:** When `errors="coerce"`, the coerced value is `None`. The
-  original key is always preserved in the output dict.
+- **CastTypes:** Raises `TypeError` if a value cannot be cast to the target type.
 - **DropFields:** Dropping a non-existent key is a no-op.
 - **FilterRows:** The predicate receives the row *after* all prior stages.

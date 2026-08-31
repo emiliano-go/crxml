@@ -10,7 +10,7 @@ processing, and automatic query fusion.
 ## Features
 
 - Streaming: never loads the full file into memory
-- Fast: Rust parser via PyO3 + quick-xml
+- Fast: Rust parser via PyO3 + memchr scanner
 - Pipeline API: compose transformations with `|`
 - Parallel mode: multi-core batch processing
 - Pandas-native: direct to DataFrame or CSV
