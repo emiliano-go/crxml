@@ -95,11 +95,11 @@ crxml skips the nesting:
 | 1 GB synthetic (Table) | 734 MB/s | 4278 MB/s `par128` | 3782 auto / ~4900 explicit |
 | Peak RssAnon (533 MB) | 24 MB (1 MB) | 137 MB | **88 MB** (auto or explicit) |
 | Pipeline fusion | No (dict path) | Yes (Rust BuildPlan) | Yes (same plan, streamed) |
-| `ParquetWriter` | — | — | `write_batch` now succeeds (batches share frozen schema `schema.rs:14`); before fix batch 2 order `FieldG` vs `Text20` last raised |
+| `ParquetWriter` | N/A | N/A | `write_batch` now succeeds (batches share frozen schema `schema.rs:14`); before fix batch 2 order `FieldG` vs `Text20` last raised |
 
 Auto discovery (16×2 MiB windows for >128 MB) adds ~15% (≈19 ms on 533 MB) so auto is **−14% vs par128** (3828 vs 4470) but still bounded and incremental. Explicit `schema=[...]` (`FrozenSchema::from_plan`) avoids Discovery and is **+11% vs par128** (4980 vs 4470). The old "fast or memory-safe" is now "fastest bounded needs explicit schema; auto is safe and bounded but slightly slower". Use `iter_record_batches(memory="64MB", threads=16, schema=[...])` for the fast path.
 
-[Full benchmark details](docs/performance.md) — like-for-like Table vs Vec, chunk-per-cell, fixed-chunk isolation, and frozen-schema cost.
+[Full benchmark details](docs/performance.md): like-for-like Table vs Vec, chunk-per-cell, fixed-chunk isolation, and frozen-schema cost.
 
 ---
 
@@ -133,18 +133,18 @@ profiling counters: `pip install -e . --config-settings=--features=profile`.
 
 ---
 
-## Engine guide — parallel streaming (frozen schema) is opt-in
+## Engine guide: parallel streaming (frozen schema) is opt-in
 
 | Engine / API | When to use | Throughput 533 MB / 1 GB | RssAnon |
 |---|---|---|---|
 | `stream` (`for row in source`) | Row-by-row dict iteration | 723 MB/s 1 MB budget (24 MB anon) | 24 MB |
 | `columnar` (`single`) | Single-threaded Arrow Table | 745 / 734 MB/s | 134 MB |
 | `parallel` (`par128` full RAM, 4 MB) | Fastest full-RAM Table | **4470 / 4278 MB/s** | 137 MB |
-| **`iter_record_batches(..., threads=16, schema=[...])` — explicit frozen** | **Fastest bounded, stable schema** — yields `RecordBatch`es | **4980 / ~4900 MB/s** | **88 MB** |
+| **`iter_record_batches(..., threads=16, schema=[...])` (explicit frozen)** | **Fastest bounded, stable schema**, yields `RecordBatch`es | **4980 / ~4900 MB/s** | **88 MB** |
 | `iter_record_batches(memory="64MB", threads=16)` auto | Bounded + incremental, stable schema | 3828 / 3782 MB/s (−14% vs par, +15% Discovery) | **88 MB** |
 | `bounded` (`memory="64MB"` single) | Single-thread bounded | 645 / 546 MB/s | 133 MB |
 
-Pass `engine=` explicitly, or let `auto` select per call. `auto` stays **"parallel if it fits"** (blocked: auto discovery adds 15% and would make `auto` slower until cheaper). Streaming is **opt-in** via `iter_record_batches(..., threads=16)` — keep 4 MB for `par` (`src/crxml/source.py:155`), 2 MB via `budget/(threads×2)` for streaming. Provide `schema=` for the fast path.
+Pass `engine=` explicitly, or let `auto` select per call. `auto` stays **"parallel if it fits"** (blocked: auto discovery adds 15% and would make `auto` slower until cheaper). Streaming is **opt-in** via `iter_record_batches(..., threads=16)`, keeping 4 MB for `par` (`src/crxml/source.py:155`), 2 MB via `budget/(threads×2)` for streaming. Provide `schema=` for the fast path.
 
 ```python
 # Recommended bounded paths
@@ -158,7 +158,7 @@ batches = src.iter_record_batches(memory="64MB", threads=16, schema=schema) # no
 # auto: stable but pays 15% Discovery (16×2 MiB windows for >128 MB)
 batches = src.iter_record_batches(memory="64MB", threads=16)
 
-# ParquetWriter (now works — batches share frozen schema)
+# ParquetWriter (now works; batches share frozen schema)
 it = src.iter_record_batches(memory="64MB", threads=16)
 first = next(it)
 w = pq.ParquetWriter("out.parquet", first.schema)
