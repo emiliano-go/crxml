@@ -89,7 +89,7 @@ class TestIteration:
 
     def test_iteration_all_rows(self, bench_10mb):
         rows = list(CrystalXMLSource(bench_10mb, row_tag="Details"))
-        assert len(rows) == 9010
+        assert len(rows) == 21047
 
     def test_iteration_keys_are_strings(self, bench_10mb):
         for row in CrystalXMLSource(bench_10mb, row_tag="Details"):

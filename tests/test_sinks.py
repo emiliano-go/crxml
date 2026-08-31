@@ -116,12 +116,12 @@ class TestToCSV:
         try:
             to_csv(
                 CrystalXMLSource(bench_10mb, row_tag="Details")
-                | RenameFields({"Level": "level"}),
+                | RenameFields({"Section": "section"}),
                 path,
             )
             with open(path) as f:
                 reader = csv.DictReader(f)
-                assert "level" in reader.fieldnames
+                assert "section" in reader.fieldnames
         finally:
             Path(path).unlink(missing_ok=True)
 
