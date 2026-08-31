@@ -69,6 +69,8 @@ df = pipeline.to_dataframe()
 
 ## Why crxml
 
+> This library was originally inspired by [carlosplanchon/xmlstreamer](https://github.com/carlosplanchon/xmlstreamer).
+
 Crystal Reports XML exports are deeply nested: `<Group>` wraps `<GroupHeader>`
 wraps `<Section>` wraps `<Details>` wraps `<Field>`/`<Text>`/`<FormattedValue>`/
 `<Value>`/`<TextValue>`.  Standard XML libraries (ElementTree, SAX, lxml)
