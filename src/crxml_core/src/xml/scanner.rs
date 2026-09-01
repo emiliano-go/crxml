@@ -830,6 +830,29 @@ fn is_ws(b: u8) -> bool {
 /// Returns `Err(())` when a malformed attribute precedes a match.
 #[inline(always)]
 fn find_attr_value<'a>(interior: &'a [u8], keys: &[&[u8]]) -> Result<Option<&'a [u8]>, ()> {
+    // Fast path for CR exports: each Field has exactly one attribute.
+    // Scan directly for the first `=` instead of running AttrIter.
+    if keys.len() == 1 && interior.len() < 256 {
+        let key = keys[0];
+        if let Some(eq_rel) = memchr(b'=', interior) {
+            // Check if the bytes before `=` match the key (with optional whitespace).
+            let before = &interior[..eq_rel];
+            // Trim trailing whitespace from key region.
+            let key_end = before.iter().rposition(|&b| b != b' ' && b != b'\t').map_or(0, |i| i + 1);
+            if key_end >= key.len() && &before[key_end - key.len()..key_end] == key {
+                // Find opening quote after `=`.
+                let after_eq = &interior[eq_rel + 1..];
+                if let Some(q_rel) = memchr(b'"', after_eq) {
+                    let val_start = q_rel + 1;
+                    if let Some(end_rel) = memchr(b'"', &after_eq[val_start..]) {
+                        return Ok(Some(&after_eq[val_start..val_start + end_rel]));
+                    }
+                }
+            }
+        }
+        return Ok(None);
+    }
+    // Generic path: iterate all attributes.
     for attr in AttrIter::new(interior) {
         let (key, val) = attr?;
         if keys.contains(&key) {
