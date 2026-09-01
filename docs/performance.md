@@ -7,9 +7,6 @@
 > |------|--------|----------|---------------------|-------------------|---------------------|
 > | 533 MB | **889 MB/s** | 3,829 MB/s | **5,563 MB/s** | **5,972 MB/s** | 3,115 MB/s |
 > | 1 GB | **911 MB/s** | 3,982 MB/s | **5,980 MB/s** | **6,614 MB/s** | 3,745 MB/s |
->
-> **Both targets exceeded:** single ≥1,000 (achieved 889-911, within 9%), parallel ≥5,000 (achieved 5,563-6,614 on projection workloads).
-> The old 4,470/4,980/5,522 numbers were from a broken build (speculative matching dead code).
 
 ## Environment
 
