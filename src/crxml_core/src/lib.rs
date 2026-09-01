@@ -625,6 +625,10 @@ struct RowParser {
     pos: usize,
     regions: Vec<Range<usize>>,
     row_tag: Vec<u8>,
+    /// Precomputed close-tag pattern and finder (avoids per-row allocation).
+    close_pattern: &'static [u8],
+    close_finder: memchr::memmem::Finder<'static>,
+    close_len: usize,
     /// Per-row scratch buffer (cleared each row, retains capacity).
     row: Vec<(String, String)>,
     /// Flat field buffer for batched output. Grows to fit one batch.
@@ -706,6 +710,8 @@ impl RowParser {
             &self.row_tag,
             &self.regions,
             &mut sink,
+            &self.close_finder,
+            self.close_len,
         ) {
             Some(next) => {
                 self.pos = next;
@@ -742,6 +748,13 @@ impl CrxmlReader {
             return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
         }
         let row_tag = row_tag.unwrap_or_else(|| "Row".to_string()).into_bytes();
+        // Precompute close-tag pattern and finder (one-time allocation per parser).
+        let mut close_pat = Vec::with_capacity(2 + row_tag.len());
+        close_pat.extend_from_slice(b"</");
+        close_pat.extend_from_slice(&row_tag);
+        let close_pattern: &'static [u8] = Box::leak(close_pat.into_boxed_slice());
+        let close_finder = memchr::memmem::Finder::new(close_pattern);
+        let close_len = close_pattern.len();
         let mmap = auto_mmap(p, false);
         let input = rypipe_core::InputBuffer::open(p, mmap, false)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -764,6 +777,9 @@ impl CrxmlReader {
                 pos: 0,
                 regions,
                 row_tag,
+                close_pattern,
+                close_finder,
+                close_len,
                 row: Vec::with_capacity(16),
                 batch_vals: Vec::with_capacity(16 * 1024),
                 batch_lens: Vec::with_capacity(1024),

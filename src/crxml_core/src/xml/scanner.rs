@@ -95,9 +95,14 @@ pub fn scan_chunk<S: ColumnarSink + ?Sized>(
     sink: &mut S,
 ) -> Result<(), rypipe_core::Error> {
     let (regions, _) = find_special_regions(bytes);
+    // Precompute close-tag pattern and finder once (avoids per-row allocation).
+    let mut close_pat = Vec::with_capacity(2 + row_tag.len());
+    close_pat.extend_from_slice(b"</");
+    close_pat.extend_from_slice(row_tag);
+    let close_finder = memchr::memmem::Finder::new(&close_pat);
     let mut pos = 0usize;
     while let Some(start) = next_row_start(bytes, pos, row_tag, &regions) {
-        match parse_row(bytes, start, row_tag, &regions, sink) {
+        match parse_row(bytes, start, row_tag, &regions, sink, &close_finder, close_pat.len()) {
             Flow::At(next) => pos = next.max(start + 1),
             // Partial trailing row: stop; normalize() discards it at finish.
             Flow::Truncated => break,
@@ -117,10 +122,12 @@ pub(crate) fn scan_one_row<S: ColumnarSink + ?Sized>(
     row_tag: &[u8],
     regions: &[Range<usize>],
     sink: &mut S,
+    close_finder: &memchr::memmem::Finder<'_>,
+    close_len: usize,
 ) -> Option<usize> {
     loop {
         let start = next_row_start(bytes, pos, row_tag, regions)?;
-        match parse_row(bytes, start, row_tag, regions, sink) {
+        match parse_row(bytes, start, row_tag, regions, sink, close_finder, close_len) {
             Flow::At(next) => return Some(next.max(start + 1)),
             Flow::Truncated => return None,
             Flow::Recover => pos = start + 1,
@@ -135,6 +142,8 @@ fn parse_row<S: ColumnarSink + ?Sized>(
     row_tag: &[u8],
     regions: &[Range<usize>],
     sink: &mut S,
+    close_finder: &memchr::memmem::Finder<'_>,
+    close_len: usize,
 ) -> Flow {
     let open = match scan_open_tag(bytes, lt) {
         Some(o) => o,
@@ -177,13 +186,23 @@ fn parse_row<S: ColumnarSink + ?Sized>(
             {
                 REJECTED_ROWS.fetch_add(1, Ordering::Relaxed);
             }
-            let after = find_row_close(bytes, cur, row_tag, regions);
+            let after = find_close_after(bytes, cur, close_finder, close_len, regions);
             if let Some(after) = after {
                 #[cfg(feature = "profile")]
                 {
                     let skipped = count_field_openings(&bytes[cur..after.min(bytes.len())]);
                     SKIPPED_FIELDS.fetch_add(skipped, Ordering::Relaxed);
                 }
+                sink.end_row();
+                return Flow::At(after);
+            } else {
+                return Flow::Truncated;
+            }
+        }
+        // Projection short-circuit: all wanted columns have values.
+        if sink.row_satisfied() {
+            let after = find_close_after(bytes, cur, close_finder, close_len, regions);
+            if let Some(after) = after {
                 sink.end_row();
                 return Flow::At(after);
             } else {
