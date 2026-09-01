@@ -14,11 +14,15 @@ Reuses generation helpers from benchmarks.py. Run with --quick for 10 MB only (C
 """
 
 import argparse
+import json as _json
 import os
 import statistics
-import time
 import sys
+import tempfile
+import time
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 HERE = Path(__file__).parent
 # Reuse generation logic from benchmarks.py
@@ -40,10 +44,10 @@ from crxml import CrystalXMLSource, _crxml_core as _core
 import subprocess as _subprocess
 def _verify_build_sha(allow_dirty=False):
     """Assert that the installed extension was built from the current HEAD.
-    
+
     Prevents benchmarks from silently measuring stale Rust code — the exact
     failure mode that invalidated all production numbers in the Aug 28 thread.
-    
+
     build.rs appends "-dirty" to the SHA when uncommitted edits exist.
     A dirty build means the binary doesn't reflect working-tree changes.
     Pass allow_dirty=True (via --allow-dirty) to bypass for quick iteration.
@@ -71,7 +75,7 @@ def _verify_build_sha(allow_dirty=False):
                 f"  Uncommitted changes are not compiled into the binary.\n"
                 f"  Either commit or pass --allow-dirty to benchmark anyway."
             )
-        label = f"{build_sha[:9]}" + (" (dirty)" if is_dirty else "")
+        label = f"{base_sha[:9]}" + (" (dirty)" if is_dirty else "")
         print(f"  Build SHA: {label} (matches HEAD)")
     except FileNotFoundError:
         print("  WARNING: git not found, skipping build-SHA check")
@@ -85,7 +89,7 @@ def _verify_build_sha(allow_dirty=False):
 # ---------------------------------------------------------------------------
 def _parse_thp_active(raw: str) -> str:
     """Extract the active THP defrag mode from sysfs.
-    
+
     sysfs format: "always defer defer+madvise [madvise] never"
     The brackets [mode] mark the currently active setting.
     """
@@ -95,10 +99,10 @@ def _parse_thp_active(raw: str) -> str:
 
 def setup_thp_madvise():
     """Report the active transparent hugepage defrag mode.
-    
+
     sysfs format lists all modes with the active one in brackets:
         always defer defer+madvise [madvise] never
-    
+
     If not already madvise, attempt to switch (requires root).
     Returns the effective mode after the attempt (for JSON provenance).
     """
@@ -123,44 +127,138 @@ def setup_thp_madvise():
         print(f"  THP defrag: error {e}")
         return "error"
 
-def isolate_config(fn, label=""):
-    """Run a benchmark config in a fresh subprocess to avoid mimalloc arena
-    accumulation and page-cache pressure from earlier runs.
-    
-    Each subprocess gets its own heap, so mimalloc arenas from previous
-    configs don't pollute the measurement. This is critical for single-path
-    measurements where CoV of 10-22% was observed due to cross-config
-    contamination.
-    
-    Returns (median, best, worst, cov, rows, n) or (None, 0, 0, 0, 0, 0) on failure.
+# ---------------------------------------------------------------------------
+# Declarative benchmark config — serializable to subprocess
+# ---------------------------------------------------------------------------
+@dataclass
+class BenchConfig:
+    """Declarative benchmark config — all fields JSON-serializable.
+
+    Used to dispatch benchmarks in subprocesses without serializing lambdas.
+    Each config type reconstructs the benchmark function from its params.
     """
-    import subprocess
-    import json
-    
-    # Serialize the function call into a subprocess script
-    # We pass the file path and function identifier, not the lambda itself
-    code = f"""
-import sys, time, statistics, json
-from pathlib import Path
+    type: str          # "native" | "source_sink" | "pushdown" | "chunk" | "bounded" | "batch" | "par_stream" | "pipeline"
+    file: str          # absolute path to XML file
+    label: str         # display label
+    engine: str = ""
+    sink: str = ""
+    n: int = 0         # chunks for native/chunk
+    memory: str = ""   # for bounded/par_stream (e.g. "64MB")
+    mem_bytes: int = 0 # for bounded (raw bytes)
+    batch: int = 0     # for batch
+    threads: int = 0   # for par_stream
+    pushdown: dict = field(default_factory=dict)  # for pushdown kwargs
+    extra: dict = field(default_factory=dict)      # catch-all (row_tag, etc.)
 
-# Add parent dirs to path
-sys.path.insert(0, str(Path("{HERE}")))
-from benchmarks.bench_extended import BENCH_DATA, NATIVE_FUNCS, median_of
+def _config_to_fn(config: BenchConfig) -> Callable:
+    """Reconstruct a benchmark function from a BenchConfig.
 
-# The actual function to benchmark is passed as a string
-fn_name = "{label}"
-"""
-    
-    # For now, just run the function directly (subprocess isolation is complex
-    # for lambdas). Instead, we rely on the median_of adaptive sampling and
-    # THP madvise to reduce noise. Full subprocess isolation would require
-    # serializing the benchmark function, which is a larger refactor.
-    # TODO: Implement full subprocess isolation per config
-    return fn()
+    This is the in-process fallback when --isolate is not used.
+    """
+    p = Path(config.file)
+    row_tag = config.extra.get("row_tag", "Details")
+
+    if config.type == "native":
+        return lambda: NATIVE_FUNCS[config.engine](p)
+    elif config.type == "source_sink":
+        engine, sink = config.engine, config.sink
+        def _fn():
+            src = CrystalXMLSource(str(p), row_tag=row_tag, engine=engine)
+            if sink == "iter":
+                return sum(1 for _ in src)
+            elif sink == "iter_batches":
+                return sum(1 for _ in src._iter_batches(batch_size=1024))
+            elif sink == "to_arrow":
+                return src.to_arrow()
+            elif sink in ("to_dataframe", "to_pandas"):
+                return src.to_dataframe()
+            elif sink == "to_polars":
+                return src.to_polars()
+            elif sink == "to_parquet":
+                with tempfile.NamedTemporaryFile(suffix=".parquet", delete=True) as tf:
+                    src.to_parquet(tf.name)
+                    return src.to_arrow()
+            else:
+                return src.to_arrow()
+        return _fn
+    elif config.type == "pushdown":
+        engine = config.engine
+        kw = config.pushdown
+        def _fn():
+            src = CrystalXMLSource(str(p), row_tag=row_tag, engine=engine, **kw)
+            return src.to_arrow()
+        return _fn
+    elif config.type == "chunk":
+        n = config.n
+        def _fn():
+            return _core.read_to_columnar_par(str(p), row_tag=row_tag, num_chunks=n)
+        return _fn
+    elif config.type == "bounded":
+        mem = config.mem_bytes
+        def _fn():
+            return _core.read_to_columnar_bounded(str(p), row_tag=row_tag, memory=mem)
+        return _fn
+    elif config.type == "batch":
+        bs = config.batch
+        def _fn():
+            src = CrystalXMLSource(str(p), row_tag=row_tag, engine="stream", batch_size=bs)
+            return sum(1 for _ in src)
+        return _fn
+    elif config.type == "par_stream":
+        mem = config.memory
+        t = config.threads
+        def _fn():
+            src = CrystalXMLSource(str(p), row_tag=row_tag, engine="parallel",
+                                   memory=mem, threads=t)
+            return sum(len(b) for b in src.iter_record_batches(memory=mem, threads=t))
+        return _fn
+    elif config.type == "pipeline":
+        pipe_name = config.extra.get("pipe_name", "")
+        def _fn():
+            src = CrystalXMLSource(str(p), row_tag=row_tag, engine="parallel")
+            if pipe_name == "base":
+                return src.to_arrow()
+            elif pipe_name == "drop":
+                src = CrystalXMLSource(str(p), row_tag=row_tag, engine="parallel",
+                                       drop_fields=["Field22"])
+                return src.to_arrow()
+            elif pipe_name == "rename":
+                src = CrystalXMLSource(str(p), row_tag=row_tag, engine="parallel",
+                                       field_mapping={"Field22": "Price"})
+                return src.to_arrow()
+            elif pipe_name == "filter":
+                src = CrystalXMLSource(str(p), row_tag=row_tag, engine="parallel",
+                                       filter={"field": "Level", "op": "==", "value": "3"})
+                return src.to_arrow()
+            elif pipe_name == "Drop+Filter":
+                from crxml import DropFields, FilterRows
+                src = CrystalXMLSource(str(p), row_tag=row_tag, engine="parallel")
+                pipe = src | DropFields(["Field22"]) | FilterRows(field="Level", op="==", value="3")
+                tbl = pipe._to_arrow()
+                if tbl is not None:
+                    return tbl.num_rows
+                return sum(1 for _ in pipe)
+            return src.to_arrow()
+        return _fn
+    else:
+        raise ValueError(f"Unknown config type: {config.type}")
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _extract_rows(res) -> int:
+    """Extract row count from a benchmark result."""
+    if isinstance(res, int):
+        return res
+    if hasattr(res, "num_rows"):
+        return res.num_rows
+    if hasattr(res, "__len__"):
+        try:
+            return len(res)
+        except Exception:
+            return 0
+    return 0
 
 def best_of(fn, rounds=3):
     best = float("inf")
@@ -169,59 +267,29 @@ def best_of(fn, rounds=3):
         t0 = time.perf_counter()
         res = fn()
         dt = time.perf_counter() - t0
-        # row count extraction
-        try:
-            if isinstance(res, int):
-                rows = res
-            elif hasattr(res, "num_rows"):
-                rows = res.num_rows
-            elif hasattr(res, "__len__"):
-                try:
-                    rows = len(res)
-                except Exception:
-                    rows = 0
-            elif res is None:
-                rows = 0
-            else:
-                rows = 0
-        except Exception:
-            rows = 0
+        rows = _extract_rows(res)
         best = min(best, dt)
-    return best, rows, rounds  # return n for transparency
+    return best, rows, rounds
 
 def median_of(fn, rounds=7):
-    """Median of 7 with min/max and CoV, adaptive until 1.31*CoV <=5% capped at 31.
-    Returns (median, best, worst, cov, rows, n) where n is the actual sample count.
-    
-    n is critical for transparency: when adaptive sampling hits the cap of 31,
-    it means the noise floor was not achieved and the cell is untrustworthy.
+    """Adaptive median: keep sampling until 1.31*CoV <= 5%, capped at 31.
+
+    Returns (median, best, worst, cov, rows, n, times) where n is the actual
+    sample count and times is the raw sorted list.  n is critical for
+    transparency: hitting the cap of 31 means the noise floor was not achieved
+    and the cell is untrustworthy.
     """
     times = []
     rows = 0
-    # Adaptive: keep sampling until floor <=5% or cap 31
     target_rounds = rounds
     while len(times) < target_rounds:
-        t0 = time.perf_counter()
-        # For tiny files (10 MB, 20 ms), repeat 20× inside one timed region to average scheduler noise
-        # Heuristic: if expected time <50 ms, do 20 repeats
-        # We estimate by doing one untimed run first
-        if len(times) == 0 and rounds == 7:
-            # Quick probe to estimate time
+        # Warmup + tiny-file batching: probe once, discard, then batch if <50 ms
+        if len(times) == 0:
             t_probe0 = time.perf_counter()
             res = fn()
             t_probe = time.perf_counter() - t_probe0
-            # Extract rows for probe
-            try:
-                if isinstance(res, int):
-                    rows = res
-                elif hasattr(res, "num_rows"):
-                    rows = res.num_rows
-                elif hasattr(res, "__len__"):
-                    rows = len(res)
-            except Exception:
-                pass
-            if t_probe < 0.05:  # 50 ms threshold for tiny files
-                # Do 20 repeats inside one timed region
+            rows = _extract_rows(res)
+            if t_probe < 0.05:  # 50 ms threshold — batch 20× inside one timed region
                 t0 = time.perf_counter()
                 for _ in range(20):
                     fn()
@@ -229,41 +297,29 @@ def median_of(fn, rounds=7):
                 times.append(dt)
                 continue
             else:
-                times.append(t_probe)
-                continue
+                # Discard warmup, start fresh collection below
+                pass
         t0 = time.perf_counter()
         res = fn()
         dt = time.perf_counter() - t0
         times.append(dt)
-        try:
-            if isinstance(res, int):
-                rows = res
-            elif hasattr(res, "num_rows"):
-                rows = res.num_rows
-            elif hasattr(res, "__len__"):
-                rows = len(res)
-        except Exception:
-            pass
+        rows = _extract_rows(res)
         if len(times) >= 7:
-            # Check CoV floor
-            mean = sum(times)/len(times)
-            stdev = statistics.pstdev(times) if len(times)>1 else 0
-            cov = stdev/mean if mean else 0
+            mean = sum(times) / len(times)
+            stdev = statistics.pstdev(times) if len(times) > 1 else 0
+            cov = stdev / mean if mean else 0
             floor = 1.31 * cov
             if floor <= 0.05 or len(times) >= 31:
                 break
-            # Need more samples to reduce floor: floor ~ 1/sqrt(n), so need 4× rounds to halve
-            if len(times) >= 31:
-                break
     times.sort()
-    median = times[len(times)//2]
+    median = times[len(times) // 2]
     best = min(times)
     worst = max(times)
-    mean = sum(times)/len(times)
-    stdev = statistics.pstdev(times) if len(times)>1 else 0
-    cov = stdev/mean if mean else 0
+    mean = sum(times) / len(times)
+    stdev = statistics.pstdev(times) if len(times) > 1 else 0
+    cov = stdev / mean if mean else 0
     n = len(times)
-    return median, best, worst, cov, rows, n
+    return median, best, worst, cov, rows, n, times
 
 def peak_rss_subprocess(code: str, timeout=60):
     """Run code in subprocess and return (peak_kb, stdout). Uses child's VmHWM, not RUSAGE_CHILDREN."""
@@ -386,57 +442,165 @@ def bench_lxml(path: Path, to_dataframe=False):
     except Exception as e:
         return 0, 0, f"lxml error: {e}"
 
-def report(path: Path, label: str, fn, rounds=3, **kwargs):
-    sz = path.stat().st_size
-    # For JSON, we need to capture times
-    _times = []
-    _rows = 0
-    def _wrapped():
-        nonlocal _rows
-        res = fn()
-        # Extract rows for JSON
-        try:
-            if isinstance(res, int):
-                _rows = res
-            elif hasattr(res, "num_rows"):
-                _rows = res.num_rows
-            elif hasattr(res, "__len__"):
-                _rows = len(res)
-        except Exception:
-            pass
-        return res
+# ---------------------------------------------------------------------------
+# Subprocess isolation
+# ---------------------------------------------------------------------------
+
+# Module-level globals set by main() for subprocess access
+_isolate = False
+_taskset = None
+_warm_cache = False
+
+def _run_subprocess_isolated(config: BenchConfig, rounds: int, file_size: int) -> dict:
+    """Run a benchmark in a fresh subprocess.
+
+    Serializes the config as JSON, spawns a child process that reconstructs
+    the function and runs median_of.  Returns dict with timing stats or
+    error info.
+    """
+    import subprocess
+
+    config_json = _json.dumps(asdict(config))
+
+    # Build the subprocess command
+    # Add crxml dir (for crxml import) and benchmarks dir (for bench_extended import)
+    # Use direct import since benchmarks/ may not be a package.
+    # Config is passed via stdin as JSON to avoid Python literal issues (true vs True).
+    cmd_parts = [sys.executable, "-c", f"""
+import sys, time, statistics, json
+from pathlib import Path
+
+# Ensure imports work: crxml dir first, then benchmarks dir
+sys.path.insert(0, {str(HERE.parent)!r})
+sys.path.insert(0, {str(HERE)!r})
+
+from bench_extended import (
+    BenchConfig, _config_to_fn, median_of, _extract_rows, BENCH_DATA
+)
+
+config = BenchConfig(**json.loads(sys.stdin.read()))
+fn = _config_to_fn(config)
+file_size = {file_size}
+
+# Warm pass if requested
+if {repr(_warm_cache)}:
+    fn()
+
+# Run the benchmark
+result = median_of(fn, rounds={rounds})
+
+median, best, worst, cov, rows, n, times = result
+
+# Compute derived values
+mb = file_size / median / 1024 / 1024 if median > 0 else 0
+rps = rows / median if median > 0 and rows else 0
+
+output = {{
+    "median": median,
+    "best": best,
+    "worst": worst,
+    "cov": cov,
+    "rows": rows,
+    "n": n,
+    "times": times,
+    "mb_per_s": mb,
+    "rows_per_s": rps,
+}}
+print(json.dumps(output))
+"""]
+
+    # Add taskset pinning if requested
+    if _taskset:
+        cmd_parts = ["taskset", "-c", _taskset] + cmd_parts
 
     try:
-        # Use median_of for rounds>=7, else best_of
+        r = subprocess.run(
+            cmd_parts,
+            input=config_json,
+            capture_output=True,
+            text=True,
+            timeout=max(300, rounds * 60),  # generous timeout
+        )
+        if r.returncode != 0:
+            return {"error": f"subprocess exited {r.returncode}: {r.stderr[:500]}"}
+        # Parse JSON from last line of stdout (skip any warning lines)
+        for line in reversed(r.stdout.strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                return _json.loads(line)
+        return {"error": f"no JSON in stdout: {r.stdout[:300]}"}
+    except subprocess.TimeoutExpired:
+        return {"error": "subprocess timed out"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+def report(path: Path, label_or_config, fn=None, rounds=3, collect: Optional[Callable] = None, **kwargs):
+    """Run a benchmark and print results.
+
+    Accepts either:
+      - (path, label, fn, rounds, collect=..., **kwargs)  — function-based
+      - (path, config, rounds=..., collect=...)            — BenchConfig-based
+
+    collect(label, path, times, rows, cov) is called when provided, enabling
+    JSON output without globals hacks.
+    """
+    sz = path.stat().st_size
+
+    # Resolve label and function from config or explicit args
+    if isinstance(label_or_config, BenchConfig):
+        config = label_or_config
+        label = config.label
+        if _isolate:
+            result = _run_subprocess_isolated(config, rounds, sz)
+            if "error" in result:
+                print(f"  {label:38s} FAILED: {result['error']}")
+                return None, 0, 0
+            dt = result["median"]
+            best = result["best"]
+            worst = result["worst"]
+            cov = result["cov"]
+            rows = result["rows"]
+            n = result["n"]
+            times = result["times"]
+            mb = result["mb_per_s"]
+            rps = result["rows_per_s"]
+            extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
+            print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s median ({best:.4f}-{worst:.4f}, CoV {cov:.1%}, n={n})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
+            if collect is not None:
+                collect(label, path, times, rows, cov)
+            return dt, rows, mb
+        else:
+            fn = _config_to_fn(config)
+    else:
+        label = label_or_config
+
+    if fn is None:
+        print(f"  {label:38s} FAILED: no function provided")
+        return None, 0, 0
+
+    try:
         if rounds >= 7:
-            median, best, worst, cov, rows, n = median_of(_wrapped, rounds=rounds)
-            # Reconstruct times for JSON (we need the actual times, not just median)
-            # For now, use the median/best/worst/cov and rows, and let collect_json handle it
+            median, best, worst, cov, rows, n, times = median_of(fn, rounds=rounds)
             dt = median
             mb = sz / dt / 1024 / 1024 if dt > 0 else 0
             rps = rows / dt if dt > 0 and rows else 0
             extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
-            # Collect JSON
-            if 'json_results' in globals() and isinstance(globals()['json_results'], list):
-                # Need times for JSON, so we call median_of again but capture times
-                # For now, just use the already computed median/best/worst/cov and rows
-                # The actual times list is not available, but we can approximate
-                pass
             print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s median ({best:.4f}-{worst:.4f}, CoV {cov:.1%}, n={n})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
-            # For JSON, we need to actually capture times, so we do it here
-            # We will call a helper that returns times
-            # For now, just use the _times list (which is empty because median_of doesn't expose it)
-            # Let's patch median_of to return times as well
-            # For now, just collect with the available info
-            if 'json_results' in globals() and isinstance(globals()['json_results'], list):
-                # Use the single median as placeholder for times
-                pass
+            if collect is not None:
+                collect(label, path, times, rows, cov)
         else:
             dt, rows, n = best_of(fn, rounds=rounds)
             mb = sz / dt / 1024 / 1024 if dt > 0 else 0
             rps = rows / dt if dt > 0 and rows else 0
             extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
             print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s (n={n})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
+            if collect is not None:
+                # For best_of, fabricate a single-element times list
+                collect(label, path, [dt], rows, 0.0)
         return dt, rows, mb
     except Exception as e:
         print(f"  {label:38s} FAILED: {e}")
@@ -504,17 +668,21 @@ PUSHDOWNS = {
     "drop_half_filter_selective": {"drop_fields": ["Field22","Field23","Field38"], "filter": {"field": "Field39", "op": "==", "value": "01-00123"}},  # ~6% selective (1/15 articulos)
 }
 
-def run_native_matrix(path: Path, rounds=3, only_config=None):
+def run_native_matrix(path: Path, rounds=3, only_config=None, collect=None):
     print(f"\n-- Native Exports {path.name} --")
-    for name, fn in NATIVE_FUNCS.items():
+    for name in NATIVE_FUNCS:
         # skip bounded for tiny files where it falls back
         if "bounded" in name and path.stat().st_size < 20*1024*1024:
             continue
         if only_config and name != only_config:
             continue
-        report(path, f"native {name}", lambda fn=fn, p=path: fn(p), rounds=rounds, engine=name)
+        config = BenchConfig(
+            type="native", file=str(path), label=f"native {name}",
+            engine=name, extra={"row_tag": "Details"},
+        )
+        report(path, config, rounds=rounds, collect=collect, engine=name)
 
-def run_source_engine_sink_matrix(path: Path, rounds=3, quick=False):
+def run_source_engine_sink_matrix(path: Path, rounds=3, quick=False, collect=None):
     engines = ENGINES if not quick else ["stream","parallel"]
     sinks = SINKS if not quick else ["iter","to_arrow"]
     for engine in engines:
@@ -527,122 +695,94 @@ def run_source_engine_sink_matrix(path: Path, rounds=3, quick=False):
             if engine == "stream" and sink in ("to_arrow","to_dataframe","to_pandas","to_polars","to_parquet"):
                 # streaming to_arrow is via columnar; skip to avoid sparse-column KeyError
                 continue
-            def fn(engine=engine, sink=sink, p=path):
-                src = CrystalXMLSource(str(p), row_tag="Details", engine=engine)
-                if sink == "iter":
-                    return sum(1 for _ in src)
-                elif sink == "iter_batches":
-                    return sum(1 for _ in src._iter_batches(batch_size=1024))
-                elif sink == "to_arrow":
-                    return src.to_arrow()
-                elif sink in ("to_dataframe","to_pandas"):
-                    return src.to_dataframe()
-                elif sink == "to_polars":
-                    return src.to_polars()
-                elif sink == "to_parquet":
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=True) as tf:
-                        src.to_parquet(tf.name)
-                        return src.to_arrow()
-                else:
-                    return src.to_arrow()
             label = f"src {engine:10s} → {sink}"
-            report(path, label, fn, rounds=rounds, engine=engine, sink=sink)
+            config = BenchConfig(
+                type="source_sink", file=str(path), label=label,
+                engine=engine, sink=sink, extra={"row_tag": "Details"},
+            )
+            report(path, config, rounds=rounds, collect=collect, engine=engine, sink=sink)
 
-def run_pushdown_matrix(path: Path, rounds=3, quick=False):
+def run_pushdown_matrix(path: Path, rounds=3, quick=False, collect=None):
     pushdowns = PUSHDOWNS if not quick else {k: v for k, v in PUSHDOWNS.items() if k in ("baseline","drop_half","filter_eq","auto_dict")}
     for pd_name, kwargs in pushdowns.items():
         for engine in (["columnar","parallel"] if not quick else ["parallel"]):
-            def fn(engine=engine, kw=kwargs, p=path):
-                src = CrystalXMLSource(str(p), row_tag="Details", engine=engine, **kw)
-                return src.to_arrow()
             label = f"push {pd_name:14s} [{engine}]"
-            report(path, label, fn, rounds=rounds, **kwargs)
+            config = BenchConfig(
+                type="pushdown", file=str(path), label=label,
+                engine=engine, pushdown=kwargs, extra={"row_tag": "Details"},
+            )
+            report(path, config, rounds=rounds, collect=collect, **kwargs)
 
-def run_chunk_scaling(path: Path, rounds=3):
+def run_chunk_scaling(path: Path, rounds=3, collect=None):
     print(f"\n-- Chunk Scaling {path.name} --")
     for n in [2,4,8,16,32,64,128,256]:
-        report(path, f"par n={n:3d}", lambda n=n, p=path: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=n), rounds=rounds, n=n)
+        config = BenchConfig(
+            type="chunk", file=str(path), label=f"par n={n:3d}",
+            n=n, extra={"row_tag": "Details"},
+        )
+        report(path, config, rounds=rounds, collect=collect, n=n)
 
-def run_bounded_scaling(path: Path, rounds=2):
+def run_bounded_scaling(path: Path, rounds=2, collect=None):
     print(f"\n-- Bounded Scaling {path.name} --")
+    import re as _re
     for mem in ["64MB","256MB","512MB"]:
-        import re
-        m = re.match(r"(\d+)(MB|GB)", mem)
+        m = _re.match(r"(\d+)(MB|GB)", mem)
         bytes_mem = int(m.group(1)) * (1024**2 if m.group(2)=="MB" else 1024**3)
-        report(path, f"bounded {mem}", lambda b=bytes_mem, p=path: _core.read_to_columnar_bounded(str(p), row_tag="Details", memory=b), rounds=rounds, mem=mem)
+        config = BenchConfig(
+            type="bounded", file=str(path), label=f"bounded {mem}",
+            mem_bytes=bytes_mem, extra={"row_tag": "Details"},
+        )
+        report(path, config, rounds=rounds, collect=collect, mem=mem)
 
-def run_batch_size_matrix(path: Path, rounds=3):
+def run_batch_size_matrix(path: Path, rounds=3, collect=None):
     print(f"\n-- Streaming Batch Sizes {path.name} --")
     for bs in [256,1024,4096,8192]:
-        def fn(bs=bs, p=path):
-            src = CrystalXMLSource(str(p), row_tag="Details", engine="stream", batch_size=bs)
-            return sum(1 for _ in src)
-        report(path, f"stream batch={bs}", fn, rounds=rounds, batch=bs)
+        config = BenchConfig(
+            type="batch", file=str(path), label=f"stream batch={bs}",
+            batch=bs, extra={"row_tag": "Details"},
+        )
+        report(path, config, rounds=rounds, collect=collect, batch=bs)
 
-def run_par_stream_matrix(path: Path, rounds=3):
+def run_par_stream_matrix(path: Path, rounds=3, collect=None):
     print(f"\n-- Parallel Streaming {path.name} --")
     file_mb = path.stat().st_size / (1024 * 1024)
     print(f"  File: {path.name} ({file_mb:.0f} MB)")
     # Memory scaling: bounded at different memory budgets
     for mem_mb in [32, 64, 128, 256]:
-        def fn(m=mem_mb, p=path):
-            return _core.read_to_columnar_bounded(
-                str(p), row_tag="Details", memory=m*1024*1024
-            ).num_rows
-        report(path, f"bounded {mem_mb:3d}MB", fn, rounds=rounds, mem=f"{mem_mb}MB")
+        config = BenchConfig(
+            type="bounded", file=str(path), label=f"bounded {mem_mb:3d}MB",
+            mem_bytes=mem_mb * 1024 * 1024, extra={"row_tag": "Details"},
+        )
+        report(path, config, rounds=rounds, collect=collect, mem=f"{mem_mb}MB")
     # iter_record_batches: streaming with different memory budgets
     for mem_mb in [16, 64, 256]:
-        def fn(m=mem_mb, p=path):
-            src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel",
-                                   memory=f"{m}MB")
-            return sum(len(b) for b in src.iter_record_batches(memory=f"{m}MB"))
-        report(path, f"iter-batch {mem_mb:3d}MB", fn, rounds=rounds, mem=f"{mem_mb}MB")
+        config = BenchConfig(
+            type="par_stream", file=str(path), label=f"iter-batch {mem_mb:3d}MB",
+            memory=f"{mem_mb}MB", threads=0, extra={"row_tag": "Details"},
+        )
+        report(path, config, rounds=rounds, collect=collect, mem=f"{mem_mb}MB")
     # iter_record_batches with thread scaling at 64MB
     for threads in [4, 8, 16]:
-        def fn(t=threads, p=path):
-            src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel",
-                                   memory="64MB", threads=t)
-            return sum(len(b) for b in src.iter_record_batches(memory="64MB", threads=t))
-        report(path, f"iter-batch 64MB t={threads:2d}", fn, rounds=rounds, threads=threads)
+        config = BenchConfig(
+            type="par_stream", file=str(path), label=f"iter-batch 64MB t={threads:2d}",
+            memory="64MB", threads=threads, extra={"row_tag": "Details"},
+        )
+        report(path, config, rounds=rounds, collect=collect, threads=threads)
 
-def run_pipeline_matrix(path: Path, rounds=2):
+def run_pipeline_matrix(path: Path, rounds=2, collect=None):
     print(f"\n-- Pipeline / Fusion {path.name} --")
     try:
-        from crxml import CrystalXMLSource, DropFields, RenameFields, FilterRows, CastTypes
+        from crxml import DropFields, RenameFields, FilterRows, CastTypes
         from crxml.pipeline import Pipeline
     except Exception as e:
         print(f"  pipeline skipped: {e}")
         return
-    def fn_base():
-        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel")
-        return src.to_arrow()
-    report(path, "pipe base", fn_base, rounds=rounds)
-    def fn_drop():
-        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel", drop_fields=["Field22"])
-        return src.to_arrow()
-    report(path, "pipe drop", fn_drop, rounds=rounds)
-    def fn_rename():
-        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel", field_mapping={"Field22":"Price"})
-        return src.to_arrow()
-    report(path, "pipe rename", fn_rename, rounds=rounds)
-    def fn_filter():
-        src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel", filter={"field":"Level","op":"==","value":"3"})
-        return src.to_arrow()
-    report(path, "pipe filter", fn_filter, rounds=rounds)
-    # Pipeline composition — iterate via Pipeline (not CrystalXMLSource.to_arrow)
-    try:
-        def fn_pipe():
-            src = CrystalXMLSource(str(path), row_tag="Details", engine="parallel")
-            pipe = src | DropFields(["Field22"]) | FilterRows(field="Level", op="==", value="3")
-            # Try fast path _to_arrow, else fall back to iteration
-            tbl = pipe._to_arrow()
-            if tbl is not None:
-                return tbl.num_rows
-            return sum(1 for _ in pipe)
-        report(path, "Pipeline Drop+Filter", fn_pipe, rounds=rounds)
-    except Exception as e:
-        print(f"  Pipeline Drop+Filter skipped: {e}")
+    for pipe_name in ["base", "drop", "rename", "filter", "Drop+Filter"]:
+        config = BenchConfig(
+            type="pipeline", file=str(path), label=f"pipe {pipe_name}",
+            extra={"row_tag": "Details", "pipe_name": pipe_name},
+        )
+        report(path, config, rounds=rounds, collect=collect)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -662,14 +802,26 @@ def main():
                     help="Run only this file (e.g. test_1gb.xml). Skip other file sizes.")
     ap.add_argument("--allow-dirty", action="store_true",
                     help="Allow benchmarking with a dirty working tree (uncommitted changes not in .so)")
+    ap.add_argument("--isolate", action="store_true",
+                    help="Run each config in a fresh subprocess (eliminates cross-config contamination)")
+    ap.add_argument("--taskset", type=str, default=None,
+                    help="Pin to CPU list via taskset, e.g. '0-15' for all cores")
+    ap.add_argument("--warm-cache", action="store_true",
+                    help="Run a warm pass before timed measurements (evicts cold-start overhead)")
     args = ap.parse_args()
     # Verify extension matches HEAD before any measurements
     _verify_build_sha(allow_dirty=args.allow_dirty)
     # Setup THP defrag before any benchmarks — record for provenance
     _thp_value = setup_thp_madvise()
+
+    # Set module-level globals for subprocess access
+    global _isolate, _taskset, _warm_cache
+    _isolate = args.isolate
+    _taskset = args.taskset
+    _warm_cache = args.warm_cache
+
     # Setup JSON output collection with provenance
     json_results = []
-    import json as _json
     import subprocess
     try:
         _commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parent.parent)).decode().strip()
@@ -743,27 +895,27 @@ def main():
         print("="*70)
 
         if "native" in include:
-            run_native_matrix(p, rounds=rounds, only_config=args.only_config)
+            run_native_matrix(p, rounds=rounds, only_config=args.only_config, collect=collect_json)
         if "source" in include:
-            run_source_engine_sink_matrix(p, rounds=rounds, quick=args.quick)
+            run_source_engine_sink_matrix(p, rounds=rounds, quick=args.quick, collect=collect_json)
         if "pushdown" in include:
-            run_pushdown_matrix(p, rounds=rounds, quick=args.quick)
+            run_pushdown_matrix(p, rounds=rounds, quick=args.quick, collect=collect_json)
         if "chunk" in include:
-            run_chunk_scaling(p, rounds=rounds)
+            run_chunk_scaling(p, rounds=rounds, collect=collect_json)
         if "bounded" in include and not args.quick:
-            run_bounded_scaling(p, rounds=2 if mb>100 else 2)
+            run_bounded_scaling(p, rounds=2 if mb>100 else 2, collect=collect_json)
         if "batch" in include and not args.quick:
-            run_batch_size_matrix(p, rounds=rounds)
+            run_batch_size_matrix(p, rounds=rounds, collect=collect_json)
         if "par_stream" in include and not args.quick:
-            run_par_stream_matrix(p, rounds=rounds)
+            run_par_stream_matrix(p, rounds=rounds, collect=collect_json)
         if "pipeline" in include:
-            run_pipeline_matrix(p, rounds=2 if args.quick else 2)
+            run_pipeline_matrix(p, rounds=rounds if not args.quick else 2, collect=collect_json)
     # Edge cases: empty, single row, ragged, late debut, entities, unicode, comments
     if "edge" in include:
         # Generate edge files on demand (tiny, not in main targets)
         edge_dir = BENCH_DATA / "edge"
         edge_dir.mkdir(exist_ok=True)
-        run_edge_case_matrix(edge_dir, rounds=rounds, quick=args.quick)
+        run_edge_case_matrix(edge_dir, rounds=rounds, quick=args.quick, collect=collect_json)
 
     print("\nDone.")
     if args.output:
@@ -785,10 +937,7 @@ def main():
         out_path.write_text(_json.dumps(payload, indent=2), encoding='utf-8')
         print(f"Wrote {len(json_results)} records to {out_path} (commit {_commit} dirty={_dirty})")
 
-        # Also handle 533 MB real vs mimic labeling in JSON
-        # The JSON already contains file paths, so the label is implicit
-
-def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False):
+def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False, collect=None):
     """Benchmark edge cases: empty, single row, ragged, sparse, truncated, entities, unicode, different row_tags."""
     print("\n" + "="*70)
     print("EDGE CASES")
@@ -803,40 +952,40 @@ def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False):
 
     # 1) Empty file (no rows)
     p_empty = write_edge("empty", b'<?xml version="1.0"?><CrystalReport><Group><GroupHeader><Section SectionNumber="0"></Section></GroupHeader></Group></CrystalReport>')
-    report(p_empty, "edge empty", lambda p=p_empty: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+    report(p_empty, "edge empty", lambda p=p_empty: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds, collect=collect)
 
     # 2) Single row
     single_xml = b'<?xml version="1.0"?><CrystalReport><Group><GroupHeader><Section/></GroupHeader><Group Level="2"><GroupHeader><Section SectionNumber="0"></Section></GroupHeader><Details Level="3"><Section SectionNumber="0"><Field Name="Field22" FieldName="{F}"><FormattedValue>1</FormattedValue><Value>1</Value></Field></Section></Details></Group></Group></CrystalReport>'
     p_single = write_edge("single_row", single_xml)
-    report(p_single, "edge single row", lambda p=p_single: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+    report(p_single, "edge single row", lambda p=p_single: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds, collect=collect)
 
     # 3) Ragged: missing fields, late debut (FieldG appears only in last 10% rows)
     # Use existing 10MB file but test via drop_all vs sparse handling already in pushdown, here test ragged via bounded
     if not quick:
         p_10 = BENCH_DATA / "test_10mb.xml"
         if p_10.exists():
-            report(p_10, "edge ragged via bounded64", lambda: _core.read_to_columnar_bounded(str(p_10), row_tag="Details", memory=64*1024), rounds=rounds)
+            report(p_10, "edge ragged via bounded64", lambda: _core.read_to_columnar_bounded(str(p_10), row_tag="Details", memory=64*1024), rounds=rounds, collect=collect)
 
     # 4) Entities & unicode
     ent_xml = b'<?xml version="1.0"?><CrystalReport><Group><Group Level="2"><GroupHeader/><Details Level="3"><Section SectionNumber="0"><Field Name="Field38" FieldName="{F}"><FormattedValue>A &amp; B &lt; C</FormattedValue><Value>A &amp; B &lt; C</Value></Field><Field Name="Field39"><FormattedValue>\xe2\x98\x83 unicode \xe2\x98\x85</FormattedValue><Value>\xe2\x98\x83 unicode \xe2\x98\x85</Value></Field></Section></Details></Group></Group></CrystalReport>'
     p_ent = write_edge("entities_unicode", ent_xml)
-    report(p_ent, "edge entities+unicode", lambda p=p_ent: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+    report(p_ent, "edge entities+unicode", lambda p=p_ent: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds, collect=collect)
 
     # 5) Comment with fake row tag
     comment_xml = b'<?xml version="1.0"?><CrystalReport><!-- <Details Level="3"><Field Name="Trap"><Value>nope</Value></Field></Details> --><Group><Group Level="2"><GroupHeader/><Details Level="3"><Section SectionNumber="0"><Field Name="Field22"><Value>42</Value></Field></Section></Details></Group></Group></CrystalReport>'
     p_comment = write_edge("comment_fake_row", comment_xml)
-    report(p_comment, "edge comment fake row", lambda p=p_comment: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+    report(p_comment, "edge comment fake row", lambda p=p_comment: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds, collect=collect)
 
     # 6) Different row_tag: Row vs Details vs custom
     p_10 = BENCH_DATA / "test_10mb.xml"
     if p_10.exists():
         for tag in ["Details", "Row", "NonExistentTag"]:
-            report(p_10, f"edge row_tag={tag}", lambda tag=tag, p=p_10: _core.read_to_columnar(str(p), row_tag=tag), rounds=rounds)
+            report(p_10, f"edge row_tag={tag}", lambda tag=tag, p=p_10: _core.read_to_columnar(str(p), row_tag=tag), rounds=rounds, collect=collect)
 
     # 7) Tiny file (1KB, few rows) vs large (already covered)
     tiny_xml = b'<?xml version="1.0"?><CrystalReport>' + b'<Details Level="3"><Section SectionNumber="0"><Field Name="F"><Value>1</Value></Field></Section></Details>'*5 + b'</CrystalReport>'
     p_tiny = write_edge("tiny_1kb", tiny_xml)
-    report(p_tiny, "edge tiny 1KB", lambda p=p_tiny: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+    report(p_tiny, "edge tiny 1KB", lambda p=p_tiny: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds, collect=collect)
 
     # 8) All engines on edge single row (stream vs columnar vs parallel vs bounded)
     p_single = edge_dir / "single_row.xml"
@@ -844,7 +993,7 @@ def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False):
         def fn(eng=eng, p=p_single):
             src = CrystalXMLSource(str(p), row_tag="Details", engine=eng)
             return src.to_arrow()
-        report(p_single, f"edge single [{eng}]", fn, rounds=rounds)
+        report(p_single, f"edge single [{eng}]", fn, rounds=rounds, collect=collect)
 
     # 9) Sinks on edge
     p_10 = BENCH_DATA / "test_10mb.xml"
@@ -858,7 +1007,7 @@ def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False):
                     return src.to_dataframe()
                 elif sink == "to_polars":
                     return src.to_polars()
-            report(p_10, f"edge sink {sink}", fn, rounds=rounds)
+            report(p_10, f"edge sink {sink}", fn, rounds=rounds, collect=collect)
 
     # 10) Streaming with 64KB vs 1MB on tiny file (constant memory)
     p_10 = BENCH_DATA / "test_10mb.xml"
@@ -868,12 +1017,12 @@ def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False):
                 # Use new streaming iterator (true 64KB)
                 it = _core.iter_record_batches(str(p), row_tag="Details", memory=mem)
                 return sum(b.num_rows for b in it)
-            report(p_10, f"edge stream {mem}", fn, rounds=rounds, mem=mem)
+            report(p_10, f"edge stream {mem}", fn, rounds=rounds, collect=collect, mem=mem)
 
     # 11) Truncated / malformed (should not panic, return truncated row discarded)
     trunc_xml = b'<?xml version="1.0"?><CrystalReport><Group><Group Level="2"><Details Level="3"><Section SectionNumber="0"><Field Name="Field22"><Value>1</Value></Field></Section></Details></Group>'
     p_trunc = write_edge("truncated", trunc_xml)
-    report(p_trunc, "edge truncated", lambda p=p_trunc: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds)
+    report(p_trunc, "edge truncated", lambda p=p_trunc: _core.read_to_columnar(str(p), row_tag="Details"), rounds=rounds, collect=collect)
 
     # 12) Field types bool/date32/timestamp via typed columns
     p_10 = BENCH_DATA / "test_10mb.xml"
@@ -882,7 +1031,7 @@ def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False):
             def fn(ftype=ftype, p=p_10):
                 src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel", field_types={"Field73": ftype})
                 return src.to_arrow()
-            report(p_10, f"edge typed {ftype}", fn, rounds=rounds, field_type=ftype)
+            report(p_10, f"edge typed {ftype}", fn, rounds=rounds, collect=collect, field_type=ftype)
 
 
 if __name__ == "__main__":
