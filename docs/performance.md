@@ -1,12 +1,15 @@
 # Performance
 
 > **⚠ Numbers in this document are stale (Aug 28 build, pre-expect_slot).**
-> Current numbers (Sep 1, with expect_slot + row_satisfied + incremental dicts + target-cpu=native):
+> Current numbers (Sep 1, with expect_slot + row_satisfied + incremental dicts + F1/F2 + target-cpu=native):
 >
-> | File | single | par_auto | drop_half (parallel) | schema (parallel) | auto_dict (parallel) |
-> |------|--------|----------|---------------------|-------------------|---------------------|
-> | 533 MB | **889 MB/s** | 3,829 MB/s | **5,563 MB/s** | **5,972 MB/s** | 3,115 MB/s |
-> | 1 GB | **911 MB/s** | 3,982 MB/s | **5,980 MB/s** | **6,614 MB/s** | 3,745 MB/s |
+> | File | single | par_auto | drop_half (parallel) | schema (parallel) | rename (parallel) |
+> |------|--------|----------|---------------------|-------------------|-------------------|
+> | 10 MB | 956 | 2,545 | 7,051 | 7,725 | — |
+> | 50 MB | 825 | 2,366 | 5,820 | 5,539 | — |
+> | 100 MB | 1,005 | 4,232 | — | — | — |
+> | 533 MB | **899** | 4,492 | **6,399** | — | **6,793** |
+> | 1 GB | **957** | **4,920** | **6,763** | — | **7,015** |
 
 ## Environment
 
