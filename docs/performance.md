@@ -163,6 +163,7 @@ Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, ful
 
 ### Source engines × sinks (`CrystalXMLSource`)
 
+<!-- BEGIN:source -->
 | Engine → Sink | 10 MB iter | 100 MB iter | 100 MB to_arrow | 1 GB to_arrow |
 |---|---|---|---|---|
 | **stream → iter** | 517 MB/s / 468k | 501 / 459k |: (sparse-column fallback) | 515 / 451k |
@@ -171,6 +172,7 @@ Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, ful
 | **columnar → to_arrow** | 637 / 576k | 667 / 603k | 667 / 603k | 694 / 628k |
 | **parallel → to_arrow** | 1888 / 1.70M | 2620 / 2.36M | 2620 / 2.36M | **3072 / 2.78M** |
 | **auto → to_arrow** | 1857 / 1.68M | 2691 / 2.43M | 2691 / 2.43M | 2874 / 2.60M |
+<!-- END:source -->
 
 `stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:542` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:546` (`auto_mmap`) + `RowSink` `lib.rs:564` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:81` (`next_row_start` `splitter.rs:107` + `parse_row` `scanner.rs:73`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234): within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1-2% self, not Rust: GIL floor.
 
@@ -180,6 +182,7 @@ Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, ful
 
 Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `auto_dict` / `filter` / `schema` / `use_mmap` (`bench_extended.py:54` `PUSHDOWNS`).
 
+<!-- BEGIN:pushdown -->
 | Pushdown | columnar | parallel | Notes |
 |---|---|---|---|
 | baseline | 681 MB/s | 2706 MB/s | 10 cols |
@@ -196,6 +199,7 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 | `filter_compare` `Field22>Field23` | 642 (45k rows) | 2346 (45k) | `compare` + `apply_compare_filter` `arrow_export.rs:29` fast path |
 | `schema` ordering | 653 | 2525 | `sort_columns` `engine.rs:152` |
 | `mmap` on/off | 647/656 | 2771/2590 | `auto_mmap` 2-4% single, warm-cache `rep_movs` 3% perf |
+<!-- END:pushdown -->
 
 `drop_all` shows the engine is **CPU-bound**, not I/O: reducing copied fields from 10→0 gives 1.66×, yet ceiling stays ~3 GB/s.
 

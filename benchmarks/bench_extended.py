@@ -450,6 +450,7 @@ def bench_lxml(path: Path, to_dataframe=False):
 _isolate = False
 _taskset = None
 _warm_cache = False
+_isolate_min_size = 50  # MB: skip subprocess isolation for smaller files
 
 def _run_subprocess_isolated(config: BenchConfig, rounds: int, file_size: int) -> dict:
     """Run a benchmark in a fresh subprocess.
@@ -482,8 +483,14 @@ config = BenchConfig(**json.loads(sys.stdin.read()))
 fn = _config_to_fn(config)
 file_size = {file_size}
 
-# Warm pass if requested
+# Evict page cache + warm pass if requested
 if {repr(_warm_cache)}:
+    try:
+        fd = os.open(config.file, os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+    except Exception:
+        pass
     fn()
 
 # Run the benchmark
@@ -495,6 +502,16 @@ median, best, worst, cov, rows, n, times = result
 mb = file_size / median / 1024 / 1024 if median > 0 else 0
 rps = rows / median if median > 0 and rows else 0
 
+# Capture peak RSS (VmHWM) from /proc/self/status
+rss_kb = 0
+try:
+    for line in open('/proc/self/status'):
+        if line.startswith('VmHWM:'):
+            rss_kb = int(line.split()[1])
+            break
+except Exception:
+    pass
+
 output = {{
     "median": median,
     "best": best,
@@ -505,6 +522,7 @@ output = {{
     "times": times,
     "mb_per_s": mb,
     "rows_per_s": rps,
+    "rss_mb": rss_kb / 1024,
 }}
 print(json.dumps(output))
 """]
@@ -554,7 +572,7 @@ def report(path: Path, label_or_config, fn=None, rounds=3, collect: Optional[Cal
     if isinstance(label_or_config, BenchConfig):
         config = label_or_config
         label = config.label
-        if _isolate:
+        if _isolate and sz >= _isolate_min_size * 1024 * 1024:
             result = _run_subprocess_isolated(config, rounds, sz)
             if "error" in result:
                 print(f"  {label:38s} FAILED: {result['error']}")
@@ -568,8 +586,9 @@ def report(path: Path, label_or_config, fn=None, rounds=3, collect: Optional[Cal
             times = result["times"]
             mb = result["mb_per_s"]
             rps = result["rows_per_s"]
+            rss = result.get("rss_mb", 0)
             extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
-            print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s median ({best:.4f}-{worst:.4f}, CoV {cov:.1%}, n={n})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {extra}")
+            print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s median ({best:.4f}-{worst:.4f}, CoV {cov:.1%}, n={n})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {rss:5.1f} MB rss  {extra}")
             if collect is not None:
                 collect(label, path, times, rows, cov)
             return dt, rows, mb
@@ -722,7 +741,7 @@ def run_chunk_scaling(path: Path, rounds=3, collect=None):
         )
         report(path, config, rounds=rounds, collect=collect, n=n)
 
-def run_bounded_scaling(path: Path, rounds=2, collect=None):
+def run_bounded_scaling(path: Path, rounds=3, collect=None):
     print(f"\n-- Bounded Scaling {path.name} --")
     import re as _re
     for mem in ["64MB","256MB","512MB"]:
@@ -808,6 +827,8 @@ def main():
                     help="Pin to CPU list via taskset, e.g. '0-15' for all cores")
     ap.add_argument("--warm-cache", action="store_true",
                     help="Run a warm pass before timed measurements (evicts cold-start overhead)")
+    ap.add_argument("--isolate-min-size", type=int, default=50,
+                    help="Skip subprocess isolation for files smaller than N MB (default 50)")
     args = ap.parse_args()
     # Verify extension matches HEAD before any measurements
     _verify_build_sha(allow_dirty=args.allow_dirty)
@@ -815,10 +836,11 @@ def main():
     _thp_value = setup_thp_madvise()
 
     # Set module-level globals for subprocess access
-    global _isolate, _taskset, _warm_cache
+    global _isolate, _taskset, _warm_cache, _isolate_min_size
     _isolate = args.isolate
     _taskset = args.taskset
     _warm_cache = args.warm_cache
+    _isolate_min_size = args.isolate_min_size
 
     # Setup JSON output collection with provenance
     json_results = []
@@ -834,6 +856,13 @@ def main():
 
     def collect_json(label, path, times, rows, cov):
         if args.output:
+            # Capture peak RSS for in-process path (subprocess path reports VmHWM separately)
+            try:
+                import resource
+                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                rss_mb = rss_kb / 1024  # Linux: ru_maxrss is in KB
+            except Exception:
+                rss_mb = 0
             json_results.append({
                 "label": label,
                 "file": str(path),
@@ -846,6 +875,7 @@ def main():
                 "cov": cov,
                 "rows": rows,
                 "mb_per_s": (path.stat().st_size / (statistics.median(times) or 1) / 1024 / 1024) if path.exists() else 0,
+                "rss_mb": rss_mb,
                 "commit": _commit,
                 "dirty": _dirty,
             })
@@ -903,7 +933,7 @@ def main():
         if "chunk" in include:
             run_chunk_scaling(p, rounds=rounds, collect=collect_json)
         if "bounded" in include and not args.quick:
-            run_bounded_scaling(p, rounds=2 if mb>100 else 2, collect=collect_json)
+            run_bounded_scaling(p, rounds=rounds, collect=collect_json)
         if "batch" in include and not args.quick:
             run_batch_size_matrix(p, rounds=rounds, collect=collect_json)
         if "par_stream" in include and not args.quick:
@@ -938,7 +968,12 @@ def main():
         print(f"Wrote {len(json_results)} records to {out_path} (commit {_commit} dirty={_dirty})")
 
 def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False, collect=None):
-    """Benchmark edge cases: empty, single row, ragged, sparse, truncated, entities, unicode, different row_tags."""
+    """Benchmark edge cases: empty, single row, ragged, sparse, truncated, entities, unicode, different row_tags.
+
+    Edge cases always run in-process: files are <1 KB, subprocess overhead
+    (0.3s) would dominate. Subprocess isolation is for files >=50 MB where
+    cross-config contamination matters.
+    """
     print("\n" + "="*70)
     print("EDGE CASES")
     print("="*70)
