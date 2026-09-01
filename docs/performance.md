@@ -1,29 +1,37 @@
 # Performance
 
-> **⚠ Numbers in this document are stale (Aug 28 build, pre-expect_slot).**
-> Current numbers (Sep 1, with expect_slot + row_satisfied + incremental dicts + F1/F2 + target-cpu=native):
->
-> | File | single | par_auto | drop_half (parallel) | schema (parallel) | rename (parallel) |
-> |------|--------|----------|---------------------|-------------------|-------------------|
-> | 10 MB | 956 | 2,545 | 7,051 | 7,725 | — |
-> | 50 MB | 825 | 2,366 | 5,820 | 5,539 | — |
-> | 100 MB | 1,005 | 4,232 | — | — | — |
-> | 533 MB | **899** | 4,492 | **6,399** | — | **6,793** |
-> | 1 GB | **957** | **4,920** | **6,763** | — | **7,015** |
+## Numbers
+
+Three throughput figures, not one. All on synthetic Crystal Reports XML (11 fields/row, ~9 rows/KB), median-of-7, warm cache.
+
+| File | Single-thread | Parallel (auto chunks) | Projected (drop_half, rename) |
+|------|:------------:|:----------------------:|:-----------------------------:|
+| 100 MB | **1,005 MB/s** | 4,232 MB/s | — |
+| 533 MB | 899 MB/s | 4,492 MB/s | 6,399–6,793 MB/s |
+| 1 GB | 957 MB/s | **4,920 MB/s** | **6,763–7,015 MB/s** |
+
+- **Single-thread**: `engine="columnar"`, one thread, full 11-column parse + Arrow export.
+- **Parallel (auto)**: `engine="parallel"`, chunk count = `max(threads, min(16×threads, file/4MB))`. On 16 cores / 1 GB: 256 chunks.
+- **Projected**: parallel with `drop_fields` or `field_mapping` pushdown. `row_satisfied` byte-jumps to row close after wanted columns arrive, skipping remaining fields.
+
+Small files (10 MB: 956 MB/s single, 50 MB: 825 MB/s) scale poorly — fixed costs dominate below ~100 MB.
 
 ## Environment
 
 | Component | Detail |
 |---|---|
-| **CPU** | AMD Ryzen 7 5800X (8 cores / 16 threads, 3.8 GHz base) |
-| **OS** | Arch Linux |
-| **Python** | 3.12 (venv) |
+| **CPU** | AMD Ryzen 7 5800X (8 cores / 16 threads, 3.8–4.85 GHz) |
+| **RAM** | 32 GB DDR4 |
+| **OS** | Arch Linux, kernel 7.1.9 |
+| **Python** | 3.14.7 |
 | **pyarrow** | 24.0.0 |
-| **crxml** | 1.2.0 (scanner + `row_dirty` core, super-optimized streaming) |
-| **rypipe-core** | 0.1.1 (Vec+field_index+row_dirty) |
+| **Rust** | 1.98.0 (target-cpu=native, LTO, codegen-units=1) |
+| **crxml** | 1.2.0 |
+| **rypipe-core** | 0.1.1 |
 | **Build** | release, LTO enabled, mimalloc allocator |
-| **Cache** | warm (one warmup parse, median-of-7, CoV median 5% max 26% (see noise floor below)) |
-| **Method** | median-of-7, CoV per cell, adaptive rounds until 1.31×CoV ≤5% capped at 31 (halving floor costs 4× rounds) |
+| **Method** | median-of-7, CoV per cell, adaptive rounds until 1.31×CoV ≤ 5% capped at 31 |
+
+> **Note on body numbers:** Tables and measurements in the sections below were taken at the time noted (mostly Aug 28). They are correct for that build but predate the expect_slot fast path, row_satisfied projection short-circuit, incremental dict unification, and F1/F2 scanner optimizations. The current numbers in the header above reflect the latest build.
 
 > **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5-10% above median (1-2× CoV), so **do not compare across that boundary.** All deltas below are median vs median.
 >
