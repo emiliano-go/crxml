@@ -150,14 +150,18 @@ fn parse_row<S: ColumnarSink + ?Sized>(
         return Flow::Recover;
     }
 
+    // Reset ordinal counter after row-tag attributes so child ordinals start at 0.
+    sink.reset_child_ordinal();
+
     if open.self_closing {
         sink.end_row();
         return Flow::At(open.after());
     }
 
     let mut cur = open.after();
+    let mut ordinal: u32 = 0;
     loop {
-        cur = match scan_child(bytes, cur, row_tag, regions, sink) {
+        cur = match scan_child(bytes, cur, row_tag, regions, sink, &mut ordinal) {
             ChildFlow::Continue(next) => next,
             ChildFlow::RowEnd(after) => {
                 sink.end_row();
@@ -205,6 +209,7 @@ fn scan_child<S: ColumnarSink + ?Sized>(
     row_tag: &[u8],
     regions: &[Range<usize>],
     sink: &mut S,
+    ordinal: &mut u32,
 ) -> ChildFlow {
     let l = match next_lt(bytes, cur) {
         Some(p) => p,
@@ -237,12 +242,17 @@ fn scan_child<S: ColumnarSink + ?Sized>(
         None => return ChildFlow::Truncated,
     };
     match child.name {
-        b"Field" => lift(field_element(bytes, &child, regions, sink)),
+        b"Field" => {
+            let r = field_element(bytes, &child, regions, sink, *ordinal);
+            *ordinal += 1;
+            lift(r)
+        }
         b"Text" => lift(text_element(bytes, &child, regions, sink)),
         b"Section" => lift(section_element(bytes, &child, sink)),
         other => {
             let name = utf8_unchecked(other);
             sink.resolve_and_put(name, Value::Str(Cow::Borrowed("")));
+            *ordinal += 1;
             ChildFlow::Continue(child.after())
         }
     }
@@ -284,6 +294,7 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
     open: &OpenTag<'_>,
     regions: &[Range<usize>],
     sink: &mut S,
+    ordinal: u32,
 ) -> Flow {
     let interior = open.interior(bytes);
     let key_raw = match find_attr_value(interior, &[b"FieldName", b"Name"]) {
@@ -291,6 +302,75 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
         Ok(None) => b"Field",
         Err(()) => return Flow::Recover,
     };
+
+    // Fast path: if the engine cached a slot for this ordinal and the raw
+    // bytes match, skip decode_attr + resolve entirely.
+    if let Some((slot, expected)) = sink.expect_slot(ordinal) {
+        if key_raw.len() == expected.len() && key_raw == expected {
+            // Match — skip decode and resolve. Extract text and push directly.
+            if !sink.needs_value() {
+                return match find_close_after(bytes, open.after(), &CLOSE_FIELD, PAT_FIELD, regions) {
+                    Some(after) => Flow::At(after),
+                    None => Flow::Truncated,
+                };
+            }
+            let mut text: Cow<'a, str> = Cow::Borrowed("");
+            let mut cur = open.after();
+            loop {
+                let l = match next_lt(bytes, cur) {
+                    Some(p) => p,
+                    None => return Flow::Truncated,
+                };
+                if l + 1 >= bytes.len() { return Flow::Truncated; }
+                if in_region(regions, l) { cur = region_end(regions, l); continue; }
+                let after_lt = l + 1;
+                if bytes[after_lt] == b'/' {
+                    if bytes.len() - after_lt >= 7 && &bytes[after_lt..after_lt + 7] == b"/Field>" {
+                        sink.put_field_at(slot, Value::Str(text));
+                        return Flow::At(after_lt + 7);
+                    }
+                    let (name, after) = match scan_close_tag(bytes, l) {
+                        Some(x) => x,
+                        None => return Flow::Truncated,
+                    };
+                    if name == b"Field" {
+                        sink.put_field_at(slot, Value::Str(text));
+                        return Flow::At(after);
+                    }
+                    cur = after;
+                    continue;
+                }
+                if bytes[after_lt] == b'!' || bytes[after_lt] == b'?' {
+                    cur = match skip_construct(bytes, l) {
+                        Some(p) => p,
+                        None => return Flow::Truncated,
+                    };
+                    continue;
+                }
+                if bytes.len() - l >= 16 && &bytes[l..l + 16] == b"<FormattedValue>" {
+                    match raw_text_until_fast(bytes, l + 16, CLOSE_FORMATTED_NAME, regions) {
+                        Some((raw, after, has_entity)) => { assign_text(&mut text, raw, has_entity); cur = after; }
+                        None => return Flow::Truncated,
+                    }
+                    continue;
+                }
+                if bytes.len() - l >= 7 && &bytes[l..l + 7] == b"<Value>" {
+                    match raw_text_until_fast(bytes, l + 7, CLOSE_VALUE_NAME, regions) {
+                        Some((raw, after, has_entity)) => { assign_text(&mut text, raw, has_entity); cur = after; }
+                        None => return Flow::Truncated,
+                    }
+                    continue;
+                }
+                // Unknown child in fast path — shouldn't happen with stable layout.
+                sink.layout_broken(ordinal);
+                return Flow::Recover;
+            }
+        }
+        // Mismatch — invalidate and fall through to generic path.
+        sink.layout_broken(ordinal);
+    }
+
+    // Generic path: full decode + resolve.
     let key = decode_attr(key_raw);
 
     // Fast paths for locate-only and traversal-only tiers.
