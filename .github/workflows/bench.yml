@@ -62,4 +62,4 @@ jobs:
       - name: Check docs match committed JSON
         run: |
           python scripts/render_perf_tables.py --check
-          git diff --exit-code docs/ --quiet || (echo "docs/performance.md is stale — run benchmarks/bench_extended.py --output .benchmarks/ on the 5800X and commit"; exit 1)
+          git diff --exit-code docs/ || (echo "docs/performance.md is stale — run benchmarks/bench_extended.py --output .benchmarks/ on the 5800X and commit"; exit 1)
