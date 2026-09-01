@@ -322,6 +322,9 @@ def main():
 
     all_data = load_jsons()
     if not all_data:
+        if args.check:
+            print("No JSON files found, nothing to check")
+            return 0
         print("No JSON files found in .benchmarks/")
         return 1
 
