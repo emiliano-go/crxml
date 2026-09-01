@@ -848,7 +848,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rypipe-core"
 version = "0.1.1"
-source = "git+https://github.com/emiliano-go/rypipe#47fba939153b0d8f28875587ff9369bc02b3cba5"
+source = "git+https://github.com/emiliano-go/rypipe#1db36147d56d1ee3c1233587ddae0715884a21bb"
 dependencies = [
  "arrow",
  "chrono",

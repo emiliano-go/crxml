@@ -1,5 +1,17 @@
 # Performance
 
+> **⚠ Numbers in this document are stale (Aug 28 build, pre-expect_slot).**
+> Current numbers (Sep 1, with expect_slot fast path + target-cpu=native):
+>
+> | File | single | par128 (peak) | par_auto |
+> |------|--------|---------------|----------|
+> | 533 MB | **965 MB/s** | **4,656 MB/s** | 4,340 MB/s |
+> | 1 GB | **925 MB/s** | **4,535 MB/s** | 4,208 MB/s |
+>
+> The old 4,470/4,980 numbers were from a broken build (speculative matching dead code).
+> The old 5,522 was also from the broken build.
+> Single-thread target (1,000 MB/s) is within 3.5%. Parallel target (5,000 MB/s) is within 7%.
+
 ## Environment
 
 | Component | Detail |
