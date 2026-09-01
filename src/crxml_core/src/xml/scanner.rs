@@ -242,7 +242,7 @@ fn scan_child<S: ColumnarSink + ?Sized>(
         b"Section" => lift(section_element(bytes, &child, sink)),
         other => {
             let name = utf8_unchecked(other);
-            sink.resolve_and_put(name, Value::Str(""));
+            sink.resolve_and_put(name, Value::Str(Cow::Borrowed("")));
             ChildFlow::Continue(child.after())
         }
     }
@@ -269,7 +269,7 @@ fn emit_all_attrs<S: ColumnarSink + ?Sized>(
             Ok((key_raw, val_raw)) => {
                 let key = decode_attr(key_raw);
                 let val = decode_attr(val_raw);
-                sink.resolve_and_put(&key, Value::Str(&val));
+                sink.resolve_and_put(&key, Value::Str(val));
             }
             Err(()) => return true,
         }
@@ -346,7 +346,7 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
             // Close tag: try </Field> (8 bytes)
             if bytes.len() - after_lt >= 7 && &bytes[after_lt..after_lt + 7] == b"/Field>" {
                 let after = after_lt + 7; // past '>'
-                sink.resolve_and_put(&key, Value::Str(&text));
+                sink.resolve_and_put(&key, Value::Str(text));
                 return Flow::At(after);
             }
             // Unknown close tag — fall back to generic scan
@@ -355,7 +355,7 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
                 None => return Flow::Truncated,
             };
             if name == b"Field" {
-                sink.resolve_and_put(&key, Value::Str(&text));
+                sink.resolve_and_put(&key, Value::Str(text));
                 return Flow::At(after);
             }
             cur = after;
@@ -460,7 +460,7 @@ fn text_element<'a, S: ColumnarSink + ?Sized>(
             // Close tag: try </Text> (6 bytes)
             if bytes.len() - after_lt >= 6 && &bytes[after_lt..after_lt + 6] == b"/Text>" {
                 let after = after_lt + 6;
-                sink.resolve_and_put(&key, Value::Str(&text));
+                sink.resolve_and_put(&key, Value::Str(text));
                 return Flow::At(after);
             }
             let (name, after) = match scan_close_tag(bytes, l) {
@@ -468,7 +468,7 @@ fn text_element<'a, S: ColumnarSink + ?Sized>(
                 None => return Flow::Truncated,
             };
             if name == b"Text" {
-                sink.resolve_and_put(&key, Value::Str(&text));
+                sink.resolve_and_put(&key, Value::Str(text));
                 return Flow::At(after);
             }
             cur = after;
@@ -512,7 +512,7 @@ fn section_element<S: ColumnarSink + ?Sized>(
         Ok(None) => Cow::Borrowed(""),
         Err(()) => return Flow::Recover,
     };
-    sink.resolve_and_put("Section", Value::Str(&sn));
+    sink.resolve_and_put("Section", Value::Str(sn));
     Flow::At(open.after())
 }
 
@@ -572,7 +572,10 @@ fn in_region(regions: &[Range<usize>], at: usize) -> bool {
     if regions.is_empty() {
         return false;
     }
-    regions.iter().any(|r| r.contains(&at))
+    match regions.binary_search_by(|r| r.start.cmp(&at)) {
+        Ok(_) => true,
+        Err(i) => i > 0 && regions[i - 1].contains(&at),
+    }
 }
 
 #[inline]
@@ -580,12 +583,16 @@ fn region_end(regions: &[Range<usize>], at: usize) -> usize {
     if regions.is_empty() {
         return at + 1;
     }
-    for r in regions {
-        if r.contains(&at) {
-            return r.end;
+    match regions.binary_search_by(|r| r.start.cmp(&at)) {
+        Ok(i) => regions[i].end,
+        Err(i) => {
+            if i > 0 && regions[i - 1].contains(&at) {
+                regions[i - 1].end
+            } else {
+                at + 1
+            }
         }
     }
-    at + 1
 }
 
 /// Scan an open tag starting at `<`. Quote-aware so `>` inside attribute

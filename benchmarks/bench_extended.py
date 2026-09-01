@@ -460,6 +460,13 @@ def ensure_files(targets, gen_only=False, skip_1gb=False):
 # Matrix definitions
 # ---------------------------------------------------------------------------
 
+def _auto_chunks(path):
+    """Replicate the auto chunk rule from CrystalXMLSource."""
+    import multiprocessing
+    threads = multiprocessing.cpu_count()
+    file_bytes = os.path.getsize(str(path))
+    return max(threads, min(16 * threads, file_bytes // (4 * 1024 * 1024)))
+
 NATIVE_FUNCS = {
     "single": lambda p: _core.read_to_columnar(str(p), row_tag="Details"),
     "multi2": lambda p: _core.read_to_columnar_multi(str(p), row_tag="Details", num_chunks=2),
@@ -467,6 +474,7 @@ NATIVE_FUNCS = {
     "par8": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=8),
     "par16": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=16),
     "par32": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=32),
+    "par_auto": lambda p: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=_auto_chunks(p)),
     "bounded64": lambda p: _core.read_to_columnar_bounded(str(p), row_tag="Details", memory=64*1024*1024),
     "bounded256": lambda p: _core.read_to_columnar_bounded(str(p), row_tag="Details", memory=256*1024*1024),
 }
@@ -553,8 +561,8 @@ def run_pushdown_matrix(path: Path, rounds=3, quick=False):
 
 def run_chunk_scaling(path: Path, rounds=3):
     print(f"\n-- Chunk Scaling {path.name} --")
-    for n in [2,4,8,16,32,64]:
-        report(path, f"par n={n:2d}", lambda n=n, p=path: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=n), rounds=rounds, n=n)
+    for n in [2,4,8,16,32,64,128,256]:
+        report(path, f"par n={n:3d}", lambda n=n, p=path: _core.read_to_columnar_par(str(p), row_tag="Details", num_chunks=n), rounds=rounds, n=n)
 
 def run_bounded_scaling(path: Path, rounds=2):
     print(f"\n-- Bounded Scaling {path.name} --")
