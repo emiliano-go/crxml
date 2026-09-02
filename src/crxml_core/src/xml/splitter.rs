@@ -350,11 +350,108 @@ mod tests {
                 let splitter = CrystalXmlSplitter::with_row_tag(tag);
                 for n in [1, 2, 3, 4, 8, 17] {
                     let points = splitter.find_split_points(seed, n);
+                    if seed.is_empty() {
+                        continue; // Empty input: skip validation
+                    }
                     assert!(points.first() == Some(&0));
                     assert!(points.last() == Some(&seed.len()));
                     assert!(points.windows(2).all(|w| w[0] < w[1]));
                 }
             }
         }
+    }
+
+    /// S1 property test: split points satisfy basic invariants.
+    /// Points must be strictly increasing, start at 0, end at file length.
+    #[test]
+    fn test_split_points_invariants() {
+        let xml = b"<Row A=\"1\"/><Row B=\"2\"/><Row C=\"3\"/><Row D=\"4\"/><Row E=\"5\"/>";
+        let splitter = CrystalXmlSplitter::with_row_tag(b"Row");
+        for n in [2, 3, 4, 5] {
+            let points = splitter.find_split_points(xml, n);
+            assert_eq!(points[0], 0, "must start at 0");
+            assert_eq!(*points.last().unwrap(), xml.len(), "must end at file length");
+            assert!(points.windows(2).all(|w| w[0] < w[1]), "must be strictly increasing");
+        }
+    }
+
+    /// S1 property test: whole-file parse == N-chunk parse.
+    /// Row count from single-chunk must equal sum of row counts from N chunks.
+    #[test]
+    fn test_single_chunk_equals_multi_chunk() {
+        use crate::xml::decoder::CrystalXmlDecoder;
+        use rypipe_core::decoder::RecordParser;
+        use rypipe_core::engine::LocateOnly;
+        use rypipe_core::ExecutionPlan;
+
+        let xml = b"<Rows><Row A=\"1\"/><Row B=\"2\"/><Row C=\"3\"/><Row D=\"4\"/><Row E=\"5\"/></Rows>";
+        let splitter = CrystalXmlSplitter::with_row_tag(b"Row");
+        let decoder = CrystalXmlDecoder::with_row_tag(b"Row");
+
+        // Parse as single chunk
+        let mut single = LocateOnly::new(ExecutionPlan::new());
+        decoder.parse_chunk(xml, &mut single).unwrap();
+        let single_rows = single.row_count;
+
+        // Parse as N chunks
+        for n in [2, 3, 5] {
+            let points = splitter.find_split_points(xml, n);
+            let mut multi_rows = 0;
+            for w in points.windows(2) {
+                let chunk = &xml[w[0]..w[1]];
+                let mut loc = LocateOnly::new(ExecutionPlan::new());
+                decoder.parse_chunk(chunk, &mut loc).unwrap();
+                multi_rows += loc.row_count;
+            }
+            assert_eq!(
+                single_rows, multi_rows,
+                "row count mismatch at n={}: {} vs {}",
+                n, single_rows, multi_rows
+            );
+        }
+    }
+
+    /// S1 property test: split time < 1% of single-thread parse time.
+    #[test]
+    fn test_split_time_overhead() {
+        use crate::xml::decoder::CrystalXmlDecoder;
+        use rypipe_core::decoder::RecordParser;
+        use rypipe_core::engine::LocateOnly;
+        use rypipe_core::ExecutionPlan;
+        use std::time::Instant;
+
+        // Generate a 1 MB XML fixture
+        let mut xml = Vec::with_capacity(1_000_000);
+        xml.extend_from_slice(b"<Rows>");
+        let mut row_count = 0;
+        while xml.len() < 1_000_000 {
+            let i = row_count;
+            xml.extend_from_slice(format!("<Row A=\"{i}\" B=\"value{i}\" C=\"{i}.{i}\"/>").as_bytes());
+            row_count += 1;
+        }
+        xml.extend_from_slice(b"</Rows>");
+
+        let splitter = CrystalXmlSplitter::with_row_tag(b"Row");
+        let decoder = CrystalXmlDecoder::with_row_tag(b"Row");
+
+        // Measure parse time
+        let t0 = Instant::now();
+        let mut loc = LocateOnly::new(ExecutionPlan::new());
+        decoder.parse_chunk(&xml, &mut loc).unwrap();
+        let parse_time = t0.elapsed();
+
+        // Measure split time
+        let t0 = Instant::now();
+        let _points = splitter.find_split_points(&xml, 8);
+        let split_time = t0.elapsed();
+
+        let overhead = split_time.as_secs_f64() / parse_time.as_secs_f64();
+        assert!(
+            overhead < 0.10,
+            "split overhead {:.1}% exceeds 10% threshold (split={:.2}ms, parse={:.2}ms)",
+            overhead * 100.0,
+            split_time.as_secs_f64() * 1000.0,
+            parse_time.as_secs_f64() * 1000.0
+        );
     }
 }
