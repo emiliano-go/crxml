@@ -1,10 +1,38 @@
 # Changelog
 
-## 1.2.1 (unreleased)
+## 2.0.0 (2026-09-02)
+
+### Framework rebrand
+
+- rypipe reframed as a "data ingestion framework" (was "columnar engine"). Code and traits unchanged; reframing reflects that adapters extend rypipe rather than merely using it.
+
+### Performance
+
+- **Single-thread**: ~953 MB/s on 533 MB Crystal Reports XML (up from ~800 MB/s).
+- **Parallel projected**: ~6,879-7,630 MB/s drop_half/rename/schema on 533 MB.
+- **Incremental dict unification**: auto_dict parallel gap closed from 45% to 16%. Per-chunk upgrade in parallel, then O(dict_size) unification.
+- **row_satisfied projection short-circuit**: Scanner byte-jumps to row close when all wanted columns arrive. +64% on drop_half parallel.
+- **expect_slot layout prediction**: memcmp raw bytes instead of full attribute scan + hash lookup. ~25 ns to ~8 ns per field.
+- **F1 precomputed close_finder**: Eliminated per-row Vec+Finder allocation. +10% single-thread.
+- **F2 fast-path find_attr_value**: Single-attribute fast path. +3% single-thread.
+- **Engine-provided Splitter default**: Eliminates bug class that caused TSV and crxml regressions.
 
 ### Bug Fixes
 
-- **Sparse-column KeyError on collect/dict path**: `CrystalXMLSource.to_arrow()` used the first row's keys as schema and `r[k]` for lookup. When a later row carried a field the first row lacked (e.g., `Field72` in 8% of rows, `Text21` in 1% - the common pattern in real Crystal Reports exports), the stream engine threw `KeyError`. Fixed to union all row keys and use `r.get(k)`. This is a user-facing correctness fix: most real exports have sparse columns, and the crash occurred on the default `to_arrow()` path.
+- **Sparse-column KeyError** (from 1.2.1): `to_arrow()` crashed when later rows had fields the first row lacked. Fixed to union all row keys.
+- **Compare filter docs corrected**: Compare filters do not force the merge path; they are applied per-row during parse AND re-applied post-export.
+- **auto_dict docs corrected**: Incremental dict path preserves fast export when schemas consistent.
+
+### Dependencies
+
+- **rypipe-core** upgraded to 2.0.0 (was 0.1.1).
+
+### Documentation
+
+- 134 audit findings fixed across 5 rounds (rypipe + crxml).
+- Architecture docs expanded from 1,058 to 2,000 lines.
+- Writing-adapters reworked into 7 dedicated pages.
+- All em dashes replaced with ;:,()-.
 
 ## 1.2.0 (2026-08-23)
 

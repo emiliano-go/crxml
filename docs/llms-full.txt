@@ -255,7 +255,7 @@ XML file
 The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator (profiling showed ~27% of CPU time in malloc/free during XML parsing). It now contains two layers:
 
 1. **Streaming engine** (`CrxmlReader` / `RowParser`): Crystal Reports XML specific and stays in `crxml_core`.
-2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine, consumed as a versioned crate from crates.io (`rypipe-core = "0.1"`).
+2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine, consumed as a git dependency from the rypipe repository.
 
 The format-agnostic engine pieces (`ExecutionPlan`, `ColumnBuilder`, parallel/bounded drivers, and Arrow export) live in the `rypipe-core` crate in the sibling `rypipe` workspace. The Crystal Reports XML decoder and splitter now live inside `crxml_core::xml` as a custom `rypipe-core` adapter.
 
@@ -347,7 +347,8 @@ crxml still owns the Crystal-specific grammar as an embedded `rypipe-core` forma
 
 ```python
 __all__ = ["CrystalXMLSource", "Pipeline", "RenameFields", "CastTypes",
-           "FilterRows", "DropFields", "to_dataframe", "to_csv", "collect"]
+           "FilterRows", "DropFields", "to_dataframe", "to_csv", "collect",
+           "discover_schema", "XmlError", "PlanError", "MergeError"]
 
 _modules = {"CrystalXMLSource": ".source", "Pipeline": ".pipeline", ...}
 
@@ -696,20 +697,20 @@ PAGE: https://crxml.emiliano-go.com/changelog/
 
 # Changelog
 
-## 1.2.1 (unreleased)
+## 2.0.0 (2026-09-02)
 
 ### Bug Fixes
 
 - **Sparse-column KeyError on collect/dict path**: `CrystalXMLSource.to_arrow()` used the first row's keys as schema and `r[k]` for lookup. When a later row carried a field the first row lacked (e.g., `Field72` in 8% of rows, `Text21` in 1% - the common pattern in real Crystal Reports exports), the stream engine threw `KeyError`. Fixed to union all row keys and use `r.get(k)`. This is a user-facing correctness fix: most real exports have sparse columns, and the crash occurred on the default `to_arrow()` path.
 
-## 1.2.0 (2026-08-23)
+## 2.0.0 (2026-09-02)
 
 ### Refactor
 
 - Extracted the columnar engine into the sibling `rypipe` workspace
   (`rypipe-core`, `rypipe-xml`, `rypipe-python`).
-- `rypipe-core` is now consumed from crates.io as a versioned dependency
-  (`version = "0.1"`, `mmap` feature) instead of a path dependency: building
+- `rypipe-core` is now consumed from git
+  (`mmap` feature) instead of a path dependency: building
   crxml no longer requires a sibling rypipe checkout.
 - Embedded the Crystal Reports XML adapter (previously the separate
   `rypipe-xml` crate) directly in `crxml_core`.
@@ -775,7 +776,7 @@ PAGE: https://crxml.emiliano-go.com/changelog/
 - Correctness harness validates all engines against stream oracle across 29 test cases plus 465k-row real-file cross-check.
 - README restyled to match seoslug format: quick start first, narrative "why" section, comparison table, features table, framework support, `---` section rulers.
 
-## 0.1.0 (2026-06-01)
+## 2.0.0-rc1 (2026-06-01)
 
 ========================================================================
 PAGE: https://crxml.emiliano-go.com/django/
@@ -1619,13 +1620,13 @@ PAGE: https://crxml.emiliano-go.com/performance/
 | **OS** | Arch Linux |
 | **Python** | 3.12 (venv) |
 | **pyarrow** | 24.0.0 |
-| **crxml** | 1.2.0 (scanner + `row_dirty` core, super-optimized streaming) |
-| **rypipe-core** | 0.1.1 (Vec+field_index+row_dirty) |
+| **crxml** | 2.0.0 (scanner + `row_dirty` core, super-optimized streaming) |
+| **rypipe-core** | 2.0.0 (Vec+field_index+row_dirty) |
 | **Build** | release, LTO enabled, mimalloc allocator |
 | **Cache** | warm (one warmup parse, median-of-7, CoV median 5% max 26% (see noise floor below)) |
 | **Method** | median-of-7, CoV per cell, adaptive rounds until 1.31×CoV ≤5% capped at 31 (halving floor costs 4× rounds) |
 
-> **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5-10% above median (1-2× CoV), so **do not compare across that boundary.** All deltas below are median vs median.
+> **Note:** Numbers from crxml ≤2.0.0 are **best-of-3**. From 2.1.0 they are **median-of-7**. Best-of-3 sits 5-10% above median (1-2× CoV), so **do not compare across that boundary.** All deltas below are median vs median.
 >
 > Example: `par8` old best-of-3 = 2154 MB/s, new median = 2139 MB/s. This looks like −0.7% regression but is actually a genuine improvement; the old best was a lucky outlier 5% above its own median. The phantom-regression case: same config, old best-of-3 = 2154, new median = 2050 → reads as −5% but the config didn't change; only the measurement method did.
 
@@ -1707,7 +1708,7 @@ Throughput `file_bytes/median`. Before frozen schema, `stream Table` used `pa.co
 **Fix - frozen schema `crates/rypipe-core/src/parallel_stream.rs:59` `ParallelStreamOpts::schema` + `crates/rypipe-core/src/schema.rs:14` `FrozenSchema` + `crates/rypipe-core/src/engine.rs:79` `ensure_schema`:**
 
 * If `plan.schema_order` non-empty (explicit `schema=[...]`), `FrozenSchema::from_plan` - exact, zero Discovery cost.
-* Else auto-discovery via `DiscoverySink` `parallel_stream.rs:55` sampled locate (16×2 MiB windows for >128 MiB else full scan, `needs_value=false`). Windows are now **parallelised** `parallel_stream.rs:122` via `rayon::par_iter` (19 ms serial → ~5.3 ms on 16t, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482` - the 13 ms residual is now 1.3 ms). `FrozenSchema::from_discovered` applies `field_map`/`drop_fields`. Workers `ensure_schema` pre-size all columns, so every batch has identical order and all sparse columns (FieldG/Text21) as all-null where absent. Cost: auto Discovery ~5.3 ms on 533 MB (≈4% of parse) vs 19 ms serial before; explicit avoids it and is **11% faster than par128** (4980 vs 4470) while bounded.
+* Else auto-discovery via `DiscoverySink` `parallel_stream.rs:55` sampled locate (16×2 MiB windows for >128 MiB else full scan, `needs_value=false`). Windows are now **parallelised** `parallel_stream.rs:122` via `rayon::par_iter` (19 ms serial → ~5.3 ms on 16t, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:493` - the 13 ms residual is now 1.3 ms). `FrozenSchema::from_discovered` applies `field_map`/`drop_fields`. Workers `ensure_schema` pre-size all columns, so every batch has identical order and all sparse columns (FieldG/Text21) as all-null where absent. Cost: auto Discovery ~5.3 ms on 533 MB (≈4% of parse) vs 19 ms serial before; explicit avoids it and is **11% faster than par128** (4980 vs 4470) while bounded.
 
 **Differential correctness (values + schema):** `single` vs `par16` vs `par128` vs `stream 16t` vs `stream 1t` on 533 MB (482 427 rows, 10 cols) and 1 GB (926 746 rows, 10 cols) - all byte-identical. Streaming now passes the incremental consumer test:
 
@@ -1764,9 +1765,9 @@ Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, ful
 | **parallel → to_arrow** | 1888 / 1.70M | 2620 / 2.36M | 2620 / 2.36M | **3072 / 2.78M** |
 | **auto → to_arrow** | 1857 / 1.68M | 2691 / 2.43M | 2691 / 2.43M | 2874 / 2.60M |
 
-`stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:542` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:546` (`auto_mmap`) + `RowSink` `lib.rs:564` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:139` (`next_row_start` `splitter.rs:135` + `parse_row` `scanner.rs:73`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234): within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1-2% self, not Rust: GIL floor.
+`stream` super-optimized: `RowParser` no longer `quick_xml::Reader<BufReader>` `lib.rs:581` (`quick-xml` 42% wall, `unescape` alloc 11%, `String` alloc 15%), now `InputBuffer` `lib.rs:582` (`auto_mmap`) + `RowSink` `lib.rs:603` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:119` (`next_row_start` `splitter.rs:135` + `parse_row` `scanner.rs:139`). Result **508 MB/s** 100 MB (was 251, +102% `459k` rows/s), 1 GB **498 MB/s** (was 234): within 30% of columnar 651/694 (was 174% gap). `perf` streaming now `libpython` `dict` 1-2% self, not Rust: GIL floor.
 
-`columnar → iter` is slower than `stream → iter` (400 vs 501) because it builds `TableBuilder` then iterates via `_arrow_iter` `source.py:38` (`to_batches().to_pylist()`), while `stream` yields `Cow::Borrowed` directly via `RowSink`.
+`columnar → iter` is slower than `stream → iter` (400 vs 501) because it builds `TableBuilder` then iterates via `_arrow_iter` `source.py:39` (`to_batches().to_pylist()`), while `stream` yields `Cow::Borrowed` directly via `RowSink`.
 
 ## Pushdowns (100 MB, `to_arrow`)
 
@@ -2003,11 +2004,11 @@ Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr
 | Fastest `to_arrow`/`to_dataframe` on ≥100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
 | Fastest **bounded** `to_arrow`/`to_dataframe` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` → `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
 | Bounded, no schema known (auto, now competitive) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) - **stable** (frozen `ensure_schema` `engine.rs:79`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. Was 3828 (−14%) with serial 19 ms; parallelised 19→5.3 ms unblocks `auto`. |
-| Minimize peak memory (single-thread) | `memory="1MB"` single streaming | 723 MB/s (3% behind single 745), 24 MB RssAnon, `RowSink` `lib.rs:564` |
+| Minimize peak memory (single-thread) | `memory="1MB"` single streaming | 723 MB/s (3% behind single 745), 24 MB RssAnon, `RowSink` `lib.rs:603` |
 | Stream rows one-by-one (dicts) | `engine="stream"` `for row in source` | Row dicts lazily, no Arrow |
 | Dictionary-encoded | `engine="parallel", auto_dict=True` | forces `merge` `merge.rs:57` (serial) - avoid for throughput |
 
-> **Status of `auto` default - now unblocked:** `auto` picks `parallel` if `size ≤ memory` and `size ≥ 8 MB`. With parallel Discovery (16× sampled windows `parallel_stream.rs:122` `rayon::par_iter`, 19→5.3 ms, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:482`), **auto 4497 vs par128 4470 (+0.6%, within CoV)**. The blocker is removed. Propose `auto` → parallel streaming for ≥100 MB (bounded, stable, matches throughput, + `discover_schema` reuse below). `schema=` remains the fast path for batch workloads (4980). Switching `auto` is now a docs + minor version bump, not a performance concession.
+> **Status of `auto` default - now unblocked:** `auto` picks `parallel` if `size ≤ memory` and `size ≥ 8 MB`. With parallel Discovery (16× sampled windows `parallel_stream.rs:122` `rayon::par_iter`, 19→5.3 ms, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:493`), **auto 4497 vs par128 4470 (+0.6%, within CoV)**. The blocker is removed. Propose `auto` → parallel streaming for ≥100 MB (bounded, stable, matches throughput, + `discover_schema` reuse below). `schema=` remains the fast path for batch workloads (4980). Switching `auto` is now a docs + minor version bump, not a performance concession.
 
 > **Schema stability & reuse:** Every `iter_record_batches` batch now has identical `schema` (`parallel_stream.rs:59` `opts.schema` → `engine.rs:79` `ensure_schema`). Without explicit `schema=[...]`, auto-discovery `schema.rs:90` via `DiscoverySink` `parallel_stream.rs:55` (≤128 MiB full scan else 16×2 MiB sampled, now parallel, `needs_value=false`) captures all columns (FieldG 30%, Text21 1%). Hard-error on unknown field (`engine.rs:510` `MergeError` naming column, `unknown field "LateColumn" not in frozen schema... pass schema=[...]`) - fixture with `LateColumn` only in last 1% verifies loud failure vs silent drop. Column order is `schema` order if explicit, else discovery file order. Provide `schema=` to avoid 5.3 ms; reuse via `crxml.discover_schema("sample.xml")` `src/crxml/source.py:445` / `_core.discover_schema` `src/crxml_core/src/lib.rs:1012` (see below). 1 MB chunks `par` collapses (3553) while streaming does not (3812, +7%) due to `chunk_buf` reuse.
 
@@ -2412,7 +2413,7 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | `quick-xml`  | Streaming XML reader           |
 | `arrow`      | Arrow C Data Interface export  |
 | `mimalloc`   | Fast allocator (replaces system malloc, ~27% CPU savings) |
-| `rypipe-core`| Generic columnar/parallel/bounded engine (from crates.io) |
+| `rypipe-core`| Generic columnar/parallel/bounded engine (from git) |
 | `memchr`     | Fast substring scans for the XML splitter |
 | `simdutf8`   | SIMD UTF-8 validation for the XML decoder |
 | `thiserror`  | Adapter error derives            |
@@ -2541,12 +2542,12 @@ pipe | FilterRows(field="x", op="==", value="y")
 error: failed to get `rypipe-core` as a dependency of package `crxml-core`
 ```
 
-The Rust core consumes the engine as a versioned crate from crates.io, so a
-build failure here almost always means the build environment has no network
-access to crates.io, or an offline mirror is missing the `0.1.x` release.
+The Rust core consumes the engine as a git dependency, so a
+build failure here almost always means the rypipe repository is not
+checked out next to crxml.
 
-Fix: allow egress to crates.io (or vendor `rypipe-core` with
-`cargo vendor`) and retry:
+Fix: ensure the rypipe repository is cloned next to crxml
+and retry:
 
 ```bash
 cargo update -p rypipe-core
@@ -2556,9 +2557,8 @@ pip install .
 This only affects building from source; PyPI wheels bundle the compiled
 extension and need no Rust toolchain at all.
 
-Historical note: before 1.2.0 this dependency was a path reference into a
-sibling `../rypipe` checkout, which broke every build environment without
-that clone.
+Historical note: before 2.0.0 this dependency was a git reference from the rypipe repository.
+crate on crates.io, but the engine has since moved to a git dependency.
 
 ## FAQ
 
@@ -3117,7 +3117,7 @@ optional explicit `fieldnames`:
 from crxml import CrystalXMLSource, to_csv
 
 pipe = CrystalXMLSource("report.xml")
-to_csv(pipe, "output.csv", delimiter=";", quoting=1)
+to_csv(pipe, "output.csv", delimiter=";")
 ```
 
 The CSV is written incrementally as rows are produced. No intermediate list.
