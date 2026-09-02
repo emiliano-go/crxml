@@ -55,6 +55,12 @@ class _ComparePredicate:
 
 
 class FilterRows:
+    """Pipeline stage that filters records by a predicate.
+
+    Accepts a callable predicate, or declarative filter arguments: a constant
+    comparison (``field``, ``op``, ``value``) or a column-vs-column comparison
+    (``field_a``, ``op``, ``field_b``).
+    """
     __slots__ = ("_predicate", "_filter_spec")
 
     def __init__(self, predicate=None, *, field=None, op=None, value=None, field_a=None, field_b=None):

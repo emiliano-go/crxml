@@ -6,13 +6,10 @@ use pyo3::exceptions::{PyException, PyIOError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use pyo3::wrap_pyfunction;
-use quick_xml::events::Event;
-use quick_xml::Reader;
 use rypipe_core::RecordParser;
 use rypipe_core::Splitter;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
 use std::ops::Range;
 use std::path::Path;
 #[cfg(feature = "profile")]
@@ -184,23 +181,6 @@ fn build_plan_from_kwargs(
     }
 
     Ok(std::sync::Arc::new(plan))
-}
-
-fn split_points_to_ranges(points: &[usize], len: usize) -> Vec<Range<usize>> {
-    if points.len() < 2 {
-        return vec![0..len];
-    }
-    points
-        .windows(2)
-        .filter_map(|w| {
-            let (start, end) = (w[0], w[1]);
-            if start < end {
-                Some(start..end)
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn empty_table(py: Python<'_>) -> PyResult<PyObject> {
@@ -385,7 +365,7 @@ pub fn read_to_columnar_multi(
     let splitter = crate::xml::CrystalXmlSplitter::with_row_tag(&row_tag);
     let decoder = crate::xml::CrystalXmlDecoder::with_row_tag(&row_tag);
     let split_points = splitter.find_split_points(bytes, num_chunks);
-    let ranges = split_points_to_ranges(&split_points, bytes.len());
+    let ranges = rypipe_core::split_points_to_ranges(&split_points, bytes.len());
 
     let est_row = splitter.estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
     let cap = (bytes.len() / est_row.max(512)).max(64);
@@ -510,12 +490,9 @@ pub fn read_to_columnar_bounded(
 fn get_par_profile(py: Python<'_>) -> PyResult<PyObject> {
     let (split_scan_ns, chunk_sum_ns, chunk_max_ns, chunk_count) =
         rypipe_core::parallel::chunk_profile();
-    let (special_regions_ns, split_loop_ns) = crate::xml::splitter::split_timing();
     let discovery_ns = rypipe_core::parallel_stream::discovery_profile();
     let d = PyDict::new(py);
     d.set_item("split_scan_ns", split_scan_ns)?;
-    d.set_item("special_regions_ns", special_regions_ns)?;
-    d.set_item("split_loop_ns", split_loop_ns)?;
     d.set_item("discovery_ns", discovery_ns)?;
     d.set_item("chunk_sum_ns", chunk_sum_ns)?;
     d.set_item("chunk_max_ns", chunk_max_ns)?;
@@ -557,25 +534,6 @@ fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
 #[pyfunction]
 #[pyo3(signature = (bytes, row_tag=None))]
 fn _test_parse_both(bytes: Vec<u8>, row_tag: Option<String>) -> PyResult<PyObject> {
-    let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
-    _run_parser(&bytes, row_tag.as_bytes())
-}
-
-/// Testing helper: parse bytes (identical to _test_parse_both).
-/// Kept for backward compatibility with benchmarks that reference it.
-#[cfg(feature = "testing")]
-#[pyfunction]
-#[pyo3(signature = (bytes, row_tag=None))]
-fn _test_parse_fast(bytes: Vec<u8>, row_tag: Option<String>) -> PyResult<PyObject> {
-    let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
-    _run_parser(&bytes, row_tag.as_bytes())
-}
-
-/// Testing helper: parse bytes with the columnar engine.
-#[cfg(feature = "testing")]
-#[pyfunction]
-#[pyo3(signature = (bytes, row_tag=None))]
-fn _test_parse_quickxml(bytes: Vec<u8>, row_tag: Option<String>) -> PyResult<PyObject> {
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
     _run_parser(&bytes, row_tag.as_bytes())
 }
@@ -1109,8 +1067,6 @@ fn _crxml_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "testing")]
     {
         m.add_function(wrap_pyfunction!(_test_parse_both, m)?)?;
-        m.add_function(wrap_pyfunction!(_test_parse_fast, m)?)?;
-        m.add_function(wrap_pyfunction!(_test_parse_quickxml, m)?)?;
     }
     // Build provenance: the git SHA this .so was compiled from.
     // Used by benchmarks to verify the extension matches HEAD.

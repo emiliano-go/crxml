@@ -1,4 +1,8 @@
 class DropFields:
+    """Pipeline stage that removes specified fields from each record.
+
+    Fields not present in a record are silently ignored.
+    """
     __slots__ = ("_fields_set",)
 
     def __init__(self, fields: list[str]):

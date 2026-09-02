@@ -1,11 +1,6 @@
 from typing import Iterable, Iterator, Callable
 
 
-def _arrow_iter(table) -> Iterator[dict]:
-    for i in range(table.num_rows):
-        yield {col: table.column(col)[i].as_py() for col in table.column_names}
-
-
 def plan_split(stages):
     """Split stages into (BuildPlan pushdown kwargs, remaining stages)."""
     plan_overrides = {}

@@ -8,6 +8,12 @@ _PY_TO_RUST_TYPE = {
 }
 
 class CastTypes:
+    """Pipeline stage that casts record fields to the specified types.
+
+    Each mapping entry maps a field name to a Python callable (e.g. ``int``,
+    ``float``) used to coerce the value. Raises ``ValueError`` if a cast
+    fails.
+    """
     __slots__ = ("_mapping",)
 
     def __init__(self, mapping: dict[str, Callable]):

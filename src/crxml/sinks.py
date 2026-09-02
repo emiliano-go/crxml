@@ -8,6 +8,12 @@ def to_dataframe(
     chunksize: int | None = None,
     dtype_backend: str = "pyarrow",
 ) -> "pd.DataFrame":
+    """Convert a pipeline of records into a pandas DataFrame.
+
+    Uses Arrow-backed dtypes by default. When ``chunksize`` is given, records
+    are batched into intermediate DataFrames before concatenation to limit
+    peak memory.
+    """
     import pandas as pd
     types_mapper = pd.ArrowDtype if dtype_backend == "pyarrow" else None
     if chunksize is None:
@@ -79,6 +85,11 @@ def to_csv(
             writer.writerow(record)
 
 def collect(pipeline: Iterable[dict]) -> list[dict]:
+    """Materialize a pipeline into a plain list of dicts.
+
+    Optimizes for columnar pipelines by converting via Arrow when possible,
+    otherwise iterates the pipeline into a list.
+    """
     if hasattr(pipeline, "_to_arrow"):
         table = pipeline._to_arrow()
         if table is not None:

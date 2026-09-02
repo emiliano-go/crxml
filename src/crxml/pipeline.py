@@ -13,6 +13,12 @@ class Pipeline:
         batch_size: int = 1000,
         workers: int | None = None,
     ):
+        """Create a new processing pipeline from a source and optional stages.
+
+        ``batch_size`` controls the number of records per internal batch, and
+        ``workers`` enables parallel execution across that many worker
+        processes.
+        """
         self._source = source
         self._stages = stages or []
         self._batch_size = batch_size
@@ -78,6 +84,11 @@ class Pipeline:
         return None
 
     def parallel(self, workers: int | None = None, batch_size: int = 1000) -> "Pipeline":
+        """Return a copy of this pipeline that processes records in parallel.
+
+        Each batch of ``batch_size`` records is dispatched to a pool of
+        ``workers`` processes for stage execution.
+        """
         return Pipeline(
             self._source,
             self._stages,

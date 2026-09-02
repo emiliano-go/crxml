@@ -1,4 +1,8 @@
 class RenameFields:
+    """Pipeline stage that renames fields in each record according to a mapping.
+
+    Fields not present in the mapping are passed through unchanged.
+    """
     __slots__ = ("_mapping",)
 
     def __init__(self, mapping: dict[str, str]):
