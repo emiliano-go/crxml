@@ -647,11 +647,10 @@ impl OpenTag<'_> {
     }
 }
 
-/// Byte search: delegates to memchr (AVX2/SSE2).
-/// memchr handles short haystacks internally via its own thresholds.
+/// Byte search: delegates to rypipe_core::scan::find (AVX2/SSE2 + O(1) fast path).
 #[inline(always)]
 fn scan_byte(haystack: &[u8], needle: u8) -> Option<usize> {
-    memchr(needle, haystack)
+    rypipe_core::scan::find(haystack, 0, needle)
 }
 
 /// Offset of the next `<` at or after `from`.
@@ -813,7 +812,7 @@ impl<'a> Iterator for AttrIter<'a> {
         }
         let quote = self.rest[j];
         let val_start = j + 1;
-        let val_rel = memchr(quote, &self.rest[val_start..])?;
+        let val_rel = rypipe_core::scan::find(&self.rest[val_start..], 0, quote)?;
         let val = &self.rest[val_start..val_start + val_rel];
         self.rest = &self.rest[val_start + val_rel + 1..];
         Some(Ok((key, val)))
@@ -834,7 +833,7 @@ fn find_attr_value<'a>(interior: &'a [u8], keys: &[&[u8]]) -> Result<Option<&'a 
     // Scan directly for the first `=` instead of running AttrIter.
     if keys.len() == 1 && interior.len() < 256 {
         let key = keys[0];
-        if let Some(eq_rel) = memchr(b'=', interior) {
+        if let Some(eq_rel) = rypipe_core::scan::find(interior, 0, b'=') {
             // Check if the bytes before `=` match the key (with optional whitespace).
             let before = &interior[..eq_rel];
             // Trim trailing whitespace from key region.
@@ -842,9 +841,9 @@ fn find_attr_value<'a>(interior: &'a [u8], keys: &[&[u8]]) -> Result<Option<&'a 
             if key_end >= key.len() && &before[key_end - key.len()..key_end] == key {
                 // Find opening quote after `=`.
                 let after_eq = &interior[eq_rel + 1..];
-                if let Some(q_rel) = memchr(b'"', after_eq) {
+                if let Some(q_rel) = rypipe_core::scan::find(after_eq, 0, b'"') {
                     let val_start = q_rel + 1;
-                    if let Some(end_rel) = memchr(b'"', &after_eq[val_start..]) {
+                    if let Some(end_rel) = rypipe_core::scan::find(&after_eq[val_start..], 0, b'"') {
                         return Ok(Some(&after_eq[val_start..val_start + end_rel]));
                     }
                 }
@@ -952,16 +951,15 @@ fn find_close_start_fast(
 ) -> Option<(usize, bool)> {
     let mut search = from;
     let mut has_entity = false;
-    // Use memchr2 to find both `<` (close tag) and `&` (entity) in one pass.
-    while let Some(rel) = memchr2(b'<', b'&', &bytes[search..]) {
-        let byte = bytes[search + rel];
+    // Use rypipe_core::scan::find2 to find both `<` (close tag) and `&` (entity) in one pass.
+    // find2 returns (absolute_position, matched_byte).
+    while let Some((at, byte)) = rypipe_core::scan::find2(bytes, search, b'<', b'&') {
         if byte == b'&' {
             has_entity = true;
-            search = search + rel + 1;
+            search = at + 1;
             continue;
         }
         // byte == b'<'
-        let at = search + rel;
         let after_name = at + 1 + name.len();
         if after_name > bytes.len() {
             return None;
@@ -1405,7 +1403,7 @@ mod tests {
     }
 
     /// Same regression check: ensure close_boundary_ok is called at the
-    /// right byte — the '>' of '</Details>', not the byte past it.
+    /// right byte, the '>' of '</Details>', not the byte past it.
     #[test]
     fn regression_row_close_boundary_check_position() {
         let xml = b"</Details>";

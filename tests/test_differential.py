@@ -242,7 +242,7 @@ def test_no_rows_all_engines(tmp_path):
 
 
 def test_sparse_disjoint_columns_all_engines(tmp_path):
-    """Rows with completely disjoint field sets — the 533 MB real export pattern.
+    """Rows with completely disjoint field sets: the 533 MB real export pattern.
 
     Field72 appears in 8% of rows, Text21 in 1% (sparse). The stream engine
     used first-row columns as schema and crashed with KeyError when later rows

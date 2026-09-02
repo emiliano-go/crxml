@@ -6,7 +6,7 @@ Three throughput figures, not one. All on synthetic Crystal Reports XML (11 fiel
 
 | File | Single-thread | Parallel (auto chunks) | Projected (drop_half, rename) |
 |------|:------------:|:----------------------:|:-----------------------------:|
-| 100 MB | **1,005 MB/s** | 4,232 MB/s | — |
+| 100 MB | **1,005 MB/s** | 4,232 MB/s | N/A |
 | 533 MB | 899 MB/s | 4,492 MB/s | 6,399–6,793 MB/s |
 | 1 GB | 957 MB/s | **4,920 MB/s** | **6,763–7,015 MB/s** |
 
@@ -14,7 +14,7 @@ Three throughput figures, not one. All on synthetic Crystal Reports XML (11 fiel
 - **Parallel (auto)**: `engine="parallel"`, chunk count = `max(threads, min(16×threads, file/4MB))`. On 16 cores / 1 GB: 256 chunks.
 - **Projected**: parallel with `drop_fields` or `field_mapping` pushdown. `row_satisfied` byte-jumps to row close after wanted columns arrive, skipping remaining fields.
 
-Small files (10 MB: 956 MB/s single, 50 MB: 825 MB/s) scale poorly — fixed costs dominate below ~100 MB.
+Small files (10 MB: 956 MB/s single, 50 MB: 825 MB/s) scale poorly, fixed costs dominate below ~100 MB.
 
 ## Environment
 
@@ -32,6 +32,8 @@ Small files (10 MB: 956 MB/s single, 50 MB: 825 MB/s) scale poorly — fixed cos
 | **Method** | median-of-7, CoV per cell, adaptive rounds until 1.31×CoV ≤ 5% capped at 31 |
 
 > **Note on body numbers:** Tables and measurements in the sections below were taken at the time noted (mostly Aug 28). They are correct for that build but predate the expect_slot fast path, row_satisfied projection short-circuit, incremental dict unification, and F1/F2 scanner optimizations. The current numbers in the header above reflect the latest build.
+
+> **Arrow version note:** rypipe-core uses arrow=55.2.0, rypipe-python uses arrow=59.2 (different pyo3 requirements). Crxml depends only on rypipe-core and uses arrow=55.2.0 directly for PyArrow export. The mismatch is a rypipe-python concern, not a crxml concern.
 
 > **Note:** Numbers from crxml ≤1.2.0 are **best-of-3**. From 1.3.0 they are **median-of-7**. Best-of-3 sits 5-10% above median (1-2× CoV), so **do not compare across that boundary.** All deltas below are median vs median.
 >

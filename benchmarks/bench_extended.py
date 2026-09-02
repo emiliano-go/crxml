@@ -1,5 +1,5 @@
 """
-Extended benchmark suite for crxml — covers ALL use cases and combinations.
+Extended benchmark suite for crxml: covers ALL use cases and combinations.
 
 Covers:
 - File sizes: 10, 50, 100, 1000 MB (1 GB optional / --skip-1gb)
@@ -45,7 +45,7 @@ import subprocess as _subprocess
 def _verify_build_sha(allow_dirty=False):
     """Assert that the installed extension was built from the current HEAD.
 
-    Prevents benchmarks from silently measuring stale Rust code — the exact
+    Prevents benchmarks from silently measuring stale Rust code, the exact
     failure mode that invalidated all production numbers in the Aug 28 thread.
 
     build.rs appends "-dirty" to the SHA when uncommitted edits exist.
@@ -132,7 +132,7 @@ def setup_thp_madvise():
 # ---------------------------------------------------------------------------
 @dataclass
 class BenchConfig:
-    """Declarative benchmark config — all fields JSON-serializable.
+    """Declarative benchmark config: all fields JSON-serializable.
 
     Used to dispatch benchmarks in subprocesses without serializing lambdas.
     Each config type reconstructs the benchmark function from its params.

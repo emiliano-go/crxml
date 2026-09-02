@@ -6,7 +6,7 @@ use memchr;
 use rypipe_core::decoder::SkipRegionFinder;
 use rypipe_core::Splitter;
 
-/// Timing stub — compute_splits was removed in S1 migration.
+/// Timing stub: compute_splits was removed in S1 migration.
 /// Returns (0, 0) for backward compatibility with get_par_profile.
 pub fn split_timing() -> (u64, u64) {
     (0, 0)

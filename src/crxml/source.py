@@ -390,7 +390,7 @@ class CrystalXMLSource:
         Unlike ``to_arrow()`` (which materializes a full table) or
         ``iter_batches`` (which materializes then splits), this streams
         directly from Rust via ``BatchConsumer`` and ``StreamingBatchIterator``.
-        Peak is ``memory`` + one batch + export buffer — set ``memory="64KB"``
+        Peak is ``memory`` + one batch + export buffer: set ``memory="64KB"``
         and ``batch_size=1`` for the smallest footprint (one row per batch,
         ~1 KB for CR rows). Python overhead means true 64 KB is only reachable
         from Rust, but this is still bounded for 50 GB files.
