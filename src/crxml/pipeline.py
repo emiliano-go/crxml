@@ -49,19 +49,33 @@ class Pipeline:
         if self._workers:
             return None
         src = self._source
-        if not (hasattr(src, "_read_arrow") and hasattr(src, "_build_plan_kwargs")):
-            return None
-        from .batchpipe import build_chain, collect_table
-        from .fusion import plan_split
 
+        # Path 1: Columnar fusion (source has _read_arrow)
+        if hasattr(src, "_read_arrow") and hasattr(src, "_build_plan_kwargs"):
+            from .batchpipe import build_chain, collect_table
+            from .fusion import plan_split
+
+            plan_overrides, remaining = plan_split(self._stages)
+            table = src._read_arrow(plan_overrides=plan_overrides or None)
+            op, trailing = build_chain(
+                table, remaining, batch_size=getattr(src, "_batch_size", 1024)
+            )
+            if trailing:
+                return None
+            return collect_table(op)
+
+        # Path 2: Dict-level fusion — all stages are fusable (.apply),
+        # collect into list, convert to pyarrow Table.
+        from .fusion import is_fusable, plan_split
         plan_overrides, remaining = plan_split(self._stages)
-        table = src._read_arrow(plan_overrides=plan_overrides or None)
-        op, trailing = build_chain(
-            table, remaining, batch_size=getattr(src, "_batch_size", 1024)
-        )
-        if trailing:
-            return None
-        return collect_table(op)
+        if remaining and all(is_fusable(s) for s in remaining):
+            import pyarrow as pa
+            rows = list(fused_iter(self._source, remaining))
+            if rows:
+                return pa.Table.from_pylist(rows)
+            return pa.Table.from_pylist([])
+
+        return None
 
     def parallel(self, workers: int | None = None, batch_size: int = 1000) -> "Pipeline":
         return Pipeline(

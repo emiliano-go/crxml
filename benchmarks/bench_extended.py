@@ -322,27 +322,33 @@ def median_of(fn, rounds=7):
     return median, best, worst, cov, rows, n, times
 
 def peak_rss_subprocess(code: str, timeout=60):
-    """Run code in subprocess and return (peak_kb, stdout). Uses child's VmHWM, not RUSAGE_CHILDREN."""
+    """Run code in subprocess and return (peak_kb, anon_kb, file_kb, stdout). Uses child's VmHWM, RssAnon, RssFile."""
     import subprocess
-    # Child reports its own VmHWM before exit to avoid cumulative RUSAGE_CHILDREN high-water
+    # Child reports its own VmHWM + RssAnon + RssFile before exit
     wrapper = code + "\n" + \
         "import pathlib; " + \
         "try:\n" + \
-        "    vm = int(next(l for l in open('/proc/self/status') if l.startswith('VmHWM:')).split()[1])\n" + \
-        "    print(f\"__VmHWM__{vm}\")\n" + \
+        "    lines = open('/proc/self/status').read().splitlines()\n" + \
+        "    vm = int(next(l for l in lines if l.startswith('VmHWM:')).split()[1])\n" + \
+        "    anon = int(next(l for l in lines if l.startswith('RssAnon:')).split()[1])\n" + \
+        "    file = int(next(l for l in lines if l.startswith('RssFile:')).split()[1])\n" + \
+        "    print(f\"__VmHWM__{vm}__RssAnon__{anon}__RssFile__{file}\")\n" + \
         "except Exception:\n" + \
         "    pass\n"
     r = subprocess.run([sys.executable, "-c", wrapper], capture_output=True, text=True, timeout=timeout)
-    peak_kb = 0
+    peak_kb = anon_kb = file_kb = 0
     for line in r.stdout.splitlines():
         if line.startswith("__VmHWM__"):
             try:
-                peak_kb = int(line.split("__VmHWM__")[1])
+                parts = line.split("__")
+                peak_kb = int(parts[1])
+                anon_kb = int(parts[3])
+                file_kb = int(parts[5])
             except Exception:
                 pass
     # Also capture child's stdout without the VmHWM marker
     out = "\n".join(l for l in r.stdout.splitlines() if not l.startswith("__VmHWM__"))
-    return peak_kb, out, r.stderr
+    return peak_kb, anon_kb, file_kb, out, r.stderr
 
 def cold_warm(path: Path, fn, use_posix_fadvise=True):
     """Run cold (after posix_fadvise DONTNEED) and warm pair, return (cold_dt, warm_dt).
@@ -502,13 +508,16 @@ median, best, worst, cov, rows, n, times = result
 mb = file_size / median / 1024 / 1024 if median > 0 else 0
 rps = rows / median if median > 0 and rows else 0
 
-# Capture peak RSS (VmHWM) from /proc/self/status
-rss_kb = 0
+# Capture peak RSS (VmHWM) + RssAnon + RssFile from /proc/self/status
+rss_kb = rss_anon_kb = rss_file_kb = 0
 try:
     for line in open('/proc/self/status'):
         if line.startswith('VmHWM:'):
             rss_kb = int(line.split()[1])
-            break
+        elif line.startswith('RssAnon:'):
+            rss_anon_kb = int(line.split()[1])
+        elif line.startswith('RssFile:'):
+            rss_file_kb = int(line.split()[1])
 except Exception:
     pass
 
@@ -523,6 +532,8 @@ output = {{
     "mb_per_s": mb,
     "rows_per_s": rps,
     "rss_mb": rss_kb / 1024,
+    "rss_anon_mb": rss_anon_kb / 1024,
+    "rss_file_mb": rss_file_kb / 1024,
 }}
 print(json.dumps(output))
 """]
@@ -587,8 +598,10 @@ def report(path: Path, label_or_config, fn=None, rounds=3, collect: Optional[Cal
             mb = result["mb_per_s"]
             rps = result["rows_per_s"]
             rss = result.get("rss_mb", 0)
+            rss_anon = result.get("rss_anon_mb", 0)
+            rss_file = result.get("rss_file_mb", 0)
             extra = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
-            print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s median ({best:.4f}-{worst:.4f}, CoV {cov:.1%}, n={n})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  {rss:5.1f} MB rss  {extra}")
+            print(f"  {label:38s} {rows:7,} rows  {dt:.4f}s median ({best:.4f}-{worst:.4f}, CoV {cov:.1%}, n={n})  {rps:8,.0f} rows/s  {mb:6.1f} MB/s  RSS {rss:5.1f} ({rss_anon:.1f} anon + {rss_file:.1f} file)  {extra}")
             if collect is not None:
                 collect(label, path, times, rows, cov)
             return dt, rows, mb
@@ -863,6 +876,16 @@ def main():
                 rss_mb = rss_kb / 1024  # Linux: ru_maxrss is in KB
             except Exception:
                 rss_mb = 0
+            # Also capture RssAnon/RssFile from /proc/self/status
+            rss_anon_mb = rss_file_mb = 0
+            try:
+                for line in open('/proc/self/status'):
+                    if line.startswith('RssAnon:'):
+                        rss_anon_mb = int(line.split()[1]) / 1024
+                    elif line.startswith('RssFile:'):
+                        rss_file_mb = int(line.split()[1]) / 1024
+            except Exception:
+                pass
             json_results.append({
                 "label": label,
                 "file": str(path),
@@ -876,6 +899,8 @@ def main():
                 "rows": rows,
                 "mb_per_s": (path.stat().st_size / (statistics.median(times) or 1) / 1024 / 1024) if path.exists() else 0,
                 "rss_mb": rss_mb,
+                "rss_anon_mb": rss_anon_mb,
+                "rss_file_mb": rss_file_mb,
                 "commit": _commit,
                 "dirty": _dirty,
             })
