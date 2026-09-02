@@ -67,7 +67,7 @@ XML file
 The crate at `src/crxml_core/` uses `mimalloc::MiMalloc` as the global allocator (profiling showed ~27% of CPU time in malloc/free during XML parsing). It now contains two layers:
 
 1. **Streaming engine** (`CrxmlReader` / `RowParser`): Crystal Reports XML specific and stays in `crxml_core`.
-2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine, consumed as a versioned crate from crates.io (`rypipe-core = "0.1"`).
+2. **Columnar FFI wrappers**: thin Python-callable wrappers that delegate to the generic `rypipe` engine, consumed as a git dependency from the rypipe repository.
 
 The format-agnostic engine pieces (`ExecutionPlan`, `ColumnBuilder`, parallel/bounded drivers, and Arrow export) live in the `rypipe-core` crate in the sibling `rypipe` workspace. The Crystal Reports XML decoder and splitter now live inside `crxml_core::xml` as a custom `rypipe-core` adapter.
 
@@ -86,13 +86,16 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 ```rust
 struct RowParser {
-    reader: Reader<BufReader<File>>,   // quick-xml streaming reader (128 KB buffer)
-    buf: Vec<u8>,                      // scratch for quick-xml events
-    inner_buf: Vec<u8>,                // scratch for child-element events
-    row: Vec<(String, String)>,        // per-row field-value pairs (cleared each row)
-    row_tag: Vec<u8>,                  // e.g. b"Row"
-    batch_vals: Vec<(String, String)>, // flat buffer: all rows concatenated
-    batch_lens: Vec<usize>,            // field count per row for slicing
+    input: rypipe_core::InputBuffer,
+    pos: usize,
+    regions: Vec<Range<usize>>,
+    row_tag: Vec<u8>,
+    close_pattern: &'static [u8],
+    close_finder: memchr::memmem::Finder<'static>,
+    close_len: usize,
+    row: Vec<(String, String)>,
+    batch_vals: Vec<(String, String)>,
+    batch_lens: Vec<usize>,
 }
 ```
 
@@ -156,7 +159,8 @@ crxml still owns the Crystal-specific grammar as an embedded `rypipe-core` forma
 
 ```python
 __all__ = ["CrystalXMLSource", "Pipeline", "RenameFields", "CastTypes",
-           "FilterRows", "DropFields", "to_dataframe", "to_csv", "collect"]
+           "FilterRows", "DropFields", "discover_schema", "XmlError",
+           "PlanError", "MergeError", "to_dataframe", "to_csv", "collect"]
 
 _modules = {"CrystalXMLSource": ".source", "Pipeline": ".pipeline", ...}
 
@@ -466,7 +470,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 
 | Optimization | Location | Impact |
 |-------------|----------|--------|
-| `mimalloc` global allocator | `lib.rs:58` | ~27% CPU reduction in malloc/free |
+| `mimalloc` global allocator | `lib.rs:56` | ~27% CPU reduction in malloc/free |
 | `PyDict::new` (no presize) | `src/crxml_core/src/lib.rs` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
 | Key interning (`FxHashMap`) | `src/crxml_core/src/lib.rs` | Reuses `PyString` objects across rows |
 | SIMD UTF-8 validation | `rypipe_xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
@@ -477,7 +481,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | `_to_arrow()` shortcut | `pipeline.py:45-67` | Skips dict construction entirely for fast-path pipelines |
 | Arrow C Data Interface | `rypipe_core::arrow_export` | Zero-copy export from Rust Arrow to pyarrow |
 | Synchronous unmap after export | `rypipe_core::input` (`MmapInput`) | Releases file-backed pages before pandas conversion begins |
-| 4x chunk multiplier | `source.py:109` | Finer grains for rayon load balancing (VTune-optimized) |
+| 16x chunk multiplier | `source.py:164` | Finer grains for rayon load balancing (VTune-optimized) |
 | Bounded memory batches | `rypipe_core::bounded` | Streams large files within configurable memory budget |
 | Fast parallel export (no merge) | `rypipe_core::merge::engines_to_record_batches` | Avoids per-chunk merge for non-auto-dict parallel parse |
 

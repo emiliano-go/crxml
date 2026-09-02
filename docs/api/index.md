@@ -22,7 +22,7 @@ CrystalXMLSource(source: str | Path, *, row_tag: str = "Row",
 
 **Returns:** iterable of `dict[str, str]`
 
-**Raises:** `FileNotFoundError`, `ValueError` (bad CR XML format)
+**Raises:** `FileNotFoundError`, `XmlError` (bad CR XML format)
 
 ## RenameFields
 
@@ -102,7 +102,7 @@ Returns the field name keys from the first row. The source caches the first
 batch internally, so calling `schema()` before building a pipeline does not
 lose data.
 
-**Raises:** `StopIteration` if the source is empty.
+**Returns:** Empty list `[]` if the source is empty.
 
 ```python
 from crxml import CrystalXMLSource

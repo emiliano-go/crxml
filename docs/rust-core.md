@@ -32,11 +32,9 @@ A single Python-exposed class:
 
 ```rust
 #[pyclass]
-struct CrxmlReader {
-    source: PathBuf,
-    row_tag: String,
-    buf: Vec<u8>,
-    inner_buf: Vec<u8>,
+pub struct CrxmlReader {
+    parser: RowParser,
+    key_cache: rustc_hash::FxHashMap<String, Py<PyString>>,
 }
 ```
 
@@ -54,22 +52,18 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | `quick-xml`  | Streaming XML reader           |
 | `arrow`      | Arrow C Data Interface export  |
 | `mimalloc`   | Fast allocator (replaces system malloc, ~27% CPU savings) |
-| `rypipe-core`| Generic columnar/parallel/bounded engine (from crates.io) |
+| `rypipe-core`| Generic columnar/parallel/bounded engine (from git) |
 | `memchr`     | Fast substring scans for the XML splitter |
 | `simdutf8`   | SIMD UTF-8 validation for the XML decoder |
 | `thiserror`  | Adapter error derives            |
 
-The `rypipe-core` crate is a path dependency on the sibling
+The `rypipe-core` crate is a git dependency from the sibling
 [rypipe](https://github.com/emiliano-go/rypipe) repository
 (see `src/crxml_core/Cargo.toml`):
 
 ```toml
-rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
+rypipe-core = { git = "https://github.com/emiliano-go/rypipe", subdirectory = "crates/rypipe-core", features = ["mmap"] }
 ```
-
-The `rypipe` checkout must sit next to the `crxml` checkout (i.e.
-`../rypipe/crates/rypipe-core` relative to the `crxml` root) for the path
-resolution to work.
 
 ## Building
 

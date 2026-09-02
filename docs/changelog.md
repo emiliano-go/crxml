@@ -12,7 +12,7 @@
 
 - Extracted the columnar engine into the sibling `rypipe` workspace
   (`rypipe-core`, `rypipe-xml`, `rypipe-python`).
-- `rypipe-core` is now consumed from crates.io as a versioned dependency
+- `rypipe-core` is now consumed from git as a versioned dependency
   (`version = "0.1"`, `mmap` feature) instead of a path dependency: building
   crxml no longer requires a sibling rypipe checkout.
 - Embedded the Crystal Reports XML adapter (previously the separate

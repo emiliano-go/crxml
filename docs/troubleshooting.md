@@ -71,12 +71,11 @@ pipe | FilterRows(field="x", op="==", value="y")
 error: failed to get `rypipe-core` as a dependency of package `crxml-core`
 ```
 
-The Rust core consumes the engine as a versioned crate from crates.io, so a
+The Rust core consumes the engine as a git dependency, so a
 build failure here almost always means the build environment has no network
-access to crates.io, or an offline mirror is missing the `0.1.x` release.
+access to GitHub, or the rypipe repository is not cloned next to the crxml checkout.
 
-Fix: allow egress to crates.io (or vendor `rypipe-core` with
-`cargo vendor`) and retry:
+Fix: ensure the rypipe repository is cloned next to crxml and retry:
 
 ```bash
 cargo update -p rypipe-core
@@ -86,9 +85,8 @@ pip install .
 This only affects building from source; PyPI wheels bundle the compiled
 extension and need no Rust toolchain at all.
 
-Historical note: before 1.2.0 this dependency was a path reference into a
-sibling `../rypipe` checkout, which broke every build environment without
-that clone.
+Historical note: before 1.2.0 this dependency was a versioned crate from
+crates.io, which was replaced by the git dependency.
 
 ## FAQ
 

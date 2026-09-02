@@ -37,7 +37,7 @@ optional explicit `fieldnames`:
 from crxml import CrystalXMLSource, to_csv
 
 pipe = CrystalXMLSource("report.xml")
-to_csv(pipe, "output.csv", delimiter=";", quoting=1)
+to_csv(pipe, "output.csv", delimiter=";")
 ```
 
 The CSV is written incrementally as rows are produced. No intermediate list.
