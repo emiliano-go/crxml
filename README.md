@@ -77,8 +77,8 @@ wraps `<Section>` wraps `<Details>` wraps `<Field>`/`<Text>`/`<FormattedValue>`/
 spend most of their CPU time descending into children you do not need.
 
 crxml skips the nesting:
-- The **stream engine** walks the XML once with a hand-rolled `memchr` scanner (`src/crxml_core/src/xml/scanner.rs`, `scan_one_row` `scanner.rs:114` via `RowSink` `src/crxml_core/src/lib.rs:639`) and yields flat dicts: **508 MB/s** 100 MB (was 251 `quick-xml`).
-- The **parallel engine** memory-maps the file, splits it at row boundaries (`splitter.rs:40` `find_split_points`), and parses each chunk on its own thread into Arrow buffers directly (no dicts): **up to 4.2 GB/s** on high-cardinality production reports (533 MB real `par128` 4198) and **4.1 GB/s** on uniform exports (1 GB `par96` 4099) via `rypipe` (`rypipe-core` `Vec<ColumnBuilder>`+`field_index` `engine.rs:16`, `row_dirty` `engine.rs:26`).
+- The **stream engine** walks the XML once with a hand-rolled `memchr` scanner (`src/crxml_core/src/xml/scanner.rs`, `scan_one_row` `scanner.rs:119` via `RowSink` `src/crxml_core/src/lib.rs:603`) and yields flat dicts: **508 MB/s** 100 MB (was 251 `quick-xml`).
+- The **parallel engine** memory-maps the file, splits it at row boundaries (`splitter.rs:40` `find_split_points`), and parses each chunk on its own thread into Arrow buffers directly (no dicts): **up to 4.2 GB/s** on high-cardinality production reports (533 MB real `par128` 4231) and **4.2 GB/s** on uniform exports (1 GB `par96` 4158) via `rypipe` (`rypipe-core` `Vec<ColumnBuilder>`+`field_index` `engine.rs:16`, `row_dirty` `engine.rs:26`).
   It is powered by the [rypipe](https://github.com/emiliano-go/rypipe) ingestion engine: `rypipe` itself was **extracted from `crxml`**: the original `crxml` engine was the prototype, then separated and abstracted so any format (CSV, JSON, HTML…) could reuse it. `crxml` now lives as a thin adapter (`crxml-core`) on top of `rypipe-core`.
 - Pipeline stages that rename, cast, drop, or filter fields execute in the Rust
   parse loop, before any Python object is created.
@@ -91,13 +91,13 @@ crxml skips the nesting:
 |---|---|---|---|
 | Row iteration | Yields dicts lazily | Arrow table first, then dicts (slower) | Yields `RecordBatch`es incrementally, stable schema |
 | DataFrame / Table output | Collects dicts, converts | Direct Arrow buffers, zero-copy | Same, incremental + bounded |
-| 533 MB real export (Table) | 745 MB/s (single) / 723 MB/s (1 MB) | **4470 MB/s** `par128` (4.16 MB) | 3828 auto / **4980 explicit `schema=[...]`** (2 MB) |
-| 1 GB synthetic (Table) | 734 MB/s | 4278 MB/s `par128` | 3782 auto / ~4900 explicit |
+| 533 MB real export (Table) | 953 MB/s (single) / 723 MB/s (1 MB) | **4231 MB/s** `par128` (4.16 MB) | 3828 auto / **7630 explicit `schema=[...]`** (2 MB) |
+| 1 GB synthetic (Table) | 940 MB/s | 4158 MB/s `par128` | 3782 auto / ~4900 explicit |
 | Peak RssAnon (533 MB) | 24 MB (1 MB) | 137 MB | **88 MB** (auto or explicit) |
 | Pipeline fusion | No (dict path) | Yes (Rust BuildPlan) | Yes (same plan, streamed) |
 | `ParquetWriter` | N/A | N/A | `write_batch` now succeeds (batches share frozen schema `schema.rs:14`); before fix batch 2 order `FieldG` vs `Text20` last raised |
 
-Auto discovery (16×2 MiB windows for >128 MB) adds ~15% (≈19 ms on 533 MB) so auto is **−14% vs par128** (3828 vs 4470) but still bounded and incremental. Explicit `schema=[...]` (`FrozenSchema::from_plan`) avoids Discovery and is **+11% vs par128** (4980 vs 4470). The old "fast or memory-safe" is now "fastest bounded needs explicit schema; auto is safe and bounded but slightly slower". Use `iter_record_batches(memory="64MB", threads=16, schema=[...])` for the fast path.
+Auto discovery (16×2 MiB windows for >128 MB) adds ~15% (≈19 ms on 533 MB) so auto is **−10% vs par128** (3828 vs 4231) but still bounded and incremental. Explicit `schema=[...]` (`FrozenSchema::from_plan`) avoids Discovery and is **+80% vs par128** (7630 vs 4231). The old "fast or memory-safe" is now "fastest bounded needs explicit schema; auto is safe and bounded but slightly slower". Use `iter_record_batches(memory="64MB", threads=16, schema=[...])` for the fast path.
 
 [Full benchmark details](docs/performance.md): like-for-like Table vs Vec, chunk-per-cell, fixed-chunk isolation, and frozen-schema cost.
 
@@ -138,13 +138,13 @@ profiling counters: `pip install -e . --config-settings=--features=profile`.
 | Engine / API | When to use | Throughput 533 MB / 1 GB | RssAnon |
 |---|---|---|---|
 | `stream` (`for row in source`) | Row-by-row dict iteration | 723 MB/s 1 MB budget (24 MB anon) | 24 MB |
-| `columnar` (`single`) | Single-threaded Arrow Table | 745 / 734 MB/s | 134 MB |
-| `parallel` (`par128` full RAM, 4 MB) | Fastest full-RAM Table | **4470 / 4278 MB/s** | 137 MB |
-| **`iter_record_batches(..., threads=16, schema=[...])` (explicit frozen)** | **Fastest bounded, stable schema**, yields `RecordBatch`es | **4980 / ~4900 MB/s** | **88 MB** |
+| `columnar` (`single`) | Single-threaded Arrow Table | 953 / 940 MB/s | 134 MB |
+| `parallel` (`par128` full RAM, 4 MB) | Fastest full-RAM Table | **4231 / 4158 MB/s** | 137 MB |
+| **`iter_record_batches(..., threads=16, schema=[...])` (explicit frozen)** | **Fastest bounded, stable schema**, yields `RecordBatch`es | **7630 / — MB/s** | **88 MB** |
 | `iter_record_batches(memory="64MB", threads=16)` auto | Bounded + incremental, stable schema | 3828 / 3782 MB/s (−14% vs par, +15% Discovery) | **88 MB** |
 | `bounded` (`memory="64MB"` single) | Single-thread bounded | 645 / 546 MB/s | 133 MB |
 
-Pass `engine=` explicitly, or let `auto` select per call. `auto` stays **"parallel if it fits"** (blocked: auto discovery adds 15% and would make `auto` slower until cheaper). Streaming is **opt-in** via `iter_record_batches(..., threads=16)`, keeping 4 MB for `par` (`src/crxml/source.py:155`), 2 MB via `budget/(threads×2)` for streaming. Provide `schema=` for the fast path.
+Pass `engine=` explicitly, or let `auto` select per call. `auto` stays **"parallel if it fits"** (blocked: auto discovery adds 15% and would make `auto` slower until cheaper). Streaming is **opt-in** via `iter_record_batches(..., threads=16)`, keeping 4 MB for `par` (`src/crxml/source.py:164`), 2 MB via `budget/(threads×2)` for streaming. Provide `schema=` for the fast path.
 
 ```python
 # Recommended bounded paths

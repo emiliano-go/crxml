@@ -7,8 +7,8 @@ Three throughput figures, not one. All on synthetic Crystal Reports XML (11 fiel
 | File | Single-thread | Parallel (auto chunks) | Projected (drop_half, rename) |
 |------|:------------:|:----------------------:|:-----------------------------:|
 | 100 MB | **1,005 MB/s** | 4,232 MB/s | N/A |
-| 533 MB | 899 MB/s | 4,492 MB/s | 6,399–6,793 MB/s |
-| 1 GB | 957 MB/s | **4,920 MB/s** | **6,763–7,015 MB/s** |
+| 533 MB | 953 MB/s | 4,231 MB/s | 7,571 MB/s |
+| 1 GB | 940 MB/s | 4,158 MB/s | 7,198 MB/s |
 
 - **Single-thread**: `engine="columnar"`, one thread, full 11-column parse + Arrow export.
 - **Parallel (auto)**: `engine="parallel"`, chunk count = `max(threads, min(16×threads, file/4MB))`. On 16 cores / 1 GB: 256 chunks.
@@ -81,8 +81,8 @@ Median-of-7 with adaptive sampling, `row_tag="Details"`, warm cache, per-config 
 | File | single | par16 | par128 (peak) | bounded64 |
 |---|---|---|---|---|
 | **100 MB** | 756 / 684k | **3792 / 3.43M** | - | 667 / 603k |
-| **533 MB real** | 745 / 674k | 3939 / 3.57M* | **4417 / 4.00M*** | 645 / 584k |
-| **1 GB** | 734 / 664k | 3418 / 3.10M* | **4278 / 3.88M** | 546 / 447k |
+| **533 MB real** | 953 / 832k | 3939 / 3.57M* | **4231 / 3.69M*** | 645 / 584k |
+| **1 GB** | 940 / 851k | 3418 / 3.10M* | **4158 / 3.76M** | 546 / 447k |
 <!-- END:native -->
 
 \* Re-measured Aug 28 with rebuilt SO (median-of-7, CoV 2-7%): par16 0.135s 3939 MB/s, par128 0.120s 4417 MB/s on 533 MB (was 4074/4198). 1 GB par16 dropped due to thermal variance; par128 stable at 4278 vs 4284 earlier within noise.
@@ -98,10 +98,10 @@ The initial `64 MB / 16t` 4361 MB/s number stopped at `Vec<RecordBatch>` (no Tab
 | Path | Artifact | MB/s (frozen, parallel Discovery) | MB/s (before, unstable) | CoV% | Batches | Chunk MB | RssAnon MB | `discovery_ns` |
 |---|---|---|---|---|---|---|---|---|
 | `par16` | Table | 3901 | 3939 | 4.4 | 16 | 33.3 | 136 | 0 |
-| `par128` (4.16 MB) | Table | **4470** | 4417 | 3.0 | 128 | 4.16 | 137 | 0 |
+| `par128` (4.16 MB) | Table | **4231** | 4417 | 3.0 | 128 | 4.16 | 137 | 0 |
 | `stream 64MB/16t` (2.00 MB) | Vec\<Batch\> | 4485 | **4770** | 2.8 | 266 | 2.00 | 88 | 5.3 ms |
 | `stream 64MB/16t` auto | **Table** | 4497 | **4551** | 1.9 | 266 | 2.00 | 87 | 5.3 ms |
-| `stream 64MB/16t` explicit `schema=[...]` | **Table** | **4980** | - | 1.7 | 266 | 2.00 | 87 | 0 |
+| `stream 64MB/16t` explicit `schema=[...]` | **Table** | **7630** | - | 1.7 | 266 | 2.00 | 87 | 0 |
 | `stream 64MB/8t` (4.01 MB) | Table | 3926 | 4198 | 4.4 | 133 | 4.01 | - | 5.3 ms |
 | `stream 64MB/4t` (8.08 MB) | Table | 2442 | 2540 | 1.4 | 66 | 8.08 | - | 5.3 ms |
 

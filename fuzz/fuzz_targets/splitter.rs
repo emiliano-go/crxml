@@ -4,32 +4,27 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Feed arbitrary bytes to the splitter; must not panic or UB.
-    let tag = b"Details";
-    let (skip_regions, has_special) = crxml_core::splitter::find_special_regions(data);
-    let _ = crxml_core::splitter::next_row_start(data, 0, tag, &skip_regions);
-    let _ = crxml_core::splitter::compute_splits(data, tag, 4);
+    let splitter = crxml_core::xml::CrystalXmlSplitter::with_row_tag(b"Details");
+    let decoder = crxml_core::xml::CrystalXmlDecoder::with_row_tag(b"Details");
 
-    // If the data is valid enough for compute_splits to produce chunks,
-    // verify round-trip: every byte belongs to exactly one chunk.
-    let chunks = crxml_core::splitter::compute_splits(data, tag, 4);
-    if chunks.len() > 1 {
-        // chunks are [0..a, a..b, b..c, c..len] after reduce
-        assert_eq!(chunks[0].start, 0);
-        assert_eq!(chunks[chunks.len() - 1].end, data.len());
-        for w in chunks.windows(2) {
-            assert_eq!(w[0].end, w[1].start, "chunks must be contiguous");
-        }
+    // Test next_record_start with arbitrary positions
+    for pos in (0..data.len()).step_by(100) {
+        let _ = splitter.next_record_start(data, pos);
     }
 
-    // Every chunk, if non-empty, must start with a row tag or be a valid
-    // continuation (can start with raw text if mid-row due to unmatched
-    // parent end tag). The only invariant: a non-empty chunk does not panic
-    // when fed to the columnar engine.
-    for chunk in &chunks {
+    // Test find_split_points
+    let points = splitter.find_split_points(data, 4);
+    assert!(points.first() == Some(&0));
+    assert!(points.last() == Some(&data.len()));
+    assert!(points.windows(2).all(|w| w[0] < w[1]));
+
+    // Every chunk, if non-empty, must not panic when fed to the parser.
+    use rypipe_core::decoder::RecordParser;
+    for window in points.windows(2) {
+        let chunk = &data[window[0]..window[1]];
         if !chunk.is_empty() {
-            let mut engine = crxml_core::columnar::ColumnarEngine::new();
-            // Ignore parse errors; fuzz input is arbitrary.
-            let _ = engine.parse_bytes(&data[chunk.clone()], tag);
+            let mut sink = rypipe_core::engine::LocateOnly::new(rypipe_core::ExecutionPlan::new());
+            let _ = decoder.parse_chunk(chunk, &mut sink);
         }
     }
 });
