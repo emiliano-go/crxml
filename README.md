@@ -154,7 +154,8 @@ import pyarrow as pa, pyarrow.parquet as pq
 src = CrystalXMLSource("report.xml", row_tag="Details")
 # explicit schema: fastest, no Discovery, writer succeeds
 schema = ["Level","Section","Field22","Field23","Field38","Field39","Field61","Field73","FieldG","Text20"]
-batches = src.iter_record_batches(memory="64MB", threads=16, schema=schema) # not yet wired in Python, use _core
+src = CrystalXMLSource("report.xml", row_tag="Details", schema=schema)
+batches = src.iter_record_batches(memory="64MB", threads=16)
 # auto: stable but pays 15% Discovery (16×2 MiB windows for >128 MB)
 batches = src.iter_record_batches(memory="64MB", threads=16)
 
