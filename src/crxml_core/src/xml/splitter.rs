@@ -1,21 +1,15 @@
 //! Chunk splitter for Crystal Reports XML streams.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use memchr;
+use rypipe_core::decoder::SkipRegionFinder;
 use rypipe_core::Splitter;
 
-// Timing for split phases — read via `split_timing()`.
-static SPECIAL_REGIONS_NS: AtomicU64 = AtomicU64::new(0);
-static SPLIT_LOOP_NS: AtomicU64 = AtomicU64::new(0);
-
-/// Read (special_regions_ns, split_loop_ns) from the last `compute_splits` call.
+/// Timing stub — compute_splits was removed in S1 migration.
+/// Returns (0, 0) for backward compatibility with get_par_profile.
 pub fn split_timing() -> (u64, u64) {
-    (
-        SPECIAL_REGIONS_NS.load(Ordering::Relaxed),
-        SPLIT_LOOP_NS.load(Ordering::Relaxed),
-    )
+    (0, 0)
 }
 
 /// Format-specific splitter for Crystal Reports-style XML.
@@ -25,6 +19,23 @@ pub fn split_timing() -> (u64, u64) {
 #[derive(Clone, Debug, Default)]
 pub struct CrystalXmlSplitter {
     row_tag: Vec<u8>,
+}
+
+/// CR XML skip-region finder: comments (`<!-- -->`) and CDATA (`<![CDATA[ ]]>`).
+struct CrXmlSkipRegions;
+
+impl SkipRegionFinder for CrXmlSkipRegions {
+    fn openers(&self) -> &[&'static [u8]] {
+        &[b"<!--", b"<![CDATA["]
+    }
+
+    fn closer_for(&self, opener: &[u8]) -> &'static [u8] {
+        if opener == b"<!--" {
+            b"-->"
+        } else {
+            b"]]>"
+        }
+    }
 }
 
 impl CrystalXmlSplitter {
@@ -37,18 +48,23 @@ impl CrystalXmlSplitter {
 }
 
 impl Splitter for CrystalXmlSplitter {
-    fn find_split_points(&self, bytes: &[u8], max_chunks: usize) -> Vec<usize> {
-        let ranges = compute_splits(bytes, &self.row_tag, max_chunks);
-        let mut points = Vec::with_capacity(ranges.len() + 1);
-        points.push(0);
-        for r in ranges {
-            points.push(r.end);
-        }
-        points.dedup();
-        if points.last() != Some(&bytes.len()) {
-            points.push(bytes.len());
-        }
-        points
+    fn next_record_start(&self, bytes: &[u8], from: usize) -> Option<usize> {
+        next_row_start_fast(bytes, from, &self.row_tag).map(|pos| {
+            // Return position past the closing `>` of the row tag
+            let after = pos + 1 + self.row_tag.len();
+            bytes[after..]
+                .iter()
+                .position(|&b| b == b'>')
+                .map(|rel| after + rel + 1)
+                .unwrap_or(bytes.len())
+        })
+    }
+
+    // find_split_points: use the default from the Splitter trait.
+    // It calls next_record_start + plan_chunk_count + in_skip_region.
+
+    fn skip_regions(&self) -> Option<&dyn SkipRegionFinder> {
+        Some(&CrXmlSkipRegions)
     }
 
     fn estimate_bytes_per_row(&self, sample: &[u8]) -> usize {
@@ -156,47 +172,6 @@ pub(crate) fn next_row_start(
     None
 }
 
-/// Compute N chunk byte ranges from `bytes`, each containing a whole number
-/// Check if byte offset `at` is inside a `<!-- ... -->` or `<![CDATA[ ... ]]>` region
-/// by scanning backwards a bounded distance (64 KB window).
-/// Returns true if the candidate is inside a comment or CDATA.
-fn in_comment_or_cdata(bytes: &[u8], at: usize) -> bool {
-    let window_start = at.saturating_sub(64 * 1024);
-    let region = &bytes[window_start..at];
-
-    // Find the last `<!--` in the window
-    let mut last_comment_abs = None;
-    {
-        let mut pos = 0;
-        while let Some(rel) = memchr::memmem::find(&region[pos..], b"<!--") {
-            last_comment_abs = Some(window_start + pos + rel);
-            pos += rel + 4;
-        }
-    }
-    if let Some(open) = last_comment_abs {
-        if memchr::memmem::find(&bytes[open + 4..at], b"-->").is_none() {
-            return true;
-        }
-    }
-
-    // Find the last `<![CDATA[` in the window
-    let mut last_cdata_abs = None;
-    {
-        let mut pos = 0;
-        while let Some(rel) = memchr::memmem::find(&region[pos..], b"<![CDATA[") {
-            last_cdata_abs = Some(window_start + pos + rel);
-            pos += rel + 9;
-        }
-    }
-    if let Some(open) = last_cdata_abs {
-        if memchr::memmem::find(&bytes[open + 9..at], b"]]>").is_none() {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Find next row start with backward scan per candidate (no pre-computed skip).
 pub(crate) fn next_row_start_fast(bytes: &[u8], from: usize, tag: &[u8]) -> Option<usize> {
     if from >= bytes.len() {
@@ -208,6 +183,7 @@ pub(crate) fn next_row_start_fast(bytes: &[u8], from: usize, tag: &[u8]) -> Opti
     tag_buf[0] = b'<';
     tag_buf[1..1 + tag.len()].copy_from_slice(tag);
     let full_tag = &tag_buf[..1 + tag.len()];
+    let skip_regions = CrXmlSkipRegions;
     let mut p = from;
     while let Some(rel) = memchr::memmem::find(&bytes[p..], &full_tag) {
         let at = p + rel;
@@ -216,75 +192,12 @@ pub(crate) fn next_row_start_fast(bytes: &[u8], from: usize, tag: &[u8]) -> Opti
             bytes.get(after),
             Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
         );
-        if boundary && !in_comment_or_cdata(bytes, at) {
+        if boundary && !rypipe_core::decoder::in_skip_region(bytes, at, &skip_regions) {
             return Some(at);
         }
         p = at + 1;
     }
     None
-}
-
-/// Compute N chunk byte ranges from `bytes`, each containing a whole number
-/// of complete rows.
-///
-/// Falls back to a single `0..bytes.len()` chunk when:
-/// - `num_chunks <= 1`
-/// - the file is too small to produce that many non-empty chunks
-/// - no valid split point could be found for a nominal boundary
-pub(crate) fn compute_splits(bytes: &[u8], row_tag: &[u8], num_chunks: usize) -> Vec<Range<usize>> {
-    use std::time::Instant;
-    if num_chunks <= 1 || bytes.is_empty() {
-        return std::iter::once(0..bytes.len()).collect();
-    }
-
-    // Skip the O(file) find_special_regions scan entirely.
-    // Each candidate does a bounded backward scan (64 KB window) instead.
-    // Cost: O(chunks × 64 KB) ≈ 6 MB for 96 chunks, vs O(file) = 533 MB.
-    SPECIAL_REGIONS_NS.store(0, Ordering::Relaxed);
-
-    let t1 = Instant::now();
-    let nominal_offsets: Vec<usize> = (1..num_chunks)
-        .map(|i| bytes.len() * i / num_chunks)
-        .collect();
-
-    use rayon::prelude::*;
-    let found: Vec<Option<usize>> = nominal_offsets
-        .par_iter()
-        .map(|&nominal| next_row_start_fast(bytes, nominal, row_tag))
-        .collect();
-    SPLIT_LOOP_NS.store(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-    // Filter out None (fewer rows than chunks → fall back)
-    if found.iter().any(|o| o.is_none()) {
-        return std::iter::once(0..bytes.len()).collect();
-    }
-
-    // Sort and deduplicate
-    let mut split_points: Vec<usize> = Vec::with_capacity(found.len() + 2);
-    split_points.push(0);
-    {
-        let mut sorted: Vec<usize> = found.into_iter().flatten().collect();
-        sorted.sort_unstable();
-        sorted.dedup();
-        split_points.extend(sorted);
-    }
-    split_points.push(bytes.len());
-    split_points.dedup();
-
-    // Build ranges from split points
-    let mut ranges: Vec<Range<usize>> = Vec::with_capacity(split_points.len() - 1);
-    for i in 0..split_points.len() - 1 {
-        let start = split_points[i];
-        let end = split_points[i + 1];
-        if start < end {
-            ranges.push(start..end);
-        }
-    }
-
-    if ranges.is_empty() {
-        return std::iter::once(0..bytes.len()).collect();
-    }
-    ranges
 }
 
 #[cfg(test)]
@@ -345,31 +258,35 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_splits_single_chunk() {
+    fn test_splitter_find_split_points_single_chunk() {
         let xml = b"<Row A=\"1\"/><Row B=\"2\"/><Row C=\"3\"/>";
-        let ranges = compute_splits(xml, b"Row", 1);
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0], 0..xml.len());
+        let splitter = CrystalXmlSplitter::with_row_tag(b"Row");
+        let points = splitter.find_split_points(xml, 1);
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0], 0);
+        assert_eq!(points[1], xml.len());
     }
 
     #[test]
-    fn test_compute_splits_two_chunks() {
+    fn test_splitter_find_split_points_two_chunks() {
         let xml = b"<Row A=\"1\"/><Row B=\"2\"/><Row C=\"3\"/><Row D=\"4\"/>";
-        let ranges = compute_splits(xml, b"Row", 2);
-        assert_eq!(ranges.len(), 2);
-        assert!(!ranges[0].is_empty());
-        assert!(!ranges[1].is_empty());
-        assert_eq!(ranges[0].start, 0);
-        assert_eq!(ranges[1].end, xml.len());
-        assert_eq!(ranges[0].end, ranges[1].start);
+        let splitter = CrystalXmlSplitter::with_row_tag(b"Row");
+        let points = splitter.find_split_points(xml, 2);
+        assert!(points.len() >= 2);
+        assert_eq!(points[0], 0);
+        assert_eq!(*points.last().unwrap(), xml.len());
+        assert!(points.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
-    fn test_compute_splits_fallback_small_file() {
+    fn test_splitter_find_split_points_fallback_small_file() {
         let xml = b"<Row A=\"1\"/><Row B=\"2\"/>";
-        let ranges = compute_splits(xml, b"Row", 8);
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0], 0..xml.len());
+        let splitter = CrystalXmlSplitter::with_row_tag(b"Row");
+        let points = splitter.find_split_points(xml, 8);
+        // Small file: should fall back to single chunk
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0], 0);
+        assert_eq!(points[1], xml.len());
     }
 
     #[test]
@@ -430,18 +347,12 @@ mod tests {
             for tag in tags {
                 let (skip, _) = find_special_regions(seed);
                 let _ = next_row_start(seed, 0, tag, &skip);
+                let splitter = CrystalXmlSplitter::with_row_tag(tag);
                 for n in [1, 2, 3, 4, 8, 17] {
-                    let chunks = compute_splits(seed, tag, n);
-                    for c in &chunks {
-                        assert!(c.start <= c.end, "range {:?} inverted", c);
-                    }
-                    if chunks.len() > 1 {
-                        assert_eq!(chunks[0].start, 0);
-                        assert_eq!(chunks[chunks.len() - 1].end, seed.len());
-                        for w in chunks.windows(2) {
-                            assert_eq!(w[0].end, w[1].start, "gap in chunks");
-                        }
-                    }
+                    let points = splitter.find_split_points(seed, n);
+                    assert!(points.first() == Some(&0));
+                    assert!(points.last() == Some(&seed.len()));
+                    assert!(points.windows(2).all(|w| w[0] < w[1]));
                 }
             }
         }
