@@ -661,8 +661,8 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | `mimalloc` global allocator | `lib.rs:56` | ~27% CPU reduction in malloc/free |
 | `PyDict::new` (no presize) | `src/crxml_core/src/lib.rs` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
 | Key interning (`FxHashMap`) | `src/crxml_core/src/lib.rs` | Reuses `PyString` objects across rows |
-| SIMD UTF-8 validation | `rypipe_xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
-| Fast scanner (memchr-based) | `rypipe_xml::decoder` | Avoids quick-xml event loop overhead for standard CR XML |
+| SIMD UTF-8 validation | `crxml_core::xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
+| Fast scanner (memchr-based) | `crxml_core::xml::decoder` | Avoids quick-xml event loop overhead for standard CR XML |
 | `StrColumn` arena allocation | `rypipe_core::columnar` | No per-cell `String` allocation |
 | Deferred filter compaction | `batchpipe.py:31-48` | Only materializes alive rows at sinks/LambdaOp |
 | Columnar fusion (Layer A) | `fusion.py:23-44` | Entire pipeline compiled into Rust `ExecutionPlan` |
@@ -688,7 +688,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | Rust columnar | `rypipe_core::StrColumn` | Flat byte arena + `i32` offsets (Arrow layout) |
 | Rust columnar | `rypipe_core::ExecutionPlan` | Compilation target for stage pushdown |
 | Rust columnar | `rypipe_core::FilterPredicate` | Equal / NotEqual / Compare variants |
-| Rust splitter | `rypipe_xml::CrystalXmlSplitter` | Finds whole-row split points for parallel parsing |
+| Rust splitter | `crxml_core::xml::splitter::CrystalXmlSplitter` | Finds whole-row split points for parallel parsing |
 | Rust decoder | `rypipe_xml::CrystalXmlDecoder` | Emits field events from Crystal Reports XML |
 
 ========================================================================
@@ -1784,10 +1784,10 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 | `typed_int` | 646 | 2583 | `lexical::parse` `columnar.rs:378` |
 | `typed_float` | 667 | 2548 |  |
 | `dict` | 646 | 2501 | `dictionary_columns` `columnar.rs:557` |
-| `auto_dict` | 569 | 1604 | forces `merge.rs:57` serial `extend`, `auto_dict_upgrade` `engine.rs:139` |
+| `auto_dict` | 569 | 1604 | forces `merge.rs:57` serial `extend`, `auto_dict_upgrade` `engine/table_builder.rs:344` |
 | `filter_eq` `Level==3` | 665 | 2552 | per-row `check` `plan.rs:280` then `row_dirty` |
 | `filter_compare` `Field22>Field23` | 642 (45k rows) | 2346 (45k) | `compare` + `apply_compare_filter` `arrow_export.rs:29` fast path |
-| `schema` ordering | 653 | 2525 | `sort_columns` `engine.rs:152` |
+| `schema` ordering | 653 | 2525 | `sort_columns` `engine/table_builder.rs:357` |
 | `mmap` on/off | 647/656 | 2771/2590 | `auto_mmap` 2-4% single, warm-cache `rep_movs` 3% perf |
 
 `drop_all` shows the engine is **CPU-bound**, not I/O: reducing copied fields from 10→0 gives 1.66×, yet ceiling stays ~3 GB/s.
@@ -2003,14 +2003,14 @@ Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr
 |---|---|---|
 | Fastest `to_arrow`/`to_dataframe` on ≥100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
 | Fastest **bounded** `to_arrow`/`to_dataframe` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` → `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
-| Bounded, no schema known (auto, now competitive) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) - **stable** (frozen `ensure_schema` `engine.rs:79`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. Was 3828 (−14%) with serial 19 ms; parallelised 19→5.3 ms unblocks `auto`. |
+| Bounded, no schema known (auto, now competitive) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) - **stable** (frozen `ensure_schema` `engine/table_builder.rs:143`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. Was 3828 (−14%) with serial 19 ms; parallelised 19→5.3 ms unblocks `auto`. |
 | Minimize peak memory (single-thread) | `memory="1MB"` single streaming | 723 MB/s (3% behind single 745), 24 MB RssAnon, `RowSink` `lib.rs:603` |
 | Stream rows one-by-one (dicts) | `engine="stream"` `for row in source` | Row dicts lazily, no Arrow |
 | Dictionary-encoded | `engine="parallel", auto_dict=True` | forces `merge` `merge.rs:57` (serial) - avoid for throughput |
 
 > **Status of `auto` default - now unblocked:** `auto` picks `parallel` if `size ≤ memory` and `size ≥ 8 MB`. With parallel Discovery (16× sampled windows `parallel_stream.rs:122` `rayon::par_iter`, 19→5.3 ms, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:493`), **auto 4497 vs par128 4470 (+0.6%, within CoV)**. The blocker is removed. Propose `auto` → parallel streaming for ≥100 MB (bounded, stable, matches throughput, + `discover_schema` reuse below). `schema=` remains the fast path for batch workloads (4980). Switching `auto` is now a docs + minor version bump, not a performance concession.
 
-> **Schema stability & reuse:** Every `iter_record_batches` batch now has identical `schema` (`parallel_stream.rs:59` `opts.schema` → `engine.rs:79` `ensure_schema`). Without explicit `schema=[...]`, auto-discovery `schema.rs:90` via `DiscoverySink` `parallel_stream.rs:55` (≤128 MiB full scan else 16×2 MiB sampled, now parallel, `needs_value=false`) captures all columns (FieldG 30%, Text21 1%). Hard-error on unknown field (`engine.rs:510` `MergeError` naming column, `unknown field "LateColumn" not in frozen schema... pass schema=[...]`) - fixture with `LateColumn` only in last 1% verifies loud failure vs silent drop. Column order is `schema` order if explicit, else discovery file order. Provide `schema=` to avoid 5.3 ms; reuse via `crxml.discover_schema("sample.xml")` `src/crxml/source.py:445` / `_core.discover_schema` `src/crxml_core/src/lib.rs:1012` (see below). 1 MB chunks `par` collapses (3553) while streaming does not (3812, +7%) due to `chunk_buf` reuse.
+> **Schema stability & reuse:** Every `iter_record_batches` batch now has identical `schema` (`parallel_stream.rs:59` `opts.schema` → `engine/table_builder.rs:143` `ensure_schema`). Without explicit `schema=[...]`, auto-discovery `schema.rs:90` via `DiscoverySink` `parallel_stream.rs:55` (≤128 MiB full scan else 16×2 MiB sampled, now parallel, `needs_value=false`) captures all columns (FieldG 30%, Text21 1%). Hard-error on unknown field (`engine/table_builder.rs:406` `MergeError` naming column, `unknown field "LateColumn" not in frozen schema... pass schema=[...]`) - fixture with `LateColumn` only in last 1% verifies loud failure vs silent drop. Column order is `schema` order if explicit, else discovery file order. Provide `schema=` to avoid 5.3 ms; reuse via `crxml.discover_schema("sample.xml")` `src/crxml/source.py:445` / `_core.discover_schema` `src/crxml_core/src/lib.rs:1012` (see below). 1 MB chunks `par` collapses (3553) while streaming does not (3812, +7%) due to `chunk_buf` reuse.
 
 ## The ceiling
 

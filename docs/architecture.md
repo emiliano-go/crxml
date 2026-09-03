@@ -473,8 +473,8 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | `mimalloc` global allocator | `lib.rs:56` | ~27% CPU reduction in malloc/free |
 | `PyDict::new` (no presize) | `src/crxml_core/src/lib.rs` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
 | Key interning (`FxHashMap`) | `src/crxml_core/src/lib.rs` | Reuses `PyString` objects across rows |
-| SIMD UTF-8 validation | `rypipe_xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
-| Fast scanner (memchr-based) | `rypipe_xml::decoder` | Avoids quick-xml event loop overhead for standard CR XML |
+| SIMD UTF-8 validation | `crxml_core::xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
+| Fast scanner (memchr-based) | `crxml_core::xml::decoder` | Avoids quick-xml event loop overhead for standard CR XML |
 | `StrColumn` arena allocation | `rypipe_core::columnar` | No per-cell `String` allocation |
 | Deferred filter compaction | `batchpipe.py:31-48` | Only materializes alive rows at sinks/LambdaOp |
 | Columnar fusion (Layer A) | `fusion.py:23-44` | Entire pipeline compiled into Rust `ExecutionPlan` |
@@ -500,5 +500,5 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | Rust columnar | `rypipe_core::StrColumn` | Flat byte arena + `i32` offsets (Arrow layout) |
 | Rust columnar | `rypipe_core::ExecutionPlan` | Compilation target for stage pushdown |
 | Rust columnar | `rypipe_core::FilterPredicate` | Equal / NotEqual / Compare variants |
-| Rust splitter | `rypipe_xml::CrystalXmlSplitter` | Finds whole-row split points for parallel parsing |
+| Rust splitter | `crxml_core::xml::splitter::CrystalXmlSplitter` | Finds whole-row split points for parallel parsing |
 | Rust decoder | `rypipe_xml::CrystalXmlDecoder` | Emits field events from Crystal Reports XML |

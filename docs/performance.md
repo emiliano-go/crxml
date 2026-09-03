@@ -39,7 +39,7 @@ Small files (10 MB: 956 MB/s single, 50 MB: 825 MB/s) scale poorly, fixed costs 
 >
 > Example: `par8` old best-of-3 = 2154 MB/s, new median = 2139 MB/s. This looks like −0.7% regression but is actually a genuine improvement; the old best was a lucky outlier 5% above its own median. The phantom-regression case: same config, old best-of-3 = 2154, new median = 2050 → reads as −5% but the config didn't change; only the measurement method did.
 
-Previous quick-xml numbers were on i5-1335U. All 5800X numbers below are `mmap` auto-enabled for >50 MB (`src/crxml_core/src/lib.rs:22` `auto_mmap`), `cap` via `estimate_bytes_per_row` (`splitter.rs:64`), `row_dirty` bitmask (`rypipe-core/src/engine.rs:16`).
+Previous quick-xml numbers were on i5-1335U. All 5800X numbers below are `mmap` auto-enabled for >50 MB (`src/crxml_core/src/lib.rs:22` `auto_mmap`), `cap` via `estimate_bytes_per_row` (`splitter.rs:64`), `row_dirty` bitmask (`rypipe-core/src/engine/table_builder.rs:43`).
 
 ## Input files
 
@@ -114,7 +114,7 @@ Throughput `file_bytes/median`. Before frozen schema, `stream Table` used `pa.co
 > ```
 > Reproduced on 533 MB and 1 GB with `memory="64MB", threads=16` before the fix. The differential test missed it because it collected then concatenated.
 
-**Fix - frozen schema `crates/rypipe-core/src/parallel_stream.rs:59` `ParallelStreamOpts::schema` + `crates/rypipe-core/src/schema.rs:14` `FrozenSchema` + `crates/rypipe-core/src/engine.rs:79` `ensure_schema`:**
+**Fix - frozen schema `crates/rypipe-core/src/parallel_stream.rs:61` `DiscoverySink` + `crates/rypipe-core/src/schema.rs:21` `FrozenSchema` + `crates/rypipe-core/src/engine/table_builder.rs:143` `ensure_schema`:**
 
 * If `plan.schema_order` non-empty (explicit `schema=[...]`), `FrozenSchema::from_plan` - exact, zero Discovery cost.
 * Else auto-discovery via `DiscoverySink` `parallel_stream.rs:55` sampled locate (16×2 MiB windows for >128 MiB else full scan, `needs_value=false`). Windows are now **parallelised** `parallel_stream.rs:122` via `rayon::par_iter` (19 ms serial → ~5.3 ms on 16t, `discovery_ns` in `get_par_profile()` `src/crxml_core/src/lib.rs:493` - the 13 ms residual is now 1.3 ms). `FrozenSchema::from_discovered` applies `field_map`/`drop_fields`. Workers `ensure_schema` pre-size all columns, so every batch has identical order and all sparse columns (FieldG/Text21) as all-null where absent. Cost: auto Discovery ~5.3 ms on 533 MB (≈4% of parse) vs 19 ms serial before; explicit avoids it and is **11% faster than par128** (4980 vs 4470) while bounded.
@@ -137,7 +137,7 @@ w.close()
 ```
 unknown field "LateColumn" not in frozen schema (10 columns, exact=false); pass schema=[...] with full column list or use full-scan discovery
 ```
-Surfaced as `MergeError` via `TableBuilder::finish()` `crates/rypipe-core/src/engine.rs:510` → `ParallelStreamingBatchIterator` `crates/rypipe-core/src/parallel_stream.rs:426` `Err` channel → Python `MergeError`. Fixture: file with `LateColumn` only in last 1% (200k rows, last 200 rows) - verified auto with sampled Discovery misses it and raises, explicit `schema=["A","LateColumn"]` succeeds.
+Surfaced as `MergeError` via `TableBuilder::finish()` `crates/rypipe-core/src/engine/table_builder.rs:406` → `ParallelStreamingBatchIterator` `crates/rypipe-core/src/parallel_stream.rs:426` `Err` channel → Python `MergeError`. Fixture: file with `LateColumn` only in last 1% (200k rows, last 200 rows) - verified auto with sampled Discovery misses it and raises, explicit `schema=["A","LateColumn"]` succeeds.
 
 1 GB side-by-side with frozen schema, parallel Discovery (5 rounds):
 
@@ -196,10 +196,10 @@ Best-of-3, `drop_fields` / `field_mapping` / `field_types` / `dictionary` / `aut
 | `typed_int` | 646 | 2583 | `lexical::parse` `columnar.rs:378` |
 | `typed_float` | 667 | 2548 |  |
 | `dict` | 646 | 2501 | `dictionary_columns` `columnar.rs:557` |
-| `auto_dict` | 569 | 1604 | forces `merge.rs:57` serial `extend`, `auto_dict_upgrade` `engine.rs:139` |
+| `auto_dict` | 569 | 1604 | forces `merge.rs:57` serial `extend`, `auto_dict_upgrade` `engine/table_builder.rs:344` |
 | `filter_eq` `Level==3` | 665 | 2552 | per-row `check` `plan.rs:280` then `row_dirty` |
 | `filter_compare` `Field22>Field23` | 642 (45k rows) | 2346 (45k) | `compare` + `apply_compare_filter` `arrow_export.rs:29` fast path |
-| `schema` ordering | 653 | 2525 | `sort_columns` `engine.rs:152` |
+| `schema` ordering | 653 | 2525 | `sort_columns` `engine/table_builder.rs:357` |
 | `mmap` on/off | 647/656 | 2771/2590 | `auto_mmap` 2-4% single, warm-cache `rep_movs` 3% perf |
 <!-- END:pushdown -->
 
