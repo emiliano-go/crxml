@@ -50,13 +50,9 @@ impl CrystalXmlSplitter {
 impl Splitter for CrystalXmlSplitter {
     fn next_record_start(&self, bytes: &[u8], from: usize) -> Option<usize> {
         next_row_start_fast(bytes, from, &self.row_tag).map(|pos| {
-            // Return position past the closing `>` of the row tag
-            let after = pos + 1 + self.row_tag.len();
-            bytes[after..]
-                .iter()
-                .position(|&b| b == b'>')
-                .map(|rel| after + rel + 1)
-                .unwrap_or(bytes.len())
+            // Return the position of the `<` that starts the row tag,
+            // which is the valid row boundary for the decoder.
+            pos
         })
     }
 
