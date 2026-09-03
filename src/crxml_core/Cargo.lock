@@ -329,7 +329,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crxml-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "arrow",
  "memchr",
@@ -846,8 +846,8 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rypipe-core"
-version = "2.0.0"
-source = "git+https://github.com/emiliano-go/rypipe#6f4bc576c54f4ffba330e56ac1c599ae27421f7a"
+version = "2.1.0"
+source = "git+https://github.com/emiliano-go/rypipe?tag=v2.1.0#d9fc9f33557733cd9152c56c8de388cbda09e277"
 dependencies = [
  "arrow",
  "chrono",
