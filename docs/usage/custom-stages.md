@@ -74,7 +74,7 @@ To use a custom stage with `.parallel()`, it must be picklable:
 - No closures or local functions
 
 crxml validates picklability at pipeline construction time and raises
-`UnpicklableStageError` for incompatible stages.
+`TypeError` for incompatible stages.
 
 ## Columnar plan fusion
 

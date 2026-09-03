@@ -271,7 +271,7 @@ Output: plan_overrides = {field_mapping: ..., field_types: ..., drop_fields: ...
 
 A pull-based (Volcano-style) operator chain over Arrow `RecordBatch` objects.
 
-**`Batch`**: the unit of flow. `namedtuple("Batch", "data, selection")` where `data` is a `RecordBatch` and `selection` is an optional `BooleanArray` mask.
+**`Batch`**: the unit of flow. A class with `__slots__ = ("data", "selection")` where `data` is a `RecordBatch` and `selection` is an optional `BooleanArray` mask.
 
 ```python
 class Batch:
@@ -342,12 +342,12 @@ class Stage:
 **`FilterRows`** has three construction paths:
 1. **Callable predicate**: `FilterRows(predicate=lambda r: ...)`: not columnar-pushdownable.
 2. **Declarative constant**: `FilterRows(field="city", op="==", value="NYC")`: pushdownable as `FilterPredicate::Equal`/`NotEqual`. Uses `_ConstantPredicate` inner class.
-3. **Declarative compare**: `FilterRows(field_a="age", op=">", field_b="threshold")`: pushdownable as `FilterPredicate::Compare` (post-reduce via pyarrow.compute). Uses `_ComparePredicate` inner class.
+3. **Declarative compare**: `FilterRows(field_a="age", op=">", field_b="threshold")`: pushdownable as `FilterPredicate::Compare` (applied in Rust via `apply_compare_filter` with `arrow::compute` kernels). Uses `_ComparePredicate` inner class.
 
 **Filter semantics**:
 - Constant `==`: missing field returns unequal (dict `.get()` returns `None`).
 - Constant `!=`: missing field returns equal (`None != value` is true; the row is kept).
-- Compare: both columns must exist. Evaluated post-reduce via `pyarrow.compute`.
+- Compare: both columns must exist. Evaluated per-row during parse AND re-applied post-export in Rust via `arrow::compute` kernels.
 
 ### `parallel.py`: Multi-process parallelism
 
@@ -501,4 +501,4 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | Rust columnar | `rypipe_core::ExecutionPlan` | Compilation target for stage pushdown |
 | Rust columnar | `rypipe_core::FilterPredicate` | Equal / NotEqual / Compare variants |
 | Rust splitter | `crxml_core::xml::splitter::CrystalXmlSplitter` | Finds whole-row split points for parallel parsing |
-| Rust decoder | `rypipe_xml::CrystalXmlDecoder` | Emits field events from Crystal Reports XML |
+| Rust decoder | `crxml_core::xml::decoder::CrystalXmlDecoder` | Emits field events from Crystal Reports XML |

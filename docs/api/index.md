@@ -39,13 +39,12 @@ RenameFields(mapping: dict[str, str])
 ## CastTypes
 
 ```python
-CastTypes(types: dict[str, type], errors: str = "raise")
+CastTypes(mapping: dict[str, type])
 ```
 
-| Param   | Type             | Default   | Description                         |
-|---------|------------------|-----------|-------------------------------------|
-| `types` | `dict[str, type]`|,         | Field name → target type            |
-| `errors`| `str`            | `"raise"` | One of `"raise"`, `"coerce"`, `"skip"` |
+| Param     | Type             | Description                         |
+|-----------|------------------|-------------------------------------|
+| `mapping` | `dict[str, type]`| Field name → target type (e.g. `int`, `float`, `bool`, `str`) |
 
 **Fusable:** yes | **Picklable:** yes
 
@@ -83,6 +82,7 @@ Pipeline(source: Iterable[dict], stages: list[Stage] | None = None,
 ```
 
 Created implicitly via `|`. Not typically constructed directly.
+When constructed directly, `stages` must be a list.
 
 ### Methods
 
@@ -172,3 +172,30 @@ collect(pipeline: Pipeline) -> list[dict]
 | Param      | Type       | Description              |
 |------------|------------|--------------------------|
 | `pipeline` | `Pipeline` | Pipeline to materialize  |
+
+## discover_schema
+
+```python
+discover_schema(source: str | Path, *, row_tag: str = "Details",
+                field_mapping: dict[str, str] | None = None,
+                drop_fields: list[str] | None = None,
+                filter: dict | None = None,
+                field_types: dict[str, str] | None = None,
+                dictionary_columns: list[str] | None = None,
+                schema: list[str] | None = None,
+                auto_dict: bool = False) -> list[str]
+```
+
+Discover the frozen schema for a file. Scans once (full scan for ≤128 MB,
+else 16×2 MiB sampled windows in parallel) and returns column names in file
+order after applying `field_mapping`/`drop_fields`/`filter` etc.
+
+Pass the result as `CrystalXMLSource(..., schema=schema)` to avoid per-file
+schema discovery and hit the explicit fast path.
+
+| Param               | Type               | Default   | Description                          |
+|---------------------|--------------------|-----------|--------------------------------------|
+| `source`            | `str \| Path`      | required | Path to CR XML file                  |
+| `row_tag`           | `str`              | `"Details"` | XML tag for each record row        |
+
+**Returns:** `list[str]` of field names in output order.

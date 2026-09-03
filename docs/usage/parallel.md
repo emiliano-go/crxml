@@ -57,7 +57,7 @@ pipe = CrystalXMLSource("report.xml") | RenameFields({"a": "b"})
 # This works, both stages are Fusable and picklable
 
 pipe2 = CrystalXMLSource("report.xml") | FilterRows(lambda r: r["x"] > 1)
-pipe2.parallel()  # raises UnpicklableStageError, lambda not picklable
+pipe2.parallel()  # raises TypeError, lambda not picklable
 ```
 
 ## Named function example

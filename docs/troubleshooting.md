@@ -27,24 +27,24 @@ The most frequent non-wrapper tag is usually the row tag. Pass it explicitly:
 src = CrystalXMLSource("report.xml", row_tag="Details")
 ```
 
-### ValueError on bad CR XML
+### XmlError on bad CR XML
 
-The parser raises `ValueError` if the XML is malformed or does not match the
+The parser raises `XmlError` if the XML is malformed or does not match the
 Crystal Reports schema. Check that:
 
 - The file is well-formed XML (validate with `xmllint`)
 - The file contains repeating row elements (not a single record)
 - The row tag contains `<Field>` children with `FieldName` attributes
 
-### TypeError from CastTypes
+### ValueError from CastTypes
 
 ```python
 CastTypes({"amount": float})
 ```
 
-Raises `TypeError` if a value cannot be cast to the target type.
+Raises `ValueError` if a value cannot be cast to the target type.
 
-### UnpicklableStageError
+### TypeError from parallel mode
 
 Raised when calling `.parallel()` on a pipeline with non-picklable stages.
 
@@ -58,7 +58,7 @@ Fix: use module-level functions or built-in stages with the keyword-based
 `FilterRows(field=..., op=..., value=...)` API.
 
 ```python
-# Causes UnpicklableStageError:
+# Causes TypeError:
 pipe | FilterRows(lambda r: r.get("x") == "y")
 
 # Works with .parallel():

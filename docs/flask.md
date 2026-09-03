@@ -156,12 +156,9 @@ def parse_mapped():
 Register an error handler for crxml-specific errors:
 
 ```python
-from crxml._crxml_core import UnpicklableStageError
-
-
-@app.errorhandler(UnpicklableStageError)
-def handle_unpicklable(e):
-    return jsonify({"error": "Stage not compatible with parallel mode"}), 400
+@app.errorhandler(TypeError)
+def handle_type_error(e):
+    return jsonify({"error": f"Stage not compatible with parallel mode: {e}"}), 400
 
 
 @app.errorhandler(ValueError)

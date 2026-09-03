@@ -42,7 +42,7 @@ Usually created implicitly via `|`. The `Pipeline` class is also importable:
 ```python
 from crxml import Pipeline, CrystalXMLSource, RenameFields
 
-pipe = Pipeline(CrystalXMLSource("report.xml"), RenameFields(mapping))
+pipe = Pipeline(CrystalXMLSource("report.xml"), [RenameFields(mapping)])
 ```
 
 ## Lazy evaluation
