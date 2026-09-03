@@ -322,6 +322,30 @@ fn field_element<'a, S: ColumnarSink + ?Sized>(
         Err(()) => return Flow::Recover,
     };
 
+    // Self-closing tag: <Field FieldName="a" Value="x"/>
+    // Extract the Value attribute directly; no child elements to scan.
+    if open.self_closing {
+        let value = find_attr_value(interior, &[b"Value"])
+            .ok()
+            .flatten()
+            .map(|v| decode_attr(v))
+            .unwrap_or(Cow::Borrowed(""));
+        let key = decode_attr(key_raw);
+        if !sink.needs_value() {
+            if !sink.needs_resolve() {
+                return Flow::At(open.after());
+            }
+            if sink.wants(&key) {
+                let _ = sink.resolve(&key);
+            }
+            return Flow::At(open.after());
+        }
+        if sink.resolve(&key).is_some() {
+            sink.resolve_and_put(&key, Value::Str(value));
+        }
+        return Flow::At(open.after());
+    }
+
     // Fast path: if the engine cached a slot for this ordinal and the raw
     // bytes match, skip decode_attr + resolve entirely.
     if let Some((slot, expected)) = sink.expect_slot(ordinal) {
