@@ -50,6 +50,11 @@ fields = src.schema()  # list of field name strings
 The source yields rows internally and caches them, so the first batch is not
 lost. `.schema()` is safe to call before building a pipeline.
 
+For performance, pass the known schema as `schema=` to
+`CrystalXMLSource(...)`. This skips the discovery pass entirely and is the
+single largest performance lever for bounded/streaming mode. See
+[Performance](../performance.md) for benchmarks.
+
 ## Memory model
 
 The parser streams the file in constant memory. The Rust backend reuses

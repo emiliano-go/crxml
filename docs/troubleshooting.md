@@ -85,9 +85,6 @@ pip install .
 This only affects building from source; PyPI wheels bundle the compiled
 extension and need no Rust toolchain at all.
 
-Historical note: before 1.2.0 this dependency was a versioned crate from
-crates.io, which was replaced by the git dependency.
-
 ## FAQ
 
 ### How do I find the right row_tag?

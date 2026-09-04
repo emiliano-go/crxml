@@ -110,7 +110,7 @@ struct RowParser {
 **`read_batch_into(n)`**: calls `read_one_row` up to `n` times, extending `batch_vals` and `batch_lens`. Runs with the GIL released.
 
 **Dict construction** (GIL held, `#[pymethods]`):
-- `new_dict(py)`: creates a plain `PyDict`. The private CPython API `_PyDict_NewPresized` was benchmarked and removed; it delivered only 3.5% overall gain and used an `unsafe` call to a private, unstable symbol.
+- `new_dict(py)`: creates a plain `PyDict`. Interned `PyString` objects are reused instead of allocating fresh `PyUnicode` per field per row.
 - `cached_key(key)`: `FxHashMap<String, Py<PyString>>`: field names repeat every row; interned `PyString` objects are reused instead of allocating fresh `PyUnicode` per field per row.
 
 **`next_batch(n)`**: releases GIL → parses `n` rows into flat buffers → re-acquires GIL → walks `batch_vals`+`batch_lens` → builds `PyList[PyDict]`.

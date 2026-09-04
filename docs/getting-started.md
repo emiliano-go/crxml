@@ -39,6 +39,22 @@ fields = src.schema()  # list of field name strings
 
 This is useful for building dynamic pipelines.
 
+## Schema for performance
+
+`.schema()` returns field names for inspection. When you know the fields
+upfront, pass them as `schema=` to skip discovery and hit the fast path:
+
+```python
+schema = src.schema()  # discover once
+fast = CrystalXMLSource("report.xml", row_tag="Details", schema=schema)
+df = fast.to_dataframe()  # no discovery pass
+```
+
+This is the single largest performance lever for bounded/streaming mode.
+On production data, explicit schema lifts throughput from 4.2 GB/s to
+7.6 GB/s on a 533 MB report. See [Performance](performance.md) for
+benchmarks.
+
 ## Simple pipeline
 
 The `|` operator chains transformation stages. Nothing executes until you
