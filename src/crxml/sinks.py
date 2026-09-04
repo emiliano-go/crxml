@@ -100,3 +100,36 @@ def collect(pipeline: Iterable[dict]) -> list[dict]:
             rows.extend(batch)
         return rows
     return list(pipeline)
+
+
+def to_arrow(pipeline: Iterable[dict]):
+    """Return a ``pyarrow.Table`` from a pipeline or source."""
+    if hasattr(pipeline, "_to_arrow"):
+        table = pipeline._to_arrow()
+        if table is not None:
+            return table
+    if hasattr(pipeline, "to_arrow"):
+        return pipeline.to_arrow()
+    import pyarrow as pa
+    return pa.Table.from_pylist(list(pipeline))
+
+
+def to_pandas(pipeline: Iterable[dict], dtype_backend: str = "pyarrow"):
+    """Return a pandas DataFrame from a pipeline or source."""
+    import pandas as pd
+    table = to_arrow(pipeline)
+    if dtype_backend == "pyarrow":
+        return table.to_pandas(types_mapper=pd.ArrowDtype)
+    return table.to_pandas()
+
+
+def to_polars(pipeline: Iterable[dict]):
+    """Return a Polars DataFrame from a pipeline or source."""
+    import polars as pl
+    return pl.from_arrow(to_arrow(pipeline))
+
+
+def to_parquet(pipeline: Iterable[dict], path: str | Path, **kwargs):
+    """Write a pipeline or source to Parquet."""
+    import pyarrow.parquet as pq
+    pq.write_table(to_arrow(pipeline), str(path), **kwargs)
