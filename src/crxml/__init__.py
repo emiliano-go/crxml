@@ -22,6 +22,7 @@ __all__ = [
     "MergeError",
 ]
 
+
 _modules = {
     "CrystalXMLSource": ".source",
     "discover_schema": ".source",
