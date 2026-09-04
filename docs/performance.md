@@ -2,17 +2,17 @@
 
 ## Numbers
 
-Three throughput figures, not one. All on synthetic Crystal Reports XML (10 fields/row, ~9 rows/KB), median-of-3, warm cache.
+Three throughput figures, not one. All on Crystal Reports XML (10 fields/row, ~9 rows/KB), median-of-7, warm cache.
 
-| File | Single-thread | Parallel (auto chunks) | Projected (schema pushdown) |
+| File | Single-thread | Parallel (par128, 4 MB) | Streaming explicit schema |
 |------|:------------:|:----------------------:|:-----------------------------:|
-| 100 MB | **1,213 MB/s** | 6,279 MB/s | 11,153 MB/s |
-| 533 MB | 1,105 MB/s | 5,979 MB/s | 9,467 MB/s |
-| 1 GB | 1,092 MB/s | 5,614 MB/s | 9,706 MB/s |
+| 100 MB | **756 MB/s** | 3,792 MB/s (par16) | - |
+| 533 MB | **953 MB/s** | **4,231 MB/s** | **4,980 MB/s** |
+| 1 GB | **940 MB/s** | **4,158 MB/s** | ~4,900 MB/s |
 
 - **Single-thread**: `engine="columnar"`, one thread, full 10-column parse + Arrow export.
-- **Parallel (auto)**: `engine="parallel"`, chunk count = `max(threads, min(16×threads, file/4MB))`. On 16 cores / 1 GB: 256 chunks.
-- **Projected**: parallel with `schema` pushdown. `row_satisfied` byte-jumps to row close after wanted columns arrive, skipping remaining fields.
+- **Parallel (par128)**: `engine="parallel"`, 128 chunks of 4 MB. Peak throughput for full-RAM path.
+- **Streaming explicit schema**: `iter_record_batches(memory="64MB", threads=16, schema=[...])`. Bounded at 88 MB RSS, +11% vs par128 via `row_satisfied` byte-jump.
 
 Small files (10 MB: 828 MB/s single, 50 MB: 924 MB/s) scale poorly, fixed costs dominate below ~100 MB.
 
@@ -29,9 +29,9 @@ Small files (10 MB: 828 MB/s single, 50 MB: 924 MB/s) scale poorly, fixed costs 
 | **crxml** | 2.0.0 |
 | **rypipe-core** | 2.0.0 |
 | **Build** | release, LTO enabled, mimalloc allocator |
-| **Method** | median-of-3 |
+| **Method** | median-of-7 |
 
-> **Note on body numbers:** Tables and measurements in the sections below were taken at the time noted (Aug 28 – Sep 3). They are correct for their respective builds. The header numbers above reflect the latest build (Sep 3, median-of-3).
+> **Note on body numbers:** Tables and measurements in the sections below were taken at the time noted. They are correct for their respective builds.
 
 > **Arrow version note:** rypipe-core uses arrow=55.2.0, rypipe-python uses arrow=59.2 (different pyo3 requirements). Crxml depends only on rypipe-core and uses arrow=55.2.0 directly for PyArrow export. The mismatch is a rypipe-python concern, not a crxml concern.
 

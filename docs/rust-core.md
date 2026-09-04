@@ -49,11 +49,10 @@ field key/value pairs from nested `<Field>` and `<Text>` elements.
 | Crate        | Purpose                        |
 |--------------|--------------------------------|
 | `pyo3`       | Python bindings                |
-| `quick-xml`  | Streaming XML reader           |
+| `memchr`     | Fast substring scans for the XML splitter and scanner |
 | `arrow`      | Arrow C Data Interface export  |
 | `mimalloc`   | Fast allocator (replaces system malloc, ~27% CPU savings) |
 | `rypipe-core`| Generic columnar/parallel/bounded engine (from git) |
-| `memchr`     | Fast substring scans for the XML splitter |
 | `simdutf8`   | SIMD UTF-8 validation for the XML decoder |
 | `thiserror`  | Adapter error derives            |
 

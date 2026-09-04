@@ -35,7 +35,7 @@ XML file
   ├─► columnar engine: rypipe_core::TableBuilder via crxml wrapper
   │     │
   │     ├─► simdutf8 validation (one SIMD pass) in the embedded CrystalXmlDecoder
-  │     ├─► borrowed-slice quick-xml reader (zero-copy events)
+  │     ├─► hand-rolled memchr/memmem scanner (SIMD-accelerated)
   │     │
   │     ├─► ColumnBuilder columns ──► finish_row (null-fill, filter)
   │     │     └─► TableBuilder::extend (merge across chunks for multi/parallel)
@@ -474,7 +474,7 @@ The expensive parts (XML parsing, string scanning) run with the GIL released in 
 | `PyDict::new` (no presize) | `src/crxml_core/src/lib.rs` | Removed private-CAPI hack; 3.5% gain not worth `unsafe` |
 | Key interning (`FxHashMap`) | `src/crxml_core/src/lib.rs` | Reuses `PyString` objects across rows |
 | SIMD UTF-8 validation | `crxml_core::xml::decoder` | One SIMD pass per chunk (via `simdutf8`) |
-| Fast scanner (memchr-based) | `crxml_core::xml::decoder` | Avoids quick-xml event loop overhead for standard CR XML |
+| Fast scanner (memchr-based) | `crxml_core::xml::scanner` | SIMD-accelerated field scanning and byte-jumps for dropped fields |
 | `StrColumn` arena allocation | `rypipe_core::columnar` | No per-cell `String` allocation |
 | Deferred filter compaction | `batchpipe.py:31-48` | Only materializes alive rows at sinks/LambdaOp |
 | Columnar fusion (Layer A) | `fusion.py:23-44` | Entire pipeline compiled into Rust `ExecutionPlan` |
