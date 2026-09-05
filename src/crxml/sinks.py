@@ -114,10 +114,16 @@ def to_arrow(pipeline: Iterable[dict]):
     return pa.Table.from_pylist(list(pipeline))
 
 
-def to_pandas(pipeline: Iterable[dict], dtype_backend: str = "pyarrow"):
+def to_pandas(pipeline: Iterable[dict], chunksize: int | None = None, dtype_backend: str = "pyarrow"):
     """Return a pandas DataFrame from a pipeline or source."""
     import pandas as pd
     table = to_arrow(pipeline)
+    if chunksize is not None:
+        # Chunk-based conversion for memory efficiency
+        chunks = []
+        for batch in table.to_batches(max_chunksize=chunksize):
+            chunks.append(batch.to_pandas(types_mapper=pd.ArrowDtype if dtype_backend == "pyarrow" else None))
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
     if dtype_backend == "pyarrow":
         return table.to_pandas(types_mapper=pd.ArrowDtype)
     return table.to_pandas()
