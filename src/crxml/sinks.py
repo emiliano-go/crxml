@@ -3,7 +3,7 @@ import warnings
 from pathlib import Path
 from typing import Iterable
 
-def to_dataframe(
+def to_pandas(
     pipeline: Iterable[dict],
     chunksize: int | None = None,
     dtype_backend: str = "pyarrow",

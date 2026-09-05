@@ -189,7 +189,7 @@ def render_source_table(merged):
     # Show key combos
     show = []
     for eng in ["stream", "columnar", "parallel", "auto"]:
-        for sink in ["iter", "to_arrow", "to_dataframe"]:
+        for sink in ["iter", "to_arrow", "to_pandas"]:
             if (eng, sink) in combos:
                 show.append((eng, sink))
 

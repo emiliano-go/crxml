@@ -59,13 +59,13 @@ def run_parallel(path: str, row_tag: str = "Details") -> dict:
 
     # Warmup: parse once, discard
     gc.collect()
-    _ = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=False).to_dataframe()
+    _ = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=False).to_pandas()
     del _
     gc.collect()
 
     t0 = time.perf_counter()
     src = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=False)
-    df = src.to_dataframe()
+    df = src.to_pandas()
     wall = time.perf_counter() - t0
     rows = len(df)
     del src, df
@@ -87,12 +87,12 @@ def run_parallel(path: str, row_tag: str = "Details") -> dict:
 
     # auto_dict comparison (also warm)
     gc.collect()
-    _ = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=True).to_dataframe()
+    _ = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=True).to_pandas()
     del _
     gc.collect()
     t0 = time.perf_counter()
     src = CrystalXMLSource(path, row_tag=row_tag, engine="parallel", use_mmap=True, auto_dict=True)
-    df2 = src.to_dataframe()
+    df2 = src.to_pandas()
     wall_ad = time.perf_counter() - t0
     profile_ad = _core.get_par_profile()
     total_ad = profile_ad["split_scan_ns"] + profile_ad["parse_ns"] + profile_ad["assembly_export_ns"]

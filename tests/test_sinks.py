@@ -1,9 +1,9 @@
-"""Tests for sinks: to_dataframe, to_csv, collect."""
+"""Tests for sinks: to_pandas, to_csv, collect."""
 import csv
 import tempfile
 from pathlib import Path
 import pytest
-from crxml import CrystalXMLSource, Pipeline, RenameFields, CastTypes, DropFields, FilterRows, to_dataframe, to_csv, collect
+from crxml import CrystalXMLSource, Pipeline, RenameFields, CastTypes, DropFields, FilterRows, to_pandas, to_csv, collect
 
 
 class TestCollect:
@@ -27,12 +27,12 @@ class TestCollect:
 
 class TestToDataFrame:
     def test_dataframe_basic(self, bench_10mb):
-        df = to_dataframe(CrystalXMLSource(bench_10mb, row_tag="Details"))
+        df = to_pandas(CrystalXMLSource(bench_10mb, row_tag="Details"))
         assert df.shape[0] > 0
         assert df.shape[1] > 0
 
     def test_dataframe_chunksize(self, bench_10mb):
-        df = to_dataframe(
+        df = to_pandas(
             CrystalXMLSource(bench_10mb, row_tag="Details"),
             chunksize=500,
         )
@@ -43,18 +43,18 @@ class TestToDataFrame:
         for r in CrystalXMLSource(bench_10mb, row_tag="Details"):
             first_key = list(r.keys())[0]
             break
-        df = to_dataframe(
+        df = to_pandas(
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | DropFields([first_key])
         )
         assert first_key not in df.columns
 
     def test_dataframe_empty(self):
-        df = to_dataframe(Pipeline(iter([])))
+        df = to_pandas(Pipeline(iter([])))
         assert df.shape == (0, 0)
 
     def test_dataframe_chunksize_empty(self):
-        df = to_dataframe(Pipeline(iter([])), chunksize=100)
+        df = to_pandas(Pipeline(iter([])), chunksize=100)
         assert df.shape == (0, 0)
 
 

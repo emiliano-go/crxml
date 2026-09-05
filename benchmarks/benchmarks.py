@@ -211,7 +211,7 @@ def bench_source_dataframe(path, label, engine):
 
     src = CrystalXMLSource(path, row_tag="Details", engine=engine)
     t0 = time.perf_counter()
-    df = src.to_dataframe()
+    df = src.to_pandas()
     t1 = time.perf_counter()
     dur = t1 - t0
     size = os.path.getsize(path)
@@ -251,7 +251,7 @@ def bench_source_dataframe_mem(path, label, engine):
 
     tracemalloc.start()
     t0 = time.perf_counter()
-    df = CrystalXMLSource(path, row_tag="Details", engine=engine).to_dataframe()
+    df = CrystalXMLSource(path, row_tag="Details", engine=engine).to_pandas()
     t1 = time.perf_counter()
     _, peak = tracemalloc.get_traced_memory()
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 if resource else 0.0

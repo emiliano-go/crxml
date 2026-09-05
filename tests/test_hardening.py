@@ -436,18 +436,18 @@ def test_dtype_backend_pyarrow(tmp_path):
 
 
 def test_dtype_backend_sink_numpy(tmp_path):
-    """sinks.to_dataframe(pipeline, dtype_backend='numpy') does not produce ArrowDtype."""
-    from crxml.sinks import to_dataframe
+    """sinks.to_pandas(pipeline, dtype_backend='numpy') does not produce ArrowDtype."""
+    from crxml.sinks import to_pandas
     p = _write_xml(tmp_path, FUSION_XML)
     pipe = Pipeline(CrystalXMLSource(p, row_tag="Row"))
-    df = to_dataframe(pipe, dtype_backend="numpy")
+    df = to_pandas(pipe, dtype_backend="numpy")
     assert str(df["name"].dtype) != "string[pyarrow]"
 
 
 def test_dtype_backend_sink_pyarrow(tmp_path):
-    """sinks.to_dataframe(pipeline, dtype_backend='pyarrow') produces ArrowDtype."""
-    from crxml.sinks import to_dataframe
+    """sinks.to_pandas(pipeline, dtype_backend='pyarrow') produces ArrowDtype."""
+    from crxml.sinks import to_pandas
     p = _write_xml(tmp_path, FUSION_XML)
     pipe = Pipeline(CrystalXMLSource(p, row_tag="Row"))
-    df = to_dataframe(pipe, dtype_backend="pyarrow")
+    df = to_pandas(pipe, dtype_backend="pyarrow")
     assert str(df["name"].dtype) == "string[pyarrow]"

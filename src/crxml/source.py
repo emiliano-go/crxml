@@ -41,7 +41,7 @@ def _arrow_iter(table) -> Iterator[dict]:
 
     Compatibility helper: for columnar/parallel engines when row iteration
     is requested.  Table-oriented callers should use ``to_arrow()`` or
-    ``to_dataframe()`` directly to avoid the dict reconstruction overhead.
+    ``to_pandas()`` directly to avoid the dict reconstruction overhead.
     """
     for batch in table.to_batches():
         yield from batch.to_pylist()
@@ -343,7 +343,7 @@ class CrystalXMLSource:
 
         return _arrow_iter(self._read_arrow())
 
-    def to_dataframe(self, dtype_backend: str = "pyarrow") -> "pd.DataFrame":
+    def to_pandas(self, dtype_backend: str = "pyarrow") -> "pd.DataFrame":
         return self.to_pandas(dtype_backend=dtype_backend)
 
     def to_arrow(self, combine: bool = False):

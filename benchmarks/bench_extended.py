@@ -5,7 +5,7 @@ Covers:
 - File sizes: 10, 50, 100, 1000 MB (1 GB optional / --skip-1gb)
 - Native engines: read_to_columnar (single), read_to_columnar_multi (2), read_to_columnar_par (2/4/8/16/32), read_to_columnar_bounded (64/256 MB)
 - Source engines: stream, columnar, parallel, auto (with _resolve_engine)
-- Sinks: iter (dict), iter_batches, to_arrow, to_dataframe, to_pandas, to_polars, to_parquet, Pipeline+stages, rypipe fusion
+- Sinks: iter (dict), iter_batches, to_arrow, to_pandas, to_pandas, to_polars, to_parquet, Pipeline+stages, rypipe fusion
 - Pushdowns: baseline, drop_fields (half/all), field_mapping (rename), field_types (int64/float64), dictionary, auto_dict, filter (eq/ne/compare/and/or/not), schema ordering, use_mmap on/off
 - Batch sizes for streaming: 1024 vs 4096
 - Chunk scaling for parallel
@@ -170,8 +170,8 @@ def _config_to_fn(config: BenchConfig) -> Callable:
                 return sum(1 for _ in src._iter_batches(batch_size=1024))
             elif sink == "to_arrow":
                 return src.to_arrow()
-            elif sink in ("to_dataframe", "to_pandas"):
-                return src.to_dataframe()
+            elif sink in ("to_pandas", "to_pandas"):
+                return src.to_pandas()
             elif sink == "to_polars":
                 return src.to_polars()
             elif sink == "to_parquet":
@@ -394,11 +394,11 @@ def cold_warm(path: Path, fn, use_posix_fadvise=True):
     warm = time.perf_counter() - t0
     return cold, warm
 
-def bench_lxml(path: Path, to_dataframe=False):
+def bench_lxml(path: Path, to_pandas=False):
     """External baseline: lxml and ElementTree iterparse, defensible.
 
     - `elem.clear()` plus ancestor cleanup to avoid DOM build (otherwise measuring tree construction, not parsing).
-    - Output shape matched to crxml: `to_dataframe` yields DataFrame, else list of dicts.
+    - Output shape matched to crxml: `to_pandas` yields DataFrame, else list of dicts.
     - Compare lxml single-thread vs crxml single (690 MB/s) head-to-head, parallel separately.
     """
     try:
@@ -434,9 +434,9 @@ def bench_lxml(path: Path, to_dataframe=False):
                 while elem.getprevious() is not None:
                     del parent[0]
         dt = time.perf_counter() - t0
-        if to_dataframe:
+        if to_pandas:
             import pandas as pd
-            # Same artifact as crxml to_dataframe (ArrowDtype)
+            # Same artifact as crxml to_pandas (ArrowDtype)
             t1 = time.perf_counter()
             table = pa.table({k: [r.get(k) for r in rows] for k in rows[0]} if rows else {})
             df = table.to_pandas(types_mapper=pd.ArrowDtype)
@@ -676,7 +676,7 @@ NATIVE_FUNCS = {
 }
 
 ENGINES = ["stream", "columnar", "parallel", "auto"]
-SINKS = ["iter", "iter_batches", "to_arrow", "to_dataframe", "to_pandas", "to_polars", "to_parquet"]
+SINKS = ["iter", "iter_batches", "to_arrow", "to_pandas", "to_pandas", "to_polars", "to_parquet"]
 
 PUSHDOWNS = {
     "baseline": {},
@@ -724,7 +724,7 @@ def run_source_engine_sink_matrix(path: Path, rounds=3, quick=False, collect=Non
                 continue
             # to_* sinks are not intended for stream engine (would fallback via rows and fail on sparse columns)
             # Skip those combos and mark as N/A
-            if engine == "stream" and sink in ("to_arrow","to_dataframe","to_pandas","to_polars","to_parquet"):
+            if engine == "stream" and sink in ("to_arrow","to_pandas","to_pandas","to_polars","to_parquet"):
                 # streaming to_arrow is via columnar; skip to avoid sparse-column KeyError
                 continue
             label = f"src {engine:10s} → {sink}"
@@ -1058,13 +1058,13 @@ def run_edge_case_matrix(edge_dir: Path, rounds=3, quick=False, collect=None):
     # 9) Sinks on edge
     p_10 = BENCH_DATA / "test_10mb.xml"
     if p_10.exists() and not quick:
-        for sink in ["to_arrow","to_dataframe","to_polars"]:
+        for sink in ["to_arrow","to_pandas","to_polars"]:
             def fn(sink=sink, p=p_10):
                 src = CrystalXMLSource(str(p), row_tag="Details", engine="parallel")
                 if sink == "to_arrow":
                     return src.to_arrow()
-                elif sink == "to_dataframe":
-                    return src.to_dataframe()
+                elif sink == "to_pandas":
+                    return src.to_pandas()
                 elif sink == "to_polars":
                     return src.to_polars()
             report(p_10, f"edge sink {sink}", fn, rounds=rounds, collect=collect)

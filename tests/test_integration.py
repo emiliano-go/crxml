@@ -1,5 +1,5 @@
 import pytest
-from crxml import CrystalXMLSource, RenameFields, CastTypes, DropFields, FilterRows, to_dataframe, to_csv, collect
+from crxml import CrystalXMLSource, RenameFields, CastTypes, DropFields, FilterRows, to_pandas, to_csv, collect
 
 
 class TestEndToEnd10MB:
@@ -68,12 +68,12 @@ class TestEndToEnd10MB:
         assert len(rows) == 21047
         assert "renamed" in rows[0]
 
-    def test_to_dataframe(self, bench_10mb):
-        df = to_dataframe(CrystalXMLSource(bench_10mb, row_tag="Details"))
+    def test_to_pandas(self, bench_10mb):
+        df = to_pandas(CrystalXMLSource(bench_10mb, row_tag="Details"))
         assert df.shape == (21047, 7)
 
-    def test_to_dataframe_with_stages(self, bench_10mb):
-        df = to_dataframe(
+    def test_to_pandas_with_stages(self, bench_10mb):
+        df = to_pandas(
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | DropFields(["Level", "Section"])
         )
@@ -103,8 +103,8 @@ class TestEndToEnd50MB:
         rows = collect(CrystalXMLSource(bench_50mb, row_tag="Details"))
         assert len(rows) == 45328
 
-    def test_to_dataframe(self, bench_50mb):
-        df = to_dataframe(CrystalXMLSource(bench_50mb, row_tag="Details"))
+    def test_to_pandas(self, bench_50mb):
+        df = to_pandas(CrystalXMLSource(bench_50mb, row_tag="Details"))
         assert df.shape[0] == 45328
 
 
@@ -114,8 +114,8 @@ class TestEndToEnd100MB:
         rows = collect(CrystalXMLSource(bench_100mb, row_tag="Details"))
         assert len(rows) == 90384
 
-    def test_to_dataframe(self, bench_100mb):
-        df = to_dataframe(CrystalXMLSource(bench_100mb, row_tag="Details"))
+    def test_to_pandas(self, bench_100mb):
+        df = to_pandas(CrystalXMLSource(bench_100mb, row_tag="Details"))
         assert df.shape[0] == 90384
 
 
