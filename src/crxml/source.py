@@ -5,6 +5,7 @@ import warnings
 from pathlib import Path
 from typing import Iterator, Optional, Union
 
+from rypipe import Adapter
 from crxml import _crxml_core as _core
 
 CrxmlReader = _core.CrxmlReader
@@ -98,7 +99,7 @@ def _validate_filter(f: dict) -> None:
         )
 
 
-class CrystalXMLSource:
+class CrystalXMLSource(Adapter):
     """Streaming/columnar source over one Crystal Reports XML file.
 
     Table sinks (``to_arrow``/``to_pandas``/...) cache the parsed Arrow
@@ -111,22 +112,11 @@ class CrystalXMLSource:
 
     __slots__ = (
         "_row_tag",
-        "_filepath",
         "_engine",
         "_engine_desired",
         "_num_chunks",
         "_memory",
-        "_field_mapping",
-        "_drop_fields",
-        "_filter",
-        "_field_types",
-        "_dictionary_columns",
-        "_use_mmap",
-        "_schema",
         "_schema_discovered",
-        "_auto_dict",
-        "_batch_size",
-        "_cached_arrow",
     )
 
     def __init__(
@@ -147,34 +137,34 @@ class CrystalXMLSource:
         use_mmap: bool = True,
         batch_size: int = 1024,
     ):
-        self._filepath = Path(source)
-        if not self._filepath.exists():
-            raise FileNotFoundError(f"File not found: {self._filepath}")
-
+        # Store adapter-specific kwargs before calling super().__init__
         self._row_tag = row_tag
         self._memory = _parse_memory(memory)
-        # Auto-tune: separate optima (Aug 28 sweep, now with frozen schema).
-        # Full-RAM par peaks at 4 MB (par133 4450 vs par266 4328 at 2 MB, −3%;
-        # 1 MB 3553 collapses). Streaming auto peaks at 2 MB but is −14% vs par
-        # due to Discovery; explicit schema 4980 beats par. 8×threads capped
-        # 533 MB at 128 vs ideal 133 for 4 MB. Raise to 16×threads to clear it
-        # while still bounding 50 GB (16×16=256 chunks, 195 MB/chunk at 50 GB).
-        t = threads if threads > 0 else _default_threads()
-        file_bytes = self._filepath.stat().st_size
-        self._num_chunks = max(t, min(16 * t, file_bytes // (4 * 1024 * 1024)))
-        self._field_mapping = field_mapping or {}
-        self._drop_fields = drop_fields or []
-        self._filter = filter
+
+        # Call Source.__init__ for standard kwargs (path, field_mapping, etc.)
+        super().__init__(
+            source,
+            field_mapping=field_mapping,
+            drop_fields=drop_fields,
+            filter=filter,
+            field_types=field_types,
+            dictionary_columns=dictionary_columns,
+            schema=schema,
+            auto_dict=auto_dict,
+            use_mmap=use_mmap,
+            batch_size=batch_size,
+        )
+
+        # Validate filter spec eagerly (crxml-specific validation)
         if self._filter is not None:
             _validate_filter(self._filter)
-        self._field_types = field_types or {}
-        self._dictionary_columns = dictionary_columns or []
-        self._use_mmap = use_mmap
-        self._schema = schema or []
+
+        # Auto-tune: separate optima (Aug 28 sweep, now with frozen schema).
+        t = threads if threads > 0 else _default_threads()
+        file_bytes = self._path.stat().st_size
+        self._num_chunks = max(t, min(16 * t, file_bytes // (4 * 1024 * 1024)))
+
         self._schema_discovered = bool(self._schema)
-        self._auto_dict = auto_dict
-        self._batch_size = batch_size
-        self._cached_arrow = None
 
         if engine not in ("auto", "stream", "columnar", "parallel"):
             raise ValueError(
@@ -202,7 +192,7 @@ class CrystalXMLSource:
         if explicit != "auto":
             return self._engine
 
-        size = self._filepath.stat().st_size
+        size = self._path.stat().st_size
         mem_ok = self._memory is None or size <= self._memory
 
         if goal == "iter":
@@ -271,24 +261,24 @@ class CrystalXMLSource:
             plan.update(plan_overrides)
         if (
             self._memory is not None
-            and self._filepath.stat().st_size > self._memory
+            and self._path.stat().st_size > self._memory
             and _HAS_BOUNDED
         ):
             bounded_kwargs = self._build_bounded_kwargs()
             if plan_overrides:
                 bounded_kwargs.update(plan_overrides)
             table = _core.read_to_columnar_bounded(
-                str(self._filepath), self._row_tag, self._memory,
+                str(self._path), self._row_tag, self._memory,
                 **bounded_kwargs,
             )
         elif engine == "columnar":
             table = _core.read_to_columnar(
-                str(self._filepath), self._row_tag,
+                str(self._path), self._row_tag,
                 prefault=self._use_mmap, **plan
             )
         elif engine == "parallel":
             table = _core.read_to_columnar_par(
-                str(self._filepath), self._row_tag, self._num_chunks,
+                str(self._path), self._row_tag, self._num_chunks,
                 prefault=self._use_mmap, **plan
             )
         else:
@@ -315,7 +305,7 @@ class CrystalXMLSource:
         return [*first_row]
 
     def _stream_iter(self):
-        return CrxmlReader(str(self._filepath), self._row_tag)
+        return CrxmlReader(str(self._path), self._row_tag)
 
     def _iter_batches(self, batch_size: int | None = None):
         if batch_size is None:
@@ -417,7 +407,7 @@ class CrystalXMLSource:
         # This makes auto match explicit-schema performance after the first call.
         if not self._schema_discovered:
             self._schema = _core.discover_schema(
-                str(self._filepath),
+                str(self._path),
                 row_tag=self._row_tag,
                 field_mapping=self._field_mapping or None,
                 drop_fields=self._drop_fields or None,
@@ -428,7 +418,7 @@ class CrystalXMLSource:
             )
             self._schema_discovered = True
         yield from _core.iter_record_batches(
-            str(self._filepath),
+            str(self._path),
             row_tag=self._row_tag,
             memory=str(memory) if isinstance(memory, int) else memory,
             batch_size=batch_size,
