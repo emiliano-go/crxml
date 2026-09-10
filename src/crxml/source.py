@@ -22,14 +22,19 @@ def _parse_memory(value: Optional[Union[str, int]]) -> Optional[int]:
         return None
     if isinstance(value, int):
         return value
-    m = re.match(r"^(\d+(?:\.\d+)?)\s*(KB|MB|GB|TB)?$", value.strip(), re.IGNORECASE)
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(KiB|MiB|GiB|TiB|KB|MB|GB|TB)?$", value.strip())
     if not m:
         raise ValueError(
             f"memory must be None, an int (bytes), or a string like '8GB', got {value!r}"
         )
     num = float(m.group(1))
-    unit = (m.group(2) or "GB").upper()
-    multipliers = {"KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    unit = (m.group(2) or "GB")
+    multipliers = {
+        "KB": 1024, "KiB": 1024,
+        "MB": 1024**2, "MiB": 1024**2,
+        "GB": 1024**3, "GiB": 1024**3,
+        "TB": 1024**4, "TiB": 1024**4,
+    }
     return int(num * multipliers[unit])
 
 
@@ -149,6 +154,31 @@ def _validate_filter(f: dict) -> None:
         )
 
 
+# Ops that the Rust reader (_crxml_core) does not understand.
+# Filter specs using these must fall back to Python execution.
+_RUST_UNSUPPORTED_OPS = frozenset({
+    "is_null", "is_type", "regex",
+    "starts_with", "ends_with", "contains",
+    "strip", "lstrip", "rstrip", "lower", "upper", "length",
+    "in", "not_in",
+})
+_RUST_UNSUPPORTED_CMP_OPS = frozenset({
+    ">", "<", ">=", "<=", "gt", "lt", "ge", "le",
+})
+
+
+def _filter_needs_python(spec: dict) -> bool:
+    """Return True if a filter spec cannot be handled by the Rust reader."""
+    if any(k in spec for k in ("or", "and", "not")):
+        return True
+    op = spec.get("op")
+    if op in _RUST_UNSUPPORTED_OPS:
+        return True
+    if op in _RUST_UNSUPPORTED_CMP_OPS:
+        return True
+    return False
+
+
 class CrystalXMLSource(Adapter):
     """Streaming/columnar source over one Crystal Reports XML file.
 
@@ -178,6 +208,7 @@ class CrystalXMLSource(Adapter):
         engine: str = "auto",
         threads: int = 0,
         memory: Optional[Union[str, int]] = None,
+        chunks: Optional[int] = None,
         field_mapping: Optional[dict[str, str]] = None,
         drop_fields: Optional[list[str]] = None,
         filter: Optional[dict[str, str]] = None,
@@ -194,7 +225,7 @@ class CrystalXMLSource(Adapter):
         # Store adapter-specific kwargs before calling super().__init__
         self._row_tag = row_tag
         self._memory = _parse_memory(memory)
-        self._max_split_chunks = max_split_chunks
+        self._max_split_chunks = chunks if chunks is not None else max_split_chunks
 
         # Call Source.__init__ for standard kwargs (path, field_mapping, etc.)
         super().__init__(
@@ -327,6 +358,23 @@ class CrystalXMLSource(Adapter):
             from .fusion import _merge_plan_kwargs
 
             _merge_plan_kwargs(plan, plan_overrides)
+
+        # Check if the filter is something the Rust reader cannot handle:
+        # compound specs (or/and/not), or ops like is_null/is_type/regex/>/</etc.
+        # If so, fall back to Python execution.
+        filter_spec = plan.get("filter")
+        needs_python_filter = False
+        if filter_spec and isinstance(filter_spec, dict):
+            needs_python_filter = _filter_needs_python(filter_spec)
+        compound_predicate = None
+        if needs_python_filter:
+            engine = "stream"
+            from .stages.filter import _build_predicate_from_spec
+            compound_predicate = _build_predicate_from_spec(filter_spec)
+            plan.pop("filter", None)
+        # Strip keys that the Rust reader doesn't accept
+        plan.pop("max_split_chunks", None)
+        plan.pop("observer", None)
         if (
             self._memory is not None
             and self._path.stat().st_size > self._memory
@@ -356,6 +404,30 @@ class CrystalXMLSource(Adapter):
             rows = []
             for batch in self._iter_batches():
                 rows.extend(batch)
+            # Apply plan overrides that the Rust reader would normally handle
+            field_mapping = plan.get("field_mapping")
+            drop_fields = plan.get("drop_fields")
+            field_types = plan.get("field_types")
+            if field_mapping or drop_fields or field_types or compound_predicate:
+                processed = []
+                for r in rows:
+                    if compound_predicate and not compound_predicate(r):
+                        continue
+                    if field_mapping:
+                        r = {field_mapping.get(k, k): v for k, v in r.items()}
+                    if drop_fields:
+                        r = {k: v for k, v in r.items() if k not in drop_fields}
+                    if field_types:
+                        for col_name, type_str in field_types.items():
+                            if col_name in r and r[col_name] is not None:
+                                if type_str == "int64":
+                                    r[col_name] = int(r[col_name])
+                                elif type_str == "float64":
+                                    r[col_name] = float(r[col_name])
+                                elif type_str in ("bool", "boolean"):
+                                    r[col_name] = r[col_name] in ("true", "True", "1", "yes")
+                    processed.append(r)
+                rows = processed
             if not rows:
                 table = pa.table({})
             else:
@@ -369,6 +441,8 @@ class CrystalXMLSource(Adapter):
         return table
 
     def schema(self) -> list[str]:
+        if self._schema:
+            return list(self._schema)
         first_row = next(iter(self), None)
         if first_row is None:
             return []
@@ -420,22 +494,48 @@ class CrystalXMLSource(Adapter):
         """Drop the cached Arrow table (see class docstring)."""
         self._cached_arrow = None
 
-    def to_polars(self):
+    def to_polars(self, memory=None, **kwargs):
         import polars as pl
 
+        if memory is not None:
+            chunks = []
+            for batch in self.iter_record_batches(memory=memory, **kwargs):
+                chunks.append(pl.from_arrow(batch))
+            return pl.concat(chunks) if chunks else pl.DataFrame()
         return pl.from_arrow(self.to_arrow())
 
-    def to_pandas(self, dtype_backend: str = "pyarrow") -> "pd.DataFrame":
+    def to_pandas(self, memory=None, dtype_backend: str = "pyarrow", **kwargs) -> "pd.DataFrame":
         import pandas as pd
 
+        if memory is not None:
+            types_mapper = pd.ArrowDtype if dtype_backend == "pyarrow" else None
+            chunks = []
+            for batch in self.iter_record_batches(memory=memory, **kwargs):
+                chunks.append(batch.to_pandas(types_mapper=types_mapper))
+            return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         table = self.to_arrow()
         if dtype_backend == "pyarrow":
             return table.to_pandas(types_mapper=pd.ArrowDtype)
         return table.to_pandas()
 
-    def to_parquet(self, path: Union[str, Path], **kwargs):
+    def to_parquet(self, path: Union[str, Path], memory=None, **kwargs):
         import pyarrow.parquet as pq
 
+        if memory is not None:
+            parquet_keys = {
+                "compression", "compression_level", "row_group_size",
+                "use_dictionary", "write_statistics",
+            }
+            parquet_kwargs = {k: v for k, v in kwargs.items() if k in parquet_keys}
+            iter_kwargs = {k: v for k, v in kwargs.items() if k not in parquet_keys}
+            writer = None
+            for batch in self.iter_record_batches(memory=memory, **iter_kwargs):
+                if writer is None:
+                    writer = pq.ParquetWriter(str(path), batch.schema, **parquet_kwargs)
+                writer.write_batch(batch)
+            if writer is not None:
+                writer.close()
+            return
         pq.write_table(self.to_arrow(), str(path), **kwargs)
 
     def iter_record_batches(
@@ -487,7 +587,7 @@ class CrystalXMLSource(Adapter):
         yield from _core.iter_record_batches(
             str(self._path),
             row_tag=self._row_tag,
-            memory=str(memory) if isinstance(memory, int) else memory,
+            memory=_parse_memory(memory),
             batch_size=batch_size,
             threads=threads,
             **self._build_plan_kwargs(),

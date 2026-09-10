@@ -81,30 +81,52 @@ def to_arrow(pipeline: Iterable[dict]):
     return pa.Table.from_pylist(list(pipeline))
 
 
-def to_pandas(pipeline: Iterable[dict], chunksize: int | None = None, dtype_backend: str = "pyarrow"):
+def to_pandas(pipeline: Iterable[dict], chunksize: int | None = None, dtype_backend: str = "pyarrow", memory=None, **kwargs):
     """Return a pandas DataFrame from a pipeline or source."""
     import pandas as pd
+    types_mapper = pd.ArrowDtype if dtype_backend == "pyarrow" else None
+    if memory is not None and hasattr(pipeline, "iter_record_batches"):
+        chunks = []
+        for batch in pipeline.iter_record_batches(memory=memory, **kwargs):
+            chunks.append(batch.to_pandas(types_mapper=types_mapper))
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
     table = to_arrow(pipeline)
     if chunksize is not None:
-        # Chunk-based conversion for memory efficiency
         chunks = []
         for batch in table.to_batches(max_chunksize=chunksize):
-            chunks.append(batch.to_pandas(types_mapper=pd.ArrowDtype if dtype_backend == "pyarrow" else None))
+            chunks.append(batch.to_pandas(types_mapper=types_mapper))
         return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
     if dtype_backend == "pyarrow":
-        return table.to_pandas(types_mapper=pd.ArrowDtype)
+        return table.to_pandas(types_mapper=types_mapper)
     return table.to_pandas()
 
 
-def to_polars(pipeline: Iterable[dict]):
+def to_polars(pipeline: Iterable[dict], memory=None, **kwargs):
     """Return a Polars DataFrame from a pipeline or source."""
     import polars as pl
+    if memory is not None and hasattr(pipeline, "iter_record_batches"):
+        chunks = []
+        for batch in pipeline.iter_record_batches(memory=memory, **kwargs):
+            chunks.append(pl.from_arrow(batch))
+        return pl.concat(chunks) if chunks else pl.DataFrame()
     return pl.from_arrow(to_arrow(pipeline))
 
 
-def to_parquet(pipeline: Iterable[dict], path: str | Path, **kwargs):
+def to_parquet(pipeline: Iterable[dict], path: str | Path, memory=None, **kwargs):
     """Write a pipeline or source to Parquet."""
     import pyarrow.parquet as pq
+    if memory is not None and hasattr(pipeline, "iter_record_batches"):
+        parquet_keys = {"compression", "compression_level", "row_group_size", "use_dictionary", "write_statistics"}
+        parquet_kwargs = {k: v for k, v in kwargs.items() if k in parquet_keys}
+        iter_kwargs = {k: v for k, v in kwargs.items() if k not in parquet_keys}
+        writer = None
+        for batch in pipeline.iter_record_batches(memory=memory, **iter_kwargs):
+            if writer is None:
+                writer = pq.ParquetWriter(str(path), batch.schema, **parquet_kwargs)
+            writer.write_batch(batch)
+        if writer is not None:
+            writer.close()
+        return
     pq.write_table(to_arrow(pipeline), str(path), **kwargs)
 
 

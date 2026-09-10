@@ -137,3 +137,43 @@ class Pipeline:
                 batch = []
         if batch:
             yield from pa.Table.from_pylist(batch).to_batches()
+
+    def to_pandas(self, memory=None, dtype_backend="pyarrow", **kwargs):
+        """Return a pandas DataFrame.
+
+        Parameters
+        ----------
+        memory:
+            Memory budget for streaming. When provided, batches are produced
+            via ``iter_record_batches`` and converted incrementally.
+        dtype_backend:
+            ``"pyarrow"`` (default) for Arrow-backed dtypes.
+        """
+        from .sinks import to_pandas
+        return to_pandas(self, memory=memory, dtype_backend=dtype_backend, **kwargs)
+
+    def to_polars(self, memory=None, **kwargs):
+        """Return a Polars DataFrame.
+
+        Parameters
+        ----------
+        memory:
+            Memory budget for streaming. When provided, batches are produced
+            via ``iter_record_batches`` and converted incrementally.
+        """
+        from .sinks import to_polars
+        return to_polars(self, memory=memory, **kwargs)
+
+    def to_parquet(self, path, memory=None, **kwargs):
+        """Write the pipeline to a Parquet file.
+
+        Parameters
+        ----------
+        path:
+            Output file path.
+        memory:
+            Memory budget for streaming. When provided, batches are produced
+            via ``iter_record_batches`` and written incrementally.
+        """
+        from .sinks import to_parquet
+        to_parquet(self, path, memory=memory, **kwargs)

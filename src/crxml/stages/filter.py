@@ -2,25 +2,60 @@ import re
 
 
 class _ConstantPredicate:
-    __slots__ = ("_field", "_op", "_value")
+    __slots__ = ("_field", "_op", "_value", "_compiled")
 
-    _VALID_OPS = frozenset({"==", "eq", "!=", "ne"})
+    _VALID_OPS = frozenset({
+        "==", "eq", "!=", "ne",
+        ">", "gt", "<", "lt", ">=", "ge", "<=", "le",
+        "regex", "starts_with", "ends_with", "contains",
+    })
+
+    _CMP_FNS = {
+        ">": lambda a, b: a > b,
+        "<": lambda a, b: a < b,
+        ">=": lambda a, b: a >= b,
+        "<=": lambda a, b: a <= b,
+        "==": lambda a, b: a == b,
+        "!=": lambda a, b: a != b,
+        "eq": lambda a, b: a == b,
+        "ne": lambda a, b: a != b,
+        "gt": lambda a, b: a > b,
+        "lt": lambda a, b: a < b,
+        "ge": lambda a, b: a >= b,
+        "le": lambda a, b: a <= b,
+    }
 
     def __init__(self, field: str, op: str, value: str):
         if op not in self._VALID_OPS:
             raise ValueError(
                 f"FilterRows: unsupported operator {op!r} for constant filter; "
-                f"use '==' or '!='"
+                f"valid operators: {' '.join(sorted(self._VALID_OPS))}"
             )
         self._field = field
         self._op = op
         self._value = value
+        self._compiled = re.compile(value) if op == "regex" else None
 
     def __call__(self, record: dict) -> bool:
         actual = record.get(self._field)
+        if actual is None:
+            return False
         if self._op in ("==", "eq"):
             return actual == self._value
-        return actual != self._value
+        if self._op in ("!=", "ne"):
+            return actual != self._value
+        if self._op == "regex":
+            return bool(self._compiled.search(str(actual)))
+        if self._op == "starts_with":
+            return str(actual).startswith(self._value)
+        if self._op == "ends_with":
+            return str(actual).endswith(self._value)
+        if self._op == "contains":
+            return self._value in str(actual)
+        fn = self._CMP_FNS.get(self._op)
+        if fn:
+            return fn(actual, self._value)
+        return False
 
 
 class _ComparePredicate:
