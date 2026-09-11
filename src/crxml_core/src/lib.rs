@@ -9,6 +9,7 @@ use pyo3::wrap_pyfunction;
 use rypipe_core::RecordParser;
 use rypipe_core::Splitter;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
