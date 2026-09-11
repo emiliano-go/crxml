@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.0 (2026-09-11)
+
+### Features
+
+- **CrystalXMLSource inherits from rypipe.Adapter.** Framework-native integration: adapters get caching and pipelines for free by subclassing rypipe.Adapter.
+- **Filter pushdown: is_null, is_type, Any/All/Not combinators.** Supports null-type checks and logical combinators for complex filter expressions.
+- **Recursive plan_kwargs for nested combinators.** plan_kwargs now handles nested FilterRowsAny/All/Not correctly.
+- **Public API: to_arrow, to_pandas, to_polars, to_parquet.** Direct access to all output formats from the engine.
+- **Binary memory units.** Accepts TB in addition to KB, MB, GB for large dataset streaming.
+- **chunksize param on to_pandas().** Controls chunk size for bounded-memory pandas conversion.
+
+### Breaking Changes
+
+- **to_dataframe alias removed.** Use to_pandas() instead.
+- **read() convenience function removed.** Use CrystalXMLSource or the rypipe.Adapter pattern instead.
+- **rypipe as a hard dependency.** crxml now requires rypipe to be installed.
+
+### Bug Fixes
+
+- **rypipe-core dependency corrected.** Now points to crates.io version 0.3 instead of local path.
+
+### Dependencies
+
+- **rypipe-core** updated to 0.3.0 (expression API, streaming sinks, observer hooks).
+
 ## 2.0.0 (2026-09-02)
 
 ### Framework rebrand
