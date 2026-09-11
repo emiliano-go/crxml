@@ -963,7 +963,7 @@ pub fn iter_record_batches(
                     _ => 1,
                 };
                 Ok(rypipe_core::MemoryBudget::new(
-                    ((num * mult as f64) as usize).max(1),
+                    ((num * mult as f64).min(usize::MAX as f64) as usize).max(1),
                 ))
             } else {
                 Err(PyException::new_err(format!(
