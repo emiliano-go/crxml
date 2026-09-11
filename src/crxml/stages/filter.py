@@ -38,12 +38,12 @@ class _ConstantPredicate:
 
     def __call__(self, record: dict) -> bool:
         actual = record.get(self._field)
-        if actual is None:
-            return False
         if self._op in ("==", "eq"):
             return actual == self._value
         if self._op in ("!=", "ne"):
             return actual != self._value
+        if actual is None:
+            return False
         if self._op == "regex":
             return bool(self._compiled.search(str(actual)))
         if self._op == "starts_with":
