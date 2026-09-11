@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 (2026-09-11)
+
+### Bug Fixes
+
+- **`FromStr` import.** Added missing `use std::str::FromStr` to `lib.rs` and `plan_kwargs.rs` for `FieldType` and `CompareOp` parsing against rypipe-core 0.3.
+- **`from_str` return type.** Adapted all `from_str(...).ok_or_else(...)` calls to chain `.ok()` first, since `FromStr::from_str` returns `Result<T, ()>`, not `Option<T>`.
+- **Null filter semantics.** `_ConstantPredicate` now correctly returns `True` for `!=` when the field value is `None` (Python semantics: `None != "NYC"` is `True`).
+- **Invalid operator test.** Updated `test_invalid_op_constant_raises` to use `"xor"` instead of `">"`, which is now a supported operator.
+
+### Changed
+
+- **Publishing CI: test blocker.** The PyPI publishing workflow now runs tests as a required gate before building.
+
 ## 0.3.0 (2026-09-11)
 
 ### Features
