@@ -190,7 +190,7 @@ class TestFilterRows:
 
     def test_invalid_op_constant_raises(self):
         with pytest.raises(ValueError, match="unsupported operator"):
-            FilterRows(field="x", op=">", value="y")
+            FilterRows(field="x", op="xor", value="y")
 
     def test_invalid_op_compare_raises(self):
         with pytest.raises(ValueError, match="unsupported operator"):
