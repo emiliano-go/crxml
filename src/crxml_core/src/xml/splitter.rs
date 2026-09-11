@@ -179,11 +179,10 @@ pub(crate) fn next_row_start(
     }
 
     // Stack-allocate the full tag to avoid per-row heap allocation.
-    // `<` + tag fits in 32 bytes for all realistic row tags.
-    let mut tag_buf = [0u8; 32];
+    let mut tag_buf = vec![0u8; 1 + tag.len()];
     tag_buf[0] = b'<';
-    tag_buf[1..1 + tag.len()].copy_from_slice(tag);
-    let full_tag = &tag_buf[..1 + tag.len()];
+    tag_buf[1..].copy_from_slice(tag);
+    let full_tag = &tag_buf[..];
 
     let mut p = from;
     while let Some(rel) = memchr::memmem::find(&bytes[p..], &full_tag) {
@@ -208,11 +207,10 @@ pub(crate) fn next_row_start_fast(bytes: &[u8], from: usize, tag: &[u8]) -> Opti
         return None;
     }
     // Stack-allocate the full tag to avoid per-row heap allocation.
-    // `<` + tag fits in 32 bytes for all realistic row tags.
-    let mut tag_buf = [0u8; 32];
+    let mut tag_buf = vec![0u8; 1 + tag.len()];
     tag_buf[0] = b'<';
-    tag_buf[1..1 + tag.len()].copy_from_slice(tag);
-    let full_tag = &tag_buf[..1 + tag.len()];
+    tag_buf[1..].copy_from_slice(tag);
+    let full_tag = &tag_buf;
     let skip_regions = CrXmlSkipRegions;
     let mut p = from;
     while let Some(rel) = memchr::memmem::find(&bytes[p..], &full_tag) {
