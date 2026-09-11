@@ -8,6 +8,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rypipe_core::{CompareOp, FieldType, FilterPredicate, RegexSpec};
+use std::str::FromStr;
 
 use crate::PlanError;
 
