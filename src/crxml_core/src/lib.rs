@@ -123,7 +123,7 @@ fn build_plan_from_kwargs(
 
     if let Some(ft) = field_types {
         for (name, type_str) in ft {
-            let ft = rypipe_core::FieldType::from_str(&type_str).ok_or_else(|| {
+            let ft = rypipe_core::FieldType::from_str(&type_str).ok().ok_or_else(|| {
                 let valid = "string, int64, float64, bool";
                 PyException::new_err(format!(
                     "unknown field type '{type_str}' for '{name}'; \
