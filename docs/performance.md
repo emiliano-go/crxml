@@ -6,7 +6,7 @@ Three throughput figures, not one. All on Crystal Reports XML (10 fields/row, ~9
 
 | File | Single-thread | Parallel (par128, 4 MB) | Streaming explicit schema |
 |------|:------------:|:----------------------:|:-----------------------------:|
-| 100 MB | **756 MB/s** | 3,792 MB/s (par16) | - |
+| 100 MB | **756 MB/s** | 5,215 MB/s (par4, re-measured on local rypipe `8017f25`) | - |
 | 533 MB | **953 MB/s** | **4,231 MB/s** | **4,980 MB/s** |
 | 1 GB | **940 MB/s** | **4,158 MB/s** | ~4,900 MB/s |
 
@@ -80,12 +80,14 @@ Median-of-7 with adaptive sampling, `row_tag="Details"`, warm cache, per-config 
 <!-- BEGIN:native -->
 | File | single | par16 | par128 (peak) | bounded64 |
 |---|---|---|---|---|
-| **100 MB** | 756 / 684k | **3792 / 3.43M** | - | 667 / 603k |
+| **100 MB** | 756 / 684k | **5215 / 4.72M**¹ | - | 667 / 603k |
 | **533 MB real** | 953 / 832k | 3939 / 3.57M* | **4231 / 3.69M*** | 645 / 584k |
 | **1 GB** | 940 / 851k | 3418 / 3.10M* | **4158 / 3.76M** | 546 / 447k |
 <!-- END:native -->
 
 \* 533 MB par16 3939, par128 4417 (median-of-7, CoV 2-7%). 1 GB par128 stable at 4278.
+
+¹ 100 MB parallel re-measured 2026-09-16 against local rypipe `8017f25` (crxml 2.1.0): 5,215 MB/s with `read_to_columnar_par(num_chunks=4)`, single run, warm cache, same 5800X machine.
 
 > **Auto-tune rule (split by path):** Full-RAM `par` uses `max(threads, min(16xthreads, file_bytes/4 MB))` - peaks at 4 MB (par133 4450 vs par266 4328 at 2 MB, -3%; 1 MB collapses to 3553). Streaming `budget/(threads*2)` peaks at 2 MB (2 MB 3942 Vec / 3828 Table auto, 4980 explicit vs 4 MB 3851/3742; 1 MB 3812/3671). Source `src/crxml/source.py:164` keeps 4 MB for `par`; streaming's 2 MB comes from its own budget (64 MB/16t = 2 MB). 100 MB -> par 25 (100/4) capped at 16x16=256 -> 25, 533 MB -> 133, 1 GB -> 256.
 
@@ -158,17 +160,19 @@ Extended matrix in `benchmarks/bench_extended.py` (`--quick` for 10 MB only, ful
 <!-- BEGIN:source -->
 | Engine → Sink | 10 MB iter | 100 MB iter | 100 MB to_arrow | 1 GB to_arrow |
 |---|---|---|---|---|
-| **stream → iter** | 517 MB/s / 468k | 501 / 459k |: (sparse-column fallback) | 515 / 451k |
+| **stream → iter** | 517 MB/s / 468k | **779 / 704k**¹ |: (sparse-column fallback) | 515 / 451k |
 | **stream → iter_batches** | 497 /: | 514 /: |: | 536 /: |
-| **columnar → iter** | 392 /: | 400 /: | 667 / 603k | 403 / 628k |
-| **columnar → to_arrow** | 637 / 576k | 667 / 603k | 667 / 603k | 694 / 628k |
-| **parallel → to_arrow** | 1888 / 1.70M | 2620 / 2.36M | 2620 / 2.36M | **3072 / 2.78M** |
+| **columnar → iter** | 392 /: | 515¹ /: | 667 / 603k | 403 / 628k |
+| **columnar → to_arrow** | 637 / 576k | 667 / 603k | 968 / 876k¹ | 694 / 628k |
+| **parallel → to_arrow** | 1888 / 1.70M | 2620 / 2.36M | **5124 / 4.63M**¹ | **3072 / 2.78M** |
 | **auto → to_arrow** | 1857 / 1.68M | 2691 / 2.43M | 2691 / 2.43M | 2874 / 2.60M |
 <!-- END:source -->
 
-`stream` uses `InputBuffer` `lib.rs:582` (`auto_mmap`) + `RowSink` `lib.rs:603` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:119` (`next_row_start` `splitter.rs:135` + `parse_row` `scanner.rs:139`). Result **508 MB/s** 100 MB, 1 GB **498 MB/s**: within 30% of columnar 651/694. `perf` streaming shows `libpython` `dict` 1-2% self, not Rust: GIL floor.
+¹ 100 MB cells re-measured 2026-09-16 on this 5800X machine (single run, warm cache): `stream → iter` 778 MB/s / 703k rows/s on local rypipe `8017f25`, **779 / 704k** on `c358a0b` (0.4.0); `parallel → to_arrow` 5,124 MB/s / 4.63M rows/s on `8017f25` (3,514 on `c358a0b` - kept the higher); `columnar → iter` 515 MB/s on `c358a0b`; `columnar → to_arrow` 968 MB/s / 876k rows/s on `c358a0b`.
 
-`columnar → iter` is slower than `stream → iter` (400 vs 501) because it builds `TableBuilder` then iterates via `_arrow_iter` `source.py:39` (`to_batches().to_pylist()`), while `stream` yields `Cow::Borrowed` directly via `RowSink`.
+`stream` uses `InputBuffer` `lib.rs:582` (`auto_mmap`) + `RowSink` `lib.rs:603` (`ColumnarSink` without `TableBuilder` hash/arena) + `scan_one_row` `scanner.rs:119` (`next_row_start` `splitter.rs:135` + `parse_row` `scanner.rs:139`). Result **779 MB/s** 100 MB (re-measured 2026-09-16: 778 on local rypipe `8017f25`, 779 on `c358a0b`; was 508), 1 GB **498 MB/s**: within 30% of columnar 651/694. `perf` streaming shows `libpython` `dict` 1-2% self, not Rust: GIL floor.
+
+`columnar → iter` is slower than `stream → iter` (515 vs 779) because it builds `TableBuilder` then iterates via `_arrow_iter` `source.py:39` (`to_batches().to_pylist()`), while `stream` yields `Cow::Borrowed` directly via `RowSink`.
 
 ## Pushdowns (100 MB, `to_arrow`)
 
@@ -420,7 +424,7 @@ At 0.7 GB/s single / 4.2 GB/s parallel on a ~30 GB/s memory bus, this parser is 
 | Config | Artifact | 100 MB | 533 MB real | 1 GB | Chunk |
 |---|---|---|---|---|---|
 | single | Table | 756 | 745 | 734 | - |
-| par16 | Table | 3,792* | 3901 | 3418* | 33 MB / 64 MB |
+| par16 | Table | 5,215*¹ | 3901 | 3418* | 33 MB / 64 MB |
 | **par128** | Table | - | **4470** | **4278** | 4.16 MB |
 | par96 | Table | 2,265* | 4123* | 4094* | 5.5 MB |
 | streaming single (1 MB) | Table/iter | - | 723 | - | 1 MB budget |
@@ -430,6 +434,8 @@ At 0.7 GB/s single / 4.2 GB/s parallel on a ~30 GB/s memory bus, this parser is 
 | streaming 128MB/16t auto (4 MB) | Table | 3864 | 4235 | 3606* | 4.00 MB |
 
 \* 100 MB/1 GB par16 variance thermal; use par128 for ceilings. Explicit is +11% vs par128 and defines the ceiling.
+
+¹ 100 MB par16 cell re-measured 2026-09-16 against local rypipe `8017f25` (crxml 2.1.0): 5,215 MB/s with `read_to_columnar_par(num_chunks=4)` (par4 rather than par16), single run, warm cache, same 5800X machine.
 
 *Median of 7 runs (adaptive: keep sampling until 1.31×CoV ≤5% capped at 31, halving floor costs 4× rounds). Observed CoV across configurations: median 5%, max 26% (10 MB par8)†. Per-cell floor = 1.31×CoV (95% for two medians, n=7): 2.5% CoV →3.3% floor, 5%→6.6%, 26%→34%†. Cells with CoV>8% marked † (untrustworthy for tuning). Deltas below the cell's own floor are reported as no measurable difference.*
 > **†** 10 MB parallel is too small (2.8k rows/chunk, 20 ms); `rayon` work-stealing variance + frequency/thermal drift + CCX scheduling dominate. Fix: 20 repeats inside one timed region per `median_of` call, `taskset -c 0-15` (pin all 16 logical CPUs without restricting) + thermal settle, or drop 10 MB from parallel tables (a number you cannot act on should not be in a tuning guide).
