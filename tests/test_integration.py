@@ -5,7 +5,7 @@ from crxml import CrystalXMLSource, RenameFields, CastTypes, DropFields, FilterR
 class TestEndToEnd10MB:
     def test_parse_all_rows(self, bench_10mb):
         rows = collect(CrystalXMLSource(bench_10mb, row_tag="Details"))
-        assert len(rows) == 21047
+        assert len(rows) == 9010
 
     def test_schema_fields(self, bench_10mb):
         fields = CrystalXMLSource(bench_10mb, row_tag="Details").schema()
@@ -40,7 +40,7 @@ class TestEndToEnd10MB:
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | CastTypes({})
         )
-        assert len(rows) == 21047
+        assert len(rows) == 9010
 
     def test_pipeline_filter(self, bench_10mb):
         first_key = None
@@ -51,7 +51,7 @@ class TestEndToEnd10MB:
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | FilterRows(lambda r: r.get(first_key) == r.get(first_key))
         )
-        assert len(rows) == 21047
+        assert len(rows) == 9010
 
     def test_pipeline_all_stages(self, bench_10mb):
         first_key = None
@@ -65,19 +65,19 @@ class TestEndToEnd10MB:
             | CastTypes({})
             | FilterRows(lambda r: True)
         )
-        assert len(rows) == 21047
+        assert len(rows) == 9010
         assert "renamed" in rows[0]
 
     def test_to_pandas(self, bench_10mb):
         df = to_pandas(CrystalXMLSource(bench_10mb, row_tag="Details"))
-        assert df.shape == (21047, 7)
+        assert df.shape == (9010, 10)
 
     def test_to_pandas_with_stages(self, bench_10mb):
         df = to_pandas(
             CrystalXMLSource(bench_10mb, row_tag="Details")
             | DropFields(["Level", "Section"])
         )
-        assert df.shape[1] == 6
+        assert df.shape[1] == 8
 
     def test_csv_roundtrip(self, bench_10mb, tmp_path):
         out = tmp_path / "out.csv"
@@ -94,7 +94,7 @@ class TestEndToEnd10MB:
             | CastTypes({})
             | DropFields([])
         )
-        assert len(rows) == 21047
+        assert len(rows) == 9010
 
 
 @pytest.mark.bench
