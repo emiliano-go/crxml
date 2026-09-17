@@ -19,14 +19,14 @@ testing = []
 alloc-stats = ["rypipe-core/alloc-stats"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
 quick-xml = "0.36"
 rustc-hash = "2"
 # Pinned exactly: the Arrow C Data Interface (FFI_ArrowSchema) is not
 # stable across minor versions; bump only after testing both directions.
-arrow = { version = "=55.2.0", default-features = false, features = ["pyarrow"] }
+arrow = { version = "=59.3.0", default-features = false, features = ["pyarrow"] }
 
-rypipe-core = { version = "0.3", features = ["mmap"] }
+rypipe-core = { path = "../../../rypipe/crates/rypipe-core", features = ["mmap"] }
 
 # Crystal Reports XML adapter dependencies (previously in rypipe-xml).
 memchr = "2"

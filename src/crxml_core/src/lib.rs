@@ -2,14 +2,13 @@
 
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
-use pyo3::exceptions::{PyException, PyIOError};
+use pyo3::exceptions::{PyException, PyIOError, PyMemoryError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use pyo3::wrap_pyfunction;
 use rypipe_core::RecordParser;
 use rypipe_core::Splitter;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
@@ -81,6 +80,9 @@ fn map_rypipe_err(e: rypipe_core::Error) -> PyErr {
         rypipe_core::Error::Merge(msg) => MergeError::new_err(msg),
         rypipe_core::Error::Io(io) => PyIOError::new_err(io.to_string()),
         rypipe_core::Error::Arrow(a) => PyException::new_err(format!("Arrow error: {}", a)),
+        rypipe_core::Error::Memory { used, limit } => PyMemoryError::new_err(format!(
+            "memory budget exceeded: {used} bytes used, limit {limit} bytes"
+        )),
         rypipe_core::Error::Parser(msg) => XmlError::new_err(format!("Parser error: {}", msg)),
         rypipe_core::Error::Lifetime(msg) => {
             XmlError::new_err(format!("Parser lifetime error: {}", msg))
@@ -123,7 +125,7 @@ fn build_plan_from_kwargs(
 
     if let Some(ft) = field_types {
         for (name, type_str) in ft {
-            let ft = rypipe_core::FieldType::from_str(&type_str).ok().ok_or_else(|| {
+            let ft = type_str.parse::<rypipe_core::FieldType>().map_err(|_| {
                 let valid = "string, int64, float64, bool";
                 PyException::new_err(format!(
                     "unknown field type '{type_str}' for '{name}'; \
@@ -147,12 +149,12 @@ fn build_plan_from_kwargs(
     Ok(std::sync::Arc::new(plan))
 }
 
-fn empty_table(py: Python<'_>) -> PyResult<PyObject> {
+fn empty_table(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let pa = PyModule::import(py, "pyarrow")?;
     Ok(pa.call_method1("table", (PyDict::new(py),))?.into())
 }
 
-fn record_batch_to_table(batch: RecordBatch, py: Python<'_>) -> PyResult<PyObject> {
+fn record_batch_to_table(batch: RecordBatch, py: Python<'_>) -> PyResult<Py<PyAny>> {
     let pa = PyModule::import(py, "pyarrow")?;
     // An empty-schema RecordBatch cannot be round-tripped through
     // Table.from_batches; return an empty table instead.
@@ -166,7 +168,7 @@ fn record_batch_to_table(batch: RecordBatch, py: Python<'_>) -> PyResult<PyObjec
     Ok(table.into())
 }
 
-fn concat_tables(a: PyObject, b: PyObject, py: Python<'_>) -> PyResult<PyObject> {
+fn concat_tables(a: Py<PyAny>, b: Py<PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
     let _q20_start = std::time::Instant::now();
     let pa = PyModule::import(py, "pyarrow")?;
     let tables_list = PyList::new(py, vec![a, b])?;
@@ -191,7 +193,7 @@ fn concat_tables(a: PyObject, b: PyObject, py: Python<'_>) -> PyResult<PyObject>
     Ok(res)
 }
 
-fn record_batches_to_table(batches: Vec<RecordBatch>, py: Python<'_>) -> PyResult<PyObject> {
+fn record_batches_to_table(batches: Vec<RecordBatch>, py: Python<'_>) -> PyResult<Py<PyAny>> {
     record_batches_to_table_inner(batches, py, false)
 }
 
@@ -199,14 +201,14 @@ fn record_batches_to_table_inner(
     batches: Vec<RecordBatch>,
     py: Python<'_>,
     combine: bool,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let _q20_combine_start = std::time::Instant::now();
     let num_batches = batches.len();
     let table = if batches.is_empty() {
         let pa = PyModule::import(py, "pyarrow")?;
         pa.call_method1("table", (PyDict::new(py),))?.into()
     } else {
-        let mut result_table: Option<PyObject> = None;
+        let mut result_table: Option<Py<PyAny>> = None;
         for batch in batches {
             let t = record_batch_to_table(batch, py)?;
             result_table = match result_table {
@@ -249,7 +251,7 @@ pub fn read_to_columnar(
     strict_types: Option<bool>,
     max_split_chunks: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let plan = build_plan_from_kwargs(
         field_mapping,
         drop_fields,
@@ -284,7 +286,7 @@ pub fn read_to_columnar(
         .map_err(map_rypipe_err)?;
 
     if table_builder.num_columns() == 0 {
-        return Python::with_gil(|py| empty_table(py));
+        return Python::attach(|py| empty_table(py));
     }
 
     let mut batch = table_builder.finish().map_err(map_rypipe_err)?;
@@ -294,7 +296,7 @@ pub fn read_to_columnar(
         batch = rypipe_core::apply_compare_filter(batch, filter).map_err(map_rypipe_err)?;
     }
 
-    Python::with_gil(|py| record_batch_to_table(batch, py))
+    Python::attach(|py| record_batch_to_table(batch, py))
 }
 
 #[pyfunction]
@@ -315,7 +317,7 @@ pub fn read_to_columnar_multi(
     strict_types: Option<bool>,
     max_split_chunks: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let plan = build_plan_from_kwargs(
         field_mapping,
         drop_fields,
@@ -365,7 +367,7 @@ pub fn read_to_columnar_multi(
     }
 
     if merged.num_columns() == 0 {
-        return Python::with_gil(|py| empty_table(py));
+        return Python::attach(|py| empty_table(py));
     }
 
     let mut batch = merged.finish().map_err(map_rypipe_err)?;
@@ -375,7 +377,7 @@ pub fn read_to_columnar_multi(
         batch = rypipe_core::apply_compare_filter(batch, filter).map_err(map_rypipe_err)?;
     }
 
-    Python::with_gil(|py| record_batch_to_table(batch, py))
+    Python::attach(|py| record_batch_to_table(batch, py))
 }
 
 #[pyfunction]
@@ -396,7 +398,7 @@ pub fn read_to_columnar_par(
     strict_types: Option<bool>,
     max_split_chunks: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let plan = build_plan_from_kwargs(
         field_mapping,
         drop_fields,
@@ -425,7 +427,7 @@ pub fn read_to_columnar_par(
         rypipe_core::parallel::ParallelExecutor::parse(bytes, &splitter, decoder, plan, num_chunks)
             .map_err(map_rypipe_err)?;
 
-    Python::with_gil(|py| record_batches_to_table(batches, py))
+    Python::attach(|py| record_batches_to_table(batches, py))
 }
 
 #[pyfunction]
@@ -445,7 +447,7 @@ pub fn read_to_columnar_bounded(
     strict_types: Option<bool>,
     max_split_chunks: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let plan = build_plan_from_kwargs(
         field_mapping,
         drop_fields,
@@ -468,14 +470,14 @@ pub fn read_to_columnar_bounded(
         .run(Path::new(&path), &splitter, decoder, plan, prefault)
         .map_err(map_rypipe_err)?;
 
-    Python::with_gil(|py| record_batches_to_table(batches, py))
+    Python::attach(|py| record_batches_to_table(batches, py))
 }
 
 /// Read chunk-time profile from the last parallel run.
 /// Returns split_scan_ns, chunk_sum_ns, chunk_max_ns, chunk_mean_ns,
 /// chunk_count, and spread (max/mean).
 #[pyfunction]
-fn get_par_profile(py: Python<'_>) -> PyResult<PyObject> {
+fn get_par_profile(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let (split_scan_ns, chunk_sum_ns, chunk_max_ns, chunk_count) =
         rypipe_core::parallel::chunk_profile();
     let discovery_ns = rypipe_core::parallel_stream::discovery_profile();
@@ -501,7 +503,7 @@ fn get_par_profile(py: Python<'_>) -> PyResult<PyObject> {
 }
 
 #[cfg(feature = "testing")]
-fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
+fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<Py<PyAny>> {
     let plan = std::sync::Arc::new(rypipe_core::ExecutionPlan::new());
     let est_row = crate::xml::CrystalXmlSplitter::with_row_tag(row_tag)
         .estimate_bytes_per_row(&bytes[..bytes.len().min(65536)]);
@@ -513,7 +515,7 @@ fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
         .parse_chunk_generic(bytes, &mut sink)
         .map_err(map_rypipe_err)?;
     let batch = sink.finish().map_err(map_rypipe_err)?;
-    Python::with_gil(|py| record_batch_to_table(batch, py))
+    Python::attach(|py| record_batch_to_table(batch, py))
 }
 
 /// Testing helper: parse bytes with the columnar engine.
@@ -521,7 +523,7 @@ fn _run_parser(bytes: &[u8], row_tag: &[u8]) -> PyResult<PyObject> {
 #[cfg(feature = "testing")]
 #[pyfunction]
 #[pyo3(signature = (bytes, row_tag=None))]
-fn _test_parse_both(bytes: Vec<u8>, row_tag: Option<String>) -> PyResult<PyObject> {
+fn _test_parse_both(bytes: Vec<u8>, row_tag: Option<String>) -> PyResult<Py<PyAny>> {
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
     _run_parser(&bytes, row_tag.as_bytes())
 }
@@ -740,7 +742,7 @@ impl CrxmlReader {
         slf
     }
 
-    fn next_row(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn next_row(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match self.parser.read_one_row().map_err(XmlError::new_err)? {
             None => Ok(None),
             Some(_n) => {
@@ -760,21 +762,21 @@ impl CrxmlReader {
         }
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
         let py = slf.py();
         slf.next_row(py)
     }
 
     /// Parse a batch of rows with the GIL released, then build Python dicts.
     #[pyo3(signature = (n=1024))]
-    fn next_batch(mut slf: PyRefMut<'_, Self>, n: usize) -> PyResult<Option<PyObject>> {
+    fn next_batch(mut slf: PyRefMut<'_, Self>, n: usize) -> PyResult<Option<Py<PyAny>>> {
         let py = slf.py();
 
         // Parse into flat buffers with GIL released. Only the pure-Rust
         // RowParser crosses into the closure; key_cache (Py objects) stays out.
         let parser: &mut RowParser = &mut slf.parser;
         let rows = py
-            .allow_threads(move || parser.read_batch_into(n))
+            .detach(move || parser.read_batch_into(n))
             .map_err(XmlError::new_err)?;
 
         if rows == 0 {
@@ -803,7 +805,7 @@ impl CrxmlReader {
     }
 
     #[cfg(feature = "profile")]
-    fn get_profile_data(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn get_profile_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let d = PyDict::new(py);
         d.set_item("event_loop_ns", self.parser.profile.event_loop_ns)?;
         d.set_item("unescape_ns", self.parser.profile.unescape_ns)?;
@@ -844,7 +846,7 @@ impl PyStreamingBatchIterator {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         // Take the iterator out without holding the lock while blocking
         let mut iter_opt = {
             let mut guard = self
@@ -856,7 +858,7 @@ impl PyStreamingBatchIterator {
         if iter_opt.is_none() {
             return Ok(None);
         }
-        let next = py.allow_threads(|| iter_opt.as_mut().unwrap().next_batch());
+        let next = py.detach(|| iter_opt.as_mut().unwrap().next_batch());
         let mut guard = self
             .inner
             .lock()
@@ -886,7 +888,7 @@ impl PyStreamingBatchIterator {
 pub fn iter_record_batches(
     path: String,
     row_tag: Option<String>,
-    memory: Option<PyObject>,
+    memory: Option<Py<PyAny>>,
     batch_size: Option<usize>,
     threads: Option<usize>,
     field_mapping: Option<HashMap<String, String>>,
@@ -917,7 +919,7 @@ pub fn iter_record_batches(
     let row_tag = row_tag.unwrap_or_else(|| "Row".to_string());
     let budget = {
         // Parse memory which may be int (bytes) or string ("64KB", "64MB", etc.)
-        Python::with_gil(|py| -> PyResult<rypipe_core::MemoryBudget> {
+        Python::attach(|py| -> PyResult<rypipe_core::MemoryBudget> {
             let mem_obj = match &memory {
                 Some(o) => o,
                 None => return Ok(rypipe_core::MemoryBudget::new(64 * 1024 * 1024)),

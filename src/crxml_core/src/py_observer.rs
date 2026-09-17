@@ -13,14 +13,14 @@ use rypipe_core::{RowObserver, Value};
 
 /// Convert a core `Value` to a Python object: Str→str, Int64→int,
 /// Float64→float, Bool→bool, Date32/Timestamp→int, Null→None.
-fn value_to_pyobject(py: Python<'_>, value: &Value<'_>) -> PyObject {
+fn value_to_pyobject(py: Python<'_>, value: &Value<'_>) -> Py<PyAny> {
     match value {
-        Value::Str(s) => s.as_ref().into_py(py),
-        Value::Int64(i) => i.into_py(py),
-        Value::Float64(f) => f.into_py(py),
-        Value::Bool(b) => b.into_py(py),
-        Value::Date32(d) => d.into_py(py),
-        Value::Timestamp(t) => t.into_py(py),
+        Value::Str(s) => s.as_ref().into_pyobject(py).unwrap().unbind().into(),
+        Value::Int64(i) => i.into_pyobject(py).unwrap().unbind().into(),
+        Value::Float64(f) => f.into_pyobject(py).unwrap().unbind().into(),
+        Value::Bool(b) => b.into_pyobject(py).unwrap().to_owned().unbind().into(),
+        Value::Date32(d) => d.into_pyobject(py).unwrap().unbind().into(),
+        Value::Timestamp(t) => t.into_pyobject(py).unwrap().unbind().into(),
         Value::Null => py.None(),
     }
 }
@@ -28,18 +28,18 @@ fn value_to_pyobject(py: Python<'_>, value: &Value<'_>) -> PyObject {
 /// Row observer backed by Python callables. Slots not present in the dict
 /// stay `None` and cost one branch per event.
 pub(crate) struct PyObserver {
-    on_begin_row: Option<PyObject>,
-    on_put_field: Option<PyObject>,
-    on_row_accepted: Option<PyObject>,
-    on_row_rejected: Option<PyObject>,
-    on_chunk_finished: Option<PyObject>,
+    on_begin_row: Option<Py<PyAny>>,
+    on_put_field: Option<Py<PyAny>>,
+    on_row_accepted: Option<Py<PyAny>>,
+    on_row_rejected: Option<Py<PyAny>>,
+    on_chunk_finished: Option<Py<PyAny>>,
 }
 
 impl PyObserver {
     /// Build from a dict `{"on_row_rejected": fn, ...}`. Unknown keys or
     /// non-callable values are a `PlanError`.
     pub(crate) fn from_any(obj: &Bound<'_, PyAny>) -> PyResult<std::sync::Arc<Self>> {
-        let dict = obj.downcast::<PyDict>().map_err(|_| {
+        let dict = obj.cast::<PyDict>().map_err(|_| {
             crate::PlanError::new_err("observer must be a dict like {\"on_row_rejected\": fn}")
         })?;
         let mut obs = Self {
@@ -79,9 +79,9 @@ impl PyObserver {
 
 /// Invoke `hook` with the args built by `build`, printing and swallowing any
 /// exception.
-fn call(hook: &Option<PyObject>, build: impl FnOnce(Python<'_>) -> PyResult<Vec<PyObject>>) {
+fn call(hook: &Option<Py<PyAny>>, build: impl FnOnce(Python<'_>) -> PyResult<Vec<Py<PyAny>>>) {
     let Some(cb) = hook else { return };
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let result = build(py).and_then(|items| {
             let args = pyo3::types::PyTuple::new(py, items)?;
             cb.call1(py, args).map(|_| ())
@@ -94,34 +94,34 @@ fn call(hook: &Option<PyObject>, build: impl FnOnce(Python<'_>) -> PyResult<Vec<
 
 impl RowObserver for PyObserver {
     fn on_begin_row(&self, row_index: usize) {
-        call(&self.on_begin_row, |py| Ok(vec![row_index.into_py(py)]));
+        call(&self.on_begin_row, |py| Ok(vec![row_index.into_pyobject(py).unwrap().unbind().into()]));
     }
 
     fn on_put_field(&self, row_index: usize, resolved_name: &str, slot: usize, value: &Value<'_>) {
         call(&self.on_put_field, |py| {
             Ok(vec![
-                row_index.into_py(py),
-                resolved_name.into_py(py),
-                slot.into_py(py),
+                row_index.into_pyobject(py).unwrap().unbind().into(),
+                resolved_name.into_pyobject(py).unwrap().unbind().into(),
+                slot.into_pyobject(py).unwrap().unbind().into(),
                 value_to_pyobject(py, value),
             ])
         });
     }
 
     fn on_row_accepted(&self, row_index: usize) {
-        call(&self.on_row_accepted, |py| Ok(vec![row_index.into_py(py)]));
+        call(&self.on_row_accepted, |py| Ok(vec![row_index.into_pyobject(py).unwrap().unbind().into()]));
     }
 
     fn on_row_rejected(&self, row_index: usize) {
-        call(&self.on_row_rejected, |py| Ok(vec![row_index.into_py(py)]));
+        call(&self.on_row_rejected, |py| Ok(vec![row_index.into_pyobject(py).unwrap().unbind().into()]));
     }
 
     fn on_chunk_finished(&self, total: usize, accepted: usize, rejected: usize) {
         call(&self.on_chunk_finished, |py| {
             Ok(vec![
-                total.into_py(py),
-                accepted.into_py(py),
-                rejected.into_py(py),
+                total.into_pyobject(py).unwrap().unbind().into(),
+                accepted.into_pyobject(py).unwrap().unbind().into(),
+                rejected.into_pyobject(py).unwrap().unbind().into(),
             ])
         });
     }
