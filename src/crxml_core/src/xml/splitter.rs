@@ -56,8 +56,42 @@ impl Splitter for CrystalXmlSplitter {
         })
     }
 
-    // find_split_points: use the default from the Splitter trait.
-    // It calls next_record_start + plan_chunk_count + in_skip_region.
+    // find_split_points: mirrors the rypipe-core 0.4.0 default, but restores
+    // the documented contract (sorted, unique, first = 0, last = len) for
+    // degenerate inputs shorter than the planned chunk count, where the
+    // upstream default can emit a duplicate leading 0 (bytes.len()/n == 0
+    // makes every nominal offset 0, and the prepend of 0 is not deduped).
+    fn find_split_points(&self, bytes: &[u8], max_chunks: usize) -> Vec<usize> {
+        if max_chunks <= 1 || bytes.is_empty() {
+            return vec![0, bytes.len()];
+        }
+        let n = rypipe_core::decoder::plan_chunk_count(
+            bytes.len(),
+            max_chunks,
+            rypipe_core::decoder::SplitMode::Parallel,
+        );
+        let skip = self.skip_regions();
+        let mut points: Vec<usize> = (1..n)
+            .filter_map(|i| {
+                let approx = bytes.len() / n * i;
+                let pos = self.next_record_start(bytes, approx)?;
+                if skip.is_some_and(|finder| {
+                    rypipe_core::decoder::in_skip_region(bytes, pos, finder)
+                }) {
+                    return None;
+                }
+                Some(pos)
+            })
+            .filter(|&pos| pos > 0)
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+        points.insert(0, 0);
+        if *points.last().unwrap_or(&0) != bytes.len() {
+            points.push(bytes.len());
+        }
+        points
+    }
 
     fn skip_regions(&self) -> Option<&dyn SkipRegionFinder> {
         Some(&CrXmlSkipRegions)
@@ -279,10 +313,13 @@ mod tests {
         let xml = b"<Row A=\"1\"/><Row B=\"2\"/>";
         let splitter = CrystalXmlSplitter::with_row_tag(b"Row");
         let points = splitter.find_split_points(xml, 8);
-        // Small file: should fall back to single chunk
-        assert_eq!(points.len(), 2);
+        // rypipe-core 0.4.0 plan_chunk_count floors at `threads`, so tiny
+        // files no longer collapse to a single chunk. The contract holds:
+        // starts at 0, ends at len, strictly increasing.
+        assert!(points.len() >= 2);
         assert_eq!(points[0], 0);
-        assert_eq!(points[1], xml.len());
+        assert_eq!(*points.last().unwrap(), xml.len());
+        assert!(points.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
