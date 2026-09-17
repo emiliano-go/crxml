@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 (2026-09-16)
+
+### Features
+
+- **Strict memory budget for streaming.** `CrystalXMLSource.iter_record_batches(..., strict=True)` makes the memory budget a hard limit via `MemoryBudget::with_strict`: oversized batches raise `MemoryError` instead of passing through. Default `False` keeps the soft-budget behavior.
+- **Split-point contract restored for degenerate inputs.** `CrystalXmlSplitter` overrides `find_split_points` to guarantee the documented contract (sorted, unique, first = 0, last = file length) for inputs shorter than the planned chunk count, where the rypipe-core 0.4.0 default can emit a duplicate leading 0.
+
+### Changed
+
+- **rypipe-core updated to 0.4.0** (registry). Adapts to the 0.4.0 API: `CompareOp`/`FieldType` parse via `str::parse`, `FilterPredicate::Strip` carries the new `TrimMode` field, `Error::Memory` maps to Python `MemoryError`, and the bindings adopt the pyo3 0.29 renames (`PyObject` → `Py<PyAny>`, `with_gil` → `attach`, `allow_threads` → `detach`) alongside the arrow 59 bump.
+- **Small-file chunk planning.** `plan_chunk_count` floors at the thread count in 0.4.0, so tiny inputs no longer collapse to a single chunk; the splitter tests now assert the contract rather than the old single-chunk fallback.
+- **Regenerated `bench_data/test_10mb.xml`** with the current generator and aligned the 10 MB row-count expectations (21,047 → 9,010) in `test_integration.py` and `test_source.py`; the 50 MB / 100 MB fixtures already matched.
+
 ## 0.3.1 (2026-09-11)
 
 ### Bug Fixes
