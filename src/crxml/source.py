@@ -540,7 +540,7 @@ class CrystalXMLSource(Adapter):
 
     def iter_record_batches(
         self, memory: Union[str, int] = "64MiB", batch_size: Optional[int] = None,
-        threads: Optional[int] = None,
+        threads: Optional[int] = None, strict: bool = False,
     ) -> Iterator["pa.RecordBatch"]:
         """Yield Arrow ``RecordBatch`` objects with constant memory.
 
@@ -551,6 +551,14 @@ class CrystalXMLSource(Adapter):
         and ``batch_size=1`` for the smallest footprint (one row per batch,
         ~1 KB for CR rows). Python overhead means true 64 KB is only reachable
         from Rust, but this is still bounded for 50 GB files.
+
+        Parameters
+        ----------
+        strict:
+            When True, the memory budget is a hard limit: oversized batches
+            raise ``MemoryError`` instead of being allowed through
+            (rypipe-core 0.4.0 strict budget contract). Default False keeps
+            the soft-budget behavior.
 
         Examples
         --------
@@ -590,6 +598,7 @@ class CrystalXMLSource(Adapter):
             memory=_parse_memory(memory),
             batch_size=batch_size,
             threads=threads,
+            strict=strict,
             **self._build_plan_kwargs(),
         )
 

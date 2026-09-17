@@ -884,7 +884,7 @@ impl PyStreamingBatchIterator {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_tag=None, memory=None, batch_size=None, threads=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, use_mmap=None, strict_types=None, max_split_chunks=None, observer=None))]
+#[pyo3(signature = (path, row_tag=None, memory=None, batch_size=None, threads=None, field_mapping=None, drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false, prefault=false, use_mmap=None, strict_types=None, max_split_chunks=None, observer=None, strict=false))]
 pub fn iter_record_batches(
     path: String,
     row_tag: Option<String>,
@@ -903,6 +903,7 @@ pub fn iter_record_batches(
     strict_types: Option<bool>,
     max_split_chunks: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
+    strict: bool,
 ) -> PyResult<PyStreamingBatchIterator> {
     let plan = build_plan_from_kwargs(
         field_mapping,
@@ -973,6 +974,7 @@ pub fn iter_record_batches(
         })?
     };
     let _batch_size = batch_size; // currently derived from budget via plan_chunks; kept for API compat
+    let budget = budget.with_strict(strict);
     let p = Path::new(&path);
     if !p.is_file() {
         return Err(PyIOError::new_err(format!("Not a regular file: {}", path)));
