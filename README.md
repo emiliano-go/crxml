@@ -49,7 +49,7 @@ for row in source:
     print(row["invoice"], row["amount"])
 
 # DataFrame (auto-routes to parallel engine)
-df = source.to_dataframe()
+df = source.to_pandas()
 print(df.head())
 ```
 
@@ -71,7 +71,7 @@ With pipeline stages fused into the Rust parse loop:
 from crxml.stages import RenameFields, DropFields
 
 pipeline = source | RenameFields({"f1": "invoice"}) | DropFields(["temp_id"])
-df = pipeline.to_dataframe()
+df = pipeline.to_pandas()
 ```
 
 > **Performance tip:** When your column set is known, pass `schema=[...]` to
@@ -189,8 +189,8 @@ w.close()
 | Framework | Integration |
 |---|---|
 | **FastAPI** / **Starlette** / **Litestar** | Parse in route handler, return DataFrame or Arrow table directly |
-| **Django** / **Flask** | Call `source.to_dataframe()` in view; pass to template or response |
-| **Pandas / Polars** | `source.to_dataframe()` / `source.to_polars()` for zero-copy analysis |
+| **Django** / **Flask** | Call `source.to_pandas()` in view; pass to template or response |
+| **Pandas / Polars** | `source.to_pandas()` / `source.to_polars()` for zero-copy analysis |
 | **Airflow / Prefect** | Parse in task, write to parquet with `source.to_parquet()` |
 | **CLI / ETL scripts** | Use `to_csv()` sink or iterate rows for line-by-line processing |
 
@@ -199,7 +199,6 @@ w.close()
 ## Limitations
 
 - **UTF-8 input only.** UTF-16 exports (which Crystal Reports can produce) fail validation; convert first.
-- **No compressed input.** `.gz`/`.zst` files must be decompressed before parsing.
 - **Crystal Reports grammar, not general XML.** The flat-row model fits CR exports; arbitrary XML documents are out of scope.
 - **Linux-tuned performance.** madvise hints and thread-count ratios were measured on Linux; other platforms work but are untested territory.
 - **No async API.** Row iteration is synchronous.

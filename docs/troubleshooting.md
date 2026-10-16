@@ -140,7 +140,7 @@ rustup install stable
 ### How do I process files larger than RAM?
 
 crxml streams the XML in constant memory. The RSS stays well below the file
-size (about 75 MB for a 100 MB file). Use `to_csv` or chunked `to_dataframe`
+size (about 75 MB for a 100 MB file). Use `to_csv` or chunked `to_pandas`
 to avoid loading all rows at once:
 
 ```python

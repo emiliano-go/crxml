@@ -126,10 +126,10 @@ fields = src.schema()
 print(fields)  # ['{Report.InvoiceNo}', '{Report.Amount}', ...]
 ```
 
-## to_dataframe
+## to_pandas
 
 ```python
-to_dataframe(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
+to_pandas(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
 ```
 
 | Param      | Type               | Default | Description                    |
@@ -271,7 +271,7 @@ XML file
   │                 │
   │                 ├─► Compare filter: arrow::compute kernels (pure Rust)
   │                 │
-  │                 └─► sinks: to_dataframe / to_csv / collect / to_polars / to_parquet
+  │                 └─► sinks: to_pandas / to_csv / collect / to_polars / to_parquet
   │
   └─► parallel engine: CrystalXmlSplitter + rypipe_core::ParallelExecutor
         │
@@ -380,7 +380,7 @@ crxml still owns the Crystal-specific grammar as an embedded `rypipe-core` forma
 ```python
 __all__ = ["CrystalXMLSource", "Pipeline", "RenameFields", "CastTypes",
            "FilterRows", "DropFields", "discover_schema", "XmlError",
-           "PlanError", "MergeError", "to_dataframe", "to_csv", "collect"]
+           "PlanError", "MergeError", "to_pandas", "to_csv", "collect"]
 
 _modules = {"CrystalXMLSource": ".source", "Pipeline": ".pipeline", ...}
 
@@ -455,7 +455,7 @@ source | rename | cast  →  Pipeline(source, [rename, cast])
 **`_to_arrow()` shortcut**:
 - Returns a single `pyarrow.Table` if the whole pipeline can be executed as columnar fusion + batchpipe chain without trailing stages.
 - Returns `None` if: workers are set, source lacks `_read_arrow`, or trailing stateful stages remain.
-- This is the key fast path used by `to_dataframe()` and `collect()`; they check `_to_arrow()` first and skip the dict stream entirely.
+- This is the key fast path used by `to_pandas()` and `collect()`; they check `_to_arrow()` first and skip the dict stream entirely.
 
 **`parallel(workers=None, batch_size=1000)`**: returns a new `Pipeline` with worker count set. Also carries forward the `_prefetch` flag (though prefetch is not toggled by the current public API).
 
@@ -593,11 +593,11 @@ Source ──► _prefetch_iter (bounded queue, maxsize=8) ──► ProcessPool
 
 | Sink | Fast path | Fallback |
 |------|-----------|----------|
-| `to_dataframe` | `pipeline._to_arrow()` → single `pyarrow.Table` → `table.to_pandas()` (ArrowDtype, zero dicts) | `_iter_batches()` → chunked DataFrame → `pd.concat`; or `pd.DataFrame.from_records(iter(pipeline))` |
+| `to_pandas` | `pipeline._to_arrow()` → single `pyarrow.Table` → `table.to_pandas()` (ArrowDtype, zero dicts) | `_iter_batches()` → chunked DataFrame → `pd.concat`; or `pd.DataFrame.from_records(iter(pipeline))` |
 | `collect` | `pipeline._to_arrow()` → `table.to_pylist()` | `_iter_batches()` → dicts; or `list(pipeline)` |
 | `to_csv` | Always streams row-by-row via `csv.DictWriter` (no intermediate list) | - |
 
-`to_dataframe(chunksize=N)` always uses batch-then-concat for memory control. `chunksize=None` triggers the single-table fast path.
+`to_pandas(chunksize=N)` always uses batch-then-concat for memory control. `chunksize=None` triggers the single-table fast path.
 
 ## Fusion decision tree
 
@@ -648,7 +648,7 @@ fused_iter(source, stages)
 When a sink is called:
 
 ```
-to_dataframe(pipeline):
+to_pandas(pipeline):
   ├─ has _to_arrow()?
   │     └─ YES → pipeline._to_arrow()
   │                  ├─ returns Table? → table.to_pandas()  [FASTEST]
@@ -1532,7 +1532,7 @@ upfront, pass them as `schema=` to skip discovery and hit the fast path:
 ```python
 schema = src.schema()  # discover once
 fast = CrystalXMLSource("report.xml", row_tag="Details", schema=schema)
-df = fast.to_dataframe()  # no discovery pass
+df = fast.to_pandas()  # no discovery pass
 ```
 
 This is the single largest performance lever for bounded/streaming mode.
@@ -1566,9 +1566,9 @@ for row in pipe:
 ## Convert to DataFrame
 
 ```python
-from crxml import to_dataframe
+from crxml import to_pandas
 
-df = to_dataframe(pipe)
+df = to_pandas(pipe)
 ```
 
 This collects all rows into a pandas DataFrame. For large files use
@@ -1604,14 +1604,14 @@ processing, and automatic query fusion. Powered by
 ## Quick Example
 
 ```python
-from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_pandas
 
 pipe = (
     CrystalXMLSource("report.xml")
     | RenameFields({"f1": "invoice", "f2": "amount"})
     | CastTypes({"amount": float})
 )
-df = to_dataframe(pipe)
+df = to_pandas(pipe)
 ```
 
 ## License
@@ -2086,8 +2086,8 @@ Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr
 
 | If your goal is... | Use this | Because... |
 |---|---|---|
-| Fastest `to_arrow`/`to_dataframe` on >=100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
-| Fastest **bounded** `to_arrow`/`to_dataframe` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` -> `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
+| Fastest `to_arrow`/`to_pandas` on >=100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
+| Fastest **bounded** `to_arrow`/`to_pandas` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` -> `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
 | Bounded, no schema known (auto) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) - **stable** (`ensure_schema` `engine.rs:79`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. |
 | Minimize peak memory (single-thread) | `memory="1MB"` single streaming | 723 MB/s (3% behind single 745), 24 MB RssAnon, `RowSink` `lib.rs:564` |
 | Stream rows one-by-one (dicts) | `engine="stream"` `for row in source` | Row dicts lazily, no Arrow |
@@ -2687,7 +2687,7 @@ rustup install stable
 ### How do I process files larger than RAM?
 
 crxml streams the XML in constant memory. The RSS stays well below the file
-size (about 75 MB for a 100 MB file). Use `to_csv` or chunked `to_dataframe`
+size (about 75 MB for a 100 MB file). Use `to_csv` or chunked `to_pandas`
 to avoid loading all rows at once:
 
 ```python
@@ -2761,7 +2761,7 @@ The parser streams the file in constant memory. The Rust backend reuses
 internal buffers across rows and never materializes the full document.
 RSS scales with file content (22 MB for 10 MB, 75 MB for 100 MB),
 staying well below file size. pandas is imported lazily: memory climbs
-only when `to_dataframe` is called.
+only when `to_pandas` is called.
 
 ## CR XML layout detection
 
@@ -2802,7 +2802,7 @@ disk I/O scales linearly with the number of branches.
 ## Example: different transformations per branch
 
 ```python
-from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe, to_csv
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_pandas, to_csv
 
 base = CrystalXMLSource("report.xml")
 
@@ -2812,7 +2812,7 @@ to_csv(branch_a, "export.csv")
 
 # Branch B: cast + DataFrame
 branch_b = base | CastTypes({"amount": float})
-df = to_dataframe(branch_b)
+df = to_pandas(branch_b)
 ```
 
 ## Performance note
@@ -3011,7 +3011,7 @@ For large files, `.parallel()` splits work across multiple processes.
 ## Usage
 
 ```python
-from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_pandas
 
 pipe = (
     CrystalXMLSource("report.xml")
@@ -3019,7 +3019,7 @@ pipe = (
     | CastTypes({"total": float})
 )
 
-df = to_dataframe(pipe.parallel(workers=4, batch_size=5000))
+df = to_pandas(pipe.parallel(workers=4, batch_size=5000))
 ```
 
 ## Parameters
@@ -3133,7 +3133,7 @@ Pipelines are fully lazy until one of:
 
 - `for row in pipeline:`, per-row iteration
 - `list(pipeline)`, collect all rows
-- `to_dataframe(pipeline)`, DataFrame sink
+- `to_pandas(pipeline)`, DataFrame sink
 - `to_csv(pipeline, path)`, CSV sink
 - `collect(pipeline)`, list sink
 
@@ -3159,10 +3159,10 @@ PAGE: https://crxml.emiliano-go.com/usage/sinks/
 
 Sinks terminate a pipeline and materialize the result.
 
-## to_dataframe
+## to_pandas
 
 ```python
-to_dataframe(pipeline, chunksize: int | None = None) -> pd.DataFrame
+to_pandas(pipeline, chunksize: int | None = None) -> pd.DataFrame
 ```
 
 Collects all rows into a pandas DataFrame.
@@ -3174,10 +3174,10 @@ Collects all rows into a pandas DataFrame.
   then concatenates. Lower peak memory.
 
 ```python
-from crxml import CrystalXMLSource, RenameFields, to_dataframe
+from crxml import CrystalXMLSource, RenameFields, to_pandas
 
 pipe = CrystalXMLSource("report.xml") | RenameFields({"f1": "name"})
-df = to_dataframe(pipe, chunksize=10000)
+df = to_pandas(pipe, chunksize=10000)
 ```
 
 ## to_csv

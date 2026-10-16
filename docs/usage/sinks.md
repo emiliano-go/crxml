@@ -2,10 +2,10 @@
 
 Sinks terminate a pipeline and materialize the result.
 
-## to_dataframe
+## to_pandas
 
 ```python
-to_dataframe(pipeline, chunksize: int | None = None) -> pd.DataFrame
+to_pandas(pipeline, chunksize: int | None = None) -> pd.DataFrame
 ```
 
 Collects all rows into a pandas DataFrame.
@@ -17,10 +17,10 @@ Collects all rows into a pandas DataFrame.
   then concatenates. Lower peak memory.
 
 ```python
-from crxml import CrystalXMLSource, RenameFields, to_dataframe
+from crxml import CrystalXMLSource, RenameFields, to_pandas
 
 pipe = CrystalXMLSource("report.xml") | RenameFields({"f1": "name"})
-df = to_dataframe(pipe, chunksize=10000)
+df = to_pandas(pipe, chunksize=10000)
 ```
 
 ## to_csv

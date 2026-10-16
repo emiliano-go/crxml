@@ -5,7 +5,7 @@ For large files, `.parallel()` splits work across multiple processes.
 ## Usage
 
 ```python
-from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_pandas
 
 pipe = (
     CrystalXMLSource("report.xml")
@@ -13,7 +13,7 @@ pipe = (
     | CastTypes({"total": float})
 )
 
-df = to_dataframe(pipe.parallel(workers=4, batch_size=5000))
+df = to_pandas(pipe.parallel(workers=4, batch_size=5000))
 ```
 
 ## Parameters

@@ -47,7 +47,7 @@ upfront, pass them as `schema=` to skip discovery and hit the fast path:
 ```python
 schema = src.schema()  # discover once
 fast = CrystalXMLSource("report.xml", row_tag="Details", schema=schema)
-df = fast.to_dataframe()  # no discovery pass
+df = fast.to_pandas()  # no discovery pass
 ```
 
 This is the single largest performance lever for bounded/streaming mode.
@@ -81,9 +81,9 @@ for row in pipe:
 ## Convert to DataFrame
 
 ```python
-from crxml import to_dataframe
+from crxml import to_pandas
 
-df = to_dataframe(pipe)
+df = to_pandas(pipe)
 ```
 
 This collects all rows into a pandas DataFrame. For large files use

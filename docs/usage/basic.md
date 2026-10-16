@@ -61,7 +61,7 @@ The parser streams the file in constant memory. The Rust backend reuses
 internal buffers across rows and never materializes the full document.
 RSS scales with file content (22 MB for 10 MB, 75 MB for 100 MB),
 staying well below file size. pandas is imported lazily: memory climbs
-only when `to_dataframe` is called.
+only when `to_pandas` is called.
 
 ## CR XML layout detection
 

@@ -23,7 +23,7 @@ disk I/O scales linearly with the number of branches.
 ## Example: different transformations per branch
 
 ```python
-from crxml import CrystalXMLSource, RenameFields, CastTypes, to_dataframe, to_csv
+from crxml import CrystalXMLSource, RenameFields, CastTypes, to_pandas, to_csv
 
 base = CrystalXMLSource("report.xml")
 
@@ -33,7 +33,7 @@ to_csv(branch_a, "export.csv")
 
 # Branch B: cast + DataFrame
 branch_b = base | CastTypes({"amount": float})
-df = to_dataframe(branch_b)
+df = to_pandas(branch_b)
 ```
 
 ## Performance note

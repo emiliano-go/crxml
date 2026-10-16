@@ -51,7 +51,7 @@ Pipelines are fully lazy until one of:
 
 - `for row in pipeline:`, per-row iteration
 - `list(pipeline)`, collect all rows
-- `to_dataframe(pipeline)`, DataFrame sink
+- `to_pandas(pipeline)`, DataFrame sink
 - `to_csv(pipeline, path)`, CSV sink
 - `collect(pipeline)`, list sink
 

@@ -117,10 +117,10 @@ fields = src.schema()
 print(fields)  # ['{Report.InvoiceNo}', '{Report.Amount}', ...]
 ```
 
-## to_dataframe
+## to_pandas
 
 ```python
-to_dataframe(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
+to_pandas(pipeline: Pipeline, chunksize: int | None = None) -> pd.DataFrame
 ```
 
 | Param      | Type               | Default | Description                    |

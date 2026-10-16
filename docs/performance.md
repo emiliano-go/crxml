@@ -406,8 +406,8 @@ Traverse is 59% memchr (vs push's 26%). Combined: 36.5% of total parse is memchr
 
 | If your goal is... | Use this | Because... |
 |---|---|---|
-| Fastest `to_arrow`/`to_dataframe` on >=100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
-| Fastest **bounded** `to_arrow`/`to_dataframe` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` -> `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
+| Fastest `to_arrow`/`to_pandas` on >=100 MB, unbounded OK | `engine="parallel"` (`par128` auto, 4 MB) | **4470 MB/s 533 MB / 4278 MB/s 1 GB** `par128` (peak 4 MB). Simple, no Discovery. |
+| Fastest **bounded** `to_arrow`/`to_pandas` | `iter_record_batches(memory="64MB", threads=16, schema=[...])` -> `pq.ParquetWriter` | **4980 MB/s 533 MB** explicit `FrozenSchema::from_plan` `schema.rs:66` (+11% vs `par128`) while bounded 88 MB and incremental. |
 | Bounded, no schema known (auto) | `iter_record_batches(memory="64MB", threads=16)` auto | **4497 MB/s Table** / 4485 Vec auto (parallel Discovery 5.3 ms) vs `par128` 4470 (+0.6%, within CoV) - **stable** (`ensure_schema` `engine.rs:79`, all sparse cols as all-null), 88 MB anon vs 137 MB, incremental. |
 | Minimize peak memory (single-thread) | `memory="1MB"` single streaming | 723 MB/s (3% behind single 745), 24 MB RssAnon, `RowSink` `lib.rs:564` |
 | Stream rows one-by-one (dicts) | `engine="stream"` `for row in source` | Row dicts lazily, no Arrow |

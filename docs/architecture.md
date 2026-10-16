@@ -51,7 +51,7 @@ XML file
   │                 │
   │                 ├─► Compare filter: arrow::compute kernels (pure Rust)
   │                 │
-  │                 └─► sinks: to_dataframe / to_csv / collect / to_polars / to_parquet
+  │                 └─► sinks: to_pandas / to_csv / collect / to_polars / to_parquet
   │
   └─► parallel engine: CrystalXmlSplitter + rypipe_core::ParallelExecutor
         │
@@ -160,7 +160,7 @@ crxml still owns the Crystal-specific grammar as an embedded `rypipe-core` forma
 ```python
 __all__ = ["CrystalXMLSource", "Pipeline", "RenameFields", "CastTypes",
            "FilterRows", "DropFields", "discover_schema", "XmlError",
-           "PlanError", "MergeError", "to_dataframe", "to_csv", "collect"]
+           "PlanError", "MergeError", "to_pandas", "to_csv", "collect"]
 
 _modules = {"CrystalXMLSource": ".source", "Pipeline": ".pipeline", ...}
 
@@ -235,7 +235,7 @@ source | rename | cast  →  Pipeline(source, [rename, cast])
 **`_to_arrow()` shortcut**:
 - Returns a single `pyarrow.Table` if the whole pipeline can be executed as columnar fusion + batchpipe chain without trailing stages.
 - Returns `None` if: workers are set, source lacks `_read_arrow`, or trailing stateful stages remain.
-- This is the key fast path used by `to_dataframe()` and `collect()`; they check `_to_arrow()` first and skip the dict stream entirely.
+- This is the key fast path used by `to_pandas()` and `collect()`; they check `_to_arrow()` first and skip the dict stream entirely.
 
 **`parallel(workers=None, batch_size=1000)`**: returns a new `Pipeline` with worker count set. Also carries forward the `_prefetch` flag (though prefetch is not toggled by the current public API).
 
@@ -373,11 +373,11 @@ Source ──► _prefetch_iter (bounded queue, maxsize=8) ──► ProcessPool
 
 | Sink | Fast path | Fallback |
 |------|-----------|----------|
-| `to_dataframe` | `pipeline._to_arrow()` → single `pyarrow.Table` → `table.to_pandas()` (ArrowDtype, zero dicts) | `_iter_batches()` → chunked DataFrame → `pd.concat`; or `pd.DataFrame.from_records(iter(pipeline))` |
+| `to_pandas` | `pipeline._to_arrow()` → single `pyarrow.Table` → `table.to_pandas()` (ArrowDtype, zero dicts) | `_iter_batches()` → chunked DataFrame → `pd.concat`; or `pd.DataFrame.from_records(iter(pipeline))` |
 | `collect` | `pipeline._to_arrow()` → `table.to_pylist()` | `_iter_batches()` → dicts; or `list(pipeline)` |
 | `to_csv` | Always streams row-by-row via `csv.DictWriter` (no intermediate list) | - |
 
-`to_dataframe(chunksize=N)` always uses batch-then-concat for memory control. `chunksize=None` triggers the single-table fast path.
+`to_pandas(chunksize=N)` always uses batch-then-concat for memory control. `chunksize=None` triggers the single-table fast path.
 
 ## Fusion decision tree
 
@@ -428,7 +428,7 @@ fused_iter(source, stages)
 When a sink is called:
 
 ```
-to_dataframe(pipeline):
+to_pandas(pipeline):
   ├─ has _to_arrow()?
   │     └─ YES → pipeline._to_arrow()
   │                  ├─ returns Table? → table.to_pandas()  [FASTEST]
